@@ -26,6 +26,6 @@ Fixed settings:
 
 Increasing the number of noise samples improves preservation-oriented metrics, like structure distance, PSNR, and LPIPS. Smaller improvements are found in the MSE and SSIM. This contradicts what the paper said, which was that increasing the number of noise samples was not necessary and did not provide substantial improvement to these metrics.
 
-I also found that increasing the number of noise samples reduces semantic editing strength, found in the decreases in CLIP Target and Edited scores.
+Also, increasing the number of noise samples reduces semantic editing strength, as found in the decreases in CLIP Target and Edited scores.
 
-Therefore, there appears to be a tradeoff between image preservation and edit strength. More Monte Carlo samples improves structural fidelity, but doesn't align with the target edit prompt as much.
+Therefore, there appears to be a tradeoff between image preservation and edit strength. More Monte Carlo samples improve structural fidelity, but don't align with the target edit prompt as much.
