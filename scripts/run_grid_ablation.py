@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))        # scripts/
+sys.path.insert(0, str(Path(__file__).parent.parent)) # project root
+
 import argparse
 import json
 import logging
-from pathlib import Path
 from typing import Any, Dict, List, TYPE_CHECKING
 
 from run_local_ablation import (

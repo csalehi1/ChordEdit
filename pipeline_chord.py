@@ -854,10 +854,10 @@ class ChordEditPipeline(DiffusionPipeline):
             ).tolist()
 
         print(
-            "t_start: ", params["t_start"], 
-            "t_end: ", params["t_end"], 
-            "t_delta: ", params["t_delta"], 
-            "n_steps: ", params["n_steps"]
+            f"t_start: {params['t_start']:>10} "
+            f"t_end: {params['t_end']:>10} "
+            f"t_delta: {params['t_delta']:>10} "
+            f"n_steps: {params['n_steps']:>10}"
         )
 
         x_curr = x_src
