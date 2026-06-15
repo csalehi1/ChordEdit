@@ -20,7 +20,13 @@ def clean(s):
     return s.replace("[", "").replace("]", "")
 
 
+def as_tensor(x):
+    if hasattr(x, "pooler_output"):
+        return x.pooler_output
+    return x
+
 def norm(x):
+    x = as_tensor(x)
     return x / x.norm(dim=-1, keepdim=True)
 
 
@@ -45,7 +51,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 print("device:", device)
 
 proc = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32", use_safetensors=True).to(device)
 model.eval()
 
 mapping = json.load(open(PIE / "mapping_file.json"))
