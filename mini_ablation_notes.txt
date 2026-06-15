@@ -1,0 +1,19 @@
+Mini ChordEdit ablation run on SD-Turbo + PIE-Bench
+
+Environment:
+- Server: seribizon
+- Model: ~/models/sd-turbo
+- Dataset: ~/datasets/PIE-Bench_v1
+- Max samples per run: 20
+- Seed: 42
+- n_steps: 1
+- noise_samples: 1
+- cleanup: True
+
+Completed runs:
+1. ChordEdit_delta015: t_delta=0.15, t_start=0.9, t_end=0.3
+2. ChordEdit_delta000: t_delta=0.0,  t_start=0.9, t_end=0.3
+3. ChordEdit_tstart100: t_start=1.0, t_delta=0.15, t_end=0.3
+4. ChordEdit_tstart060: t_start=0.6, t_delta=0.15, t_end=0.3
+5. ChordEdit_tend020: t_end=0.2, t_start=0.9, t_delta=0.15
+6. ChordEdit_tend050: t_end=0.5, t_start=0.9, t_delta=0.15
