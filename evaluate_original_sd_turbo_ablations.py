@@ -107,6 +107,8 @@ def clip_image_features(paths: List[Path], processor, model, batch_size: int = 1
         images = [Image.open(p).convert("RGB") for p in batch_paths]
         inputs = processor(images=images, return_tensors="pt", padding=True).to(DEVICE)
         emb = model.get_image_features(**inputs)
+        if hasattr(emb, "pooler_output"):
+            emb = emb.pooler_output
         emb = emb / emb.norm(dim=-1, keepdim=True)
         feats.append(emb.detach().cpu())
     return torch.cat(feats, dim=0)
@@ -119,6 +121,8 @@ def clip_text_features(texts: List[str], processor, model, batch_size: int = 64)
         batch_texts = texts[i : i + batch_size]
         inputs = processor(text=batch_texts, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
         emb = model.get_text_features(**inputs)
+        if hasattr(emb, "pooler_output"):
+            emb = emb.pooler_output
         emb = emb / emb.norm(dim=-1, keepdim=True)
         feats.append(emb.detach().cpu())
     return torch.cat(feats, dim=0)
