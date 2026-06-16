@@ -2,7 +2,7 @@
 set -euo pipefail
 
 GPU=0
-MAX_SAMPLES=20
+MAX_SAMPLES=700
 
 MODEL_ROOT="$HOME/models/sd-turbo"
 PIE_ROOT="$HOME/datasets/PIE-Bench_v1"

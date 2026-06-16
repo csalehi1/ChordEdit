@@ -17,8 +17,8 @@ set -euo pipefail
 # Outputs are written to /shared/ssd_30T so we do not fill /data.
 # ============================================================
 
-GPU=0
-MAX_SAMPLES=20
+GPU=1
+MAX_SAMPLES=700
 
 MODEL_ROOT="$HOME/models/sd-turbo"
 PIE_ROOT="$HOME/datasets/PIE-Bench_v1"

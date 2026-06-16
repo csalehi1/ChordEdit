@@ -1,0 +1,88 @@
+usage: run_pie_bench.py [-h] [--config CONFIG] [--model-root MODEL_ROOT]
+                        [--model-type {auto,sd,sdxl}] [--device DEVICE]
+                        [--precision {fp32,fp16,bf16}] [--seed SEED]
+                        [--noise-samples NOISE_SAMPLES] [--n-steps N_STEPS]
+                        [--t-start T_START] [--t-end T_END]
+                        [--t-delta T_DELTA] [--step-scale STEP_SCALE]
+                        [--cleanup] [--no-cleanup] [--center-crop]
+                        [--no-center-crop] [--use-attention-mask]
+                        [--safety-checker] [--no-safety-checker]
+                        [--chord-edit-mode {sym,default}]
+                        [--image-size IMAGE_SIZE] [--max-samples MAX_SAMPLES]
+                        [--pie-root PIE_ROOT] [--mapping-file MAPPING_FILE]
+                        [--image-subdir IMAGE_SUBDIR]
+                        [--export-root EXPORT_ROOT]
+                        [--method-name METHOD_NAME]
+                        [--output-subdir OUTPUT_SUBDIR]
+                        [--source-subdir SOURCE_SUBDIR] [--copy-source]
+                        [--mapping-dest MAPPING_DEST] [--no-sync-mapping]
+                        [--overwrite] [--log-every LOG_EVERY]
+
+Run ChordEdit on PIE-Bench data and export PIE-format results.
+
+options:
+  -h, --help            show this help message and exit
+  --config CONFIG       Optional YAML config describing edit params.
+  --model-root MODEL_ROOT
+                        Root folder containing SD or SDXL component
+                        subfolders.
+  --model-type {auto,sd,sdxl}
+                        Model family. auto selects SDXL when
+                        tokenizer_2/text_encoder_2 folders are present.
+  --device DEVICE       Torch device override, e.g. cuda:0 or cpu.
+  --precision {fp32,fp16,bf16}
+                        Computation precision.
+  --seed SEED           Random seed overriding the config file.
+  --noise-samples NOISE_SAMPLES
+                        Number of MC noise samples.
+  --n-steps N_STEPS     Number of Chord iterations.
+  --t-start T_START     Edit timestep start.
+  --t-end T_END         Edit timestep end.
+  --t-delta T_DELTA     Edit timestep delta.
+  --step-scale STEP_SCALE
+                        Edit update magnitude.
+  --cleanup             Force cleanup on.
+  --no-cleanup          Force cleanup off.
+  --center-crop         Center-crop before resize for VAE preprocessing
+                        (default).
+  --no-center-crop      Disable center crop before resizing.
+  --use-attention-mask  Pass attention masks to the text encoder (defaults off
+                        to mirror chord/src).
+  --safety-checker      Enable StableDiffusion safety checker before exporting
+                        images.
+  --no-safety-checker   Disable safety checker (default).
+  --chord-edit-mode {sym,default}
+                        Chord edit mode. default uses the default edit mode,
+                        sym uses a symmetric edit.
+  --image-size IMAGE_SIZE
+                        Resolution used when feeding the VAE. Defaults to 512
+                        for SD and 1024 for SDXL.
+  --max-samples MAX_SAMPLES
+                        Only process the first N records.
+  --pie-root PIE_ROOT   Root directory of PIE-Bench data.
+  --mapping-file MAPPING_FILE
+                        Mapping file path relative to --pie-root.
+  --image-subdir IMAGE_SUBDIR
+                        Subdirectory (inside --pie-root) containing the
+                        original PIE annotation images.
+  --export-root EXPORT_ROOT
+                        Directory that follows PIE-Bench layout (data/... +
+                        output/...). Defaults to --pie-root.
+  --method-name METHOD_NAME
+                        Name used under
+                        export_root/output/<method_name>/annotation_images.
+  --output-subdir OUTPUT_SUBDIR
+                        Subdirectory inside output/<method_name>/ for
+                        generated images.
+  --source-subdir SOURCE_SUBDIR
+                        Subdirectory inside data/ where original images are
+                        copied when --copy-source is set.
+  --copy-source         Copy the source PIE images into export_root/data.
+  --mapping-dest MAPPING_DEST
+                        Relative path (from export_root) to write the mapping
+                        file.
+  --no-sync-mapping     Skip copying the PIE mapping file into export_root.
+  --overwrite           Overwrite existing predictions when present.
+  --log-every LOG_EVERY
+                        Progress logging interval in number of saved samples
+                        (0 disables incremental logs).
