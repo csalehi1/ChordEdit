@@ -30,59 +30,13 @@ METRICS_CSV = DATA_DIR / "id_to_metrics.csv"
 STRINGS_CSV = DATA_DIR / "id_to_string_pair.csv"
 WEIGHTS_DIR = PARENT_DIR / "weights"
 
-TARGET_COLUMN = "clip_similarity_target_image"
+TARGET_COLUMN = "combined_score"
 DELTA_VALUE = 0.0
 
 EPOCHS = 20
 BATCH_SIZE = 32
 LR = 1e-3
 SEED = 42
-
-
-def load_data() -> pd.DataFrame:
-    """Filter metrics to DELTA_VALUE rows, pick the highest combined_score row per id,
-    and join with prompt strings. Maps discrete t_start/t_end values to ordinal indices."""
-    metrics = pd.read_csv(METRICS_CSV, dtype={"sample_id": str})
-    strings = pd.read_csv(STRINGS_CSV, dtype={"id": str})
-
-    filtered = metrics[metrics["t_delta"] == DELTA_VALUE]
-    best_idx = filtered.groupby("sample_id")["combined_score"].idxmax()
-    best = filtered.loc[best_idx, ["sample_id", "t_start", "t_end"]].reset_index(drop=True)
-
-    df = pd.merge(best, strings, left_on="sample_id", right_on="id")
-
-    # Map each discrete t_start / t_end value to an ordinal index (0, 1, 2, …)
-    for col in ("t_start", "t_end"):
-        sorted_levels = sorted(df[col].unique())
-        level_to_index = {v: i for i, v in enumerate(sorted_levels)}
-        df[f"{col}_idx"] = df[col].map(level_to_index)
-
-    return df
-
-
-def save_splits(
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    data_dir: Path = DATA_DIR,
-) -> None:
-    """Save train/val/test splits as gzip-compressed Parquet files in data_dir."""
-    data_dir.mkdir(exist_ok=True)
-    for name, df in (("train", train_df), ("val", val_df), ("test", test_df)):
-        out = data_dir / f"{name}.parquet.gz"
-        df.to_parquet(out, compression="gzip", index=False)
-        print(f"Saved {out} ({out.stat().st_size / 1024:.1f} KB)")
-
-
-def split_data(
-    df: pd.DataFrame, seed: int = SEED
-    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Split df into train/val/test with an 80/10/10 ratio."""
-    train = df.sample(frac=0.8, random_state=seed)
-    remaining = df.drop(train.index)
-    val = remaining.sample(frac=0.5, random_state=seed)
-    test = remaining.drop(val.index)
-    return train.reset_index(drop=True), val.reset_index(drop=True), test.reset_index(drop=True)
 
 
 class PairDataset(Dataset):
@@ -99,6 +53,52 @@ class PairDataset(Dataset):
 
     def __getitem__(self, idx: int):
         return self.src[idx], self.tgt[idx], self.y1[idx], self.y2[idx]
+
+
+def load_data() -> pd.DataFrame:
+    """Filter metrics to DELTA_VALUE rows, pick the highest TARGET_COLUMN row per id,
+    and join with prompt strings. Maps discrete t_start/t_end values to ordinal indices."""
+    metrics = pd.read_csv(METRICS_CSV, dtype={"sample_id": str})
+    strings = pd.read_csv(STRINGS_CSV, dtype={"id": str})
+
+    filtered = metrics[metrics["t_delta"] == DELTA_VALUE]
+    best_idx = filtered.groupby("sample_id")[TARGET_COLUMN].idxmax()
+    best = filtered.loc[best_idx, ["sample_id", "t_start", "t_end"]].reset_index(drop=True)
+
+    df = pd.merge(best, strings, left_on="sample_id", right_on="id")
+
+    # Map each discrete t_start / t_end value to an ordinal index (0, 1, 2, …)
+    for col in ("t_start", "t_end"):
+        sorted_levels = sorted(df[col].unique())
+        level_to_index = {v: i for i, v in enumerate(sorted_levels)}
+        df[f"{col}_idx"] = df[col].map(level_to_index)
+
+    return df
+
+
+def split_data(
+    df: pd.DataFrame, seed: int = SEED
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Split df into train/val/test with an 80/10/10 ratio."""
+    train = df.sample(frac=0.8, random_state=seed)
+    remaining = df.drop(train.index)
+    val = remaining.sample(frac=0.5, random_state=seed)
+    test = remaining.drop(val.index)
+    return train.reset_index(drop=True), val.reset_index(drop=True), test.reset_index(drop=True)
+
+
+def save_splits(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    data_dir: Path = DATA_DIR,
+) -> None:
+    """Save train/val/test splits as gzip-compressed Parquet files in data_dir."""
+    data_dir.mkdir(exist_ok=True)
+    for name, df in (("train", train_df), ("val", val_df), ("test", test_df)):
+        out = data_dir / f"{name}.parquet.gz"
+        df.to_parquet(out, compression="gzip", index=False)
+        print(f"Saved {out} ({out.stat().st_size / 1024:.1f} KB)")
 
 
 def collate(batch):
@@ -159,6 +159,11 @@ def train() -> OrdinalPairClassifier:
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable_params, lr=LR)
 
+    WEIGHTS_DIR.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    weights_out = WEIGHTS_DIR / f"classifier_weights_{timestamp}.pt"
+    best_val_mae = float("inf")
+
     for epoch in range(1, EPOCHS + 1):
         model.train()
         epoch_loss = 0.0
@@ -173,23 +178,26 @@ def train() -> OrdinalPairClassifier:
             epoch_loss += loss.item() * len(srcs)
 
         val_metrics = eval_loader(model, val_loader, device)
+        val_mae = val_metrics["mae_t_start"] + val_metrics["mae_t_end"]
+        improved = val_mae < best_val_mae
+        if improved:
+            best_val_mae = val_mae
+            torch.save(model.state_dict(), weights_out)
         print(
             f"Epoch {epoch:02d}  loss={epoch_loss / len(train_df):.4f}"
             f"  val: MAE_start={val_metrics['mae_t_start']:.3f}  MAE_end={val_metrics['mae_t_end']:.3f}"
             f"  acc_start={val_metrics['acc_t_start']:.3f}  acc_end={val_metrics['acc_t_end']:.3f}  acc_both={val_metrics['acc_both']:.3f}"
+            + ("  *" if improved else "")
         )
+
+    print(f"Saved {weights_out}  (best val MAE={best_val_mae:.4f})")
+    model.load_state_dict(torch.load(weights_out, map_location=device, weights_only=True))
 
     test_metrics = eval_loader(model, test_loader, device)
     print(
         f"\nTest: MAE_start={test_metrics['mae_t_start']:.3f}  MAE_end={test_metrics['mae_t_end']:.3f}"
         f"  acc_start={test_metrics['acc_t_start']:.3f}  acc_end={test_metrics['acc_t_end']:.3f}  acc_both={test_metrics['acc_both']:.3f}"
     )
-
-    WEIGHTS_DIR.mkdir(exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    weights_out = WEIGHTS_DIR / f"classifier_weights_{timestamp}.pt"
-    torch.save(model.state_dict(), weights_out)
-    print(f"Saved {weights_out}")
     return model
 
 
