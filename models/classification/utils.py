@@ -1,11 +1,14 @@
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
 
 
-ID_TO_METRICS_PATH = "models/classifier/id_to_metrics.csv"
+PARENT_DIR = Path(__file__).resolve().parent
+ID_TO_METRICS_PATH = PARENT_DIR / "pie_grid_evaluation.csv"
 
 
-def compute_combined_quality_score(
+def compute_combined_score(
     df: pd.DataFrame,
     psnr_col: str = "psnr",
     clip_col: str = "clip_similarity_target_image",
@@ -16,9 +19,9 @@ def compute_combined_quality_score(
 ) -> pd.Series:
     """Return a combined quality score in [0, 1] that equally weights PSNR and
     CLIP similarity after min-max normalizing each to account for their
-    differing value ranges (~17-41 vs ~7-34 in the current dataset).
+    differing value ranges.
 
-    If min/max bounds are not provided they are derived from the passed
+    If min/max bounds are not provided, they are derived from the passed
     DataFrame, making the normalization relative to the observed population.
     Pass explicit bounds (e.g. from training data) to keep the scale fixed
     across splits or future data.
@@ -36,4 +39,16 @@ def compute_combined_quality_score(
     clip_norm = (clip - c_min) / (c_max - c_min + eps)
 
     combined = (psnr_norm + clip_norm) / 2.0
-    return pd.Series(combined, index=df.index, name="combined_quality_score")
+    return pd.Series(combined, index=df.index, name="combined_score")
+
+
+def main() -> None:
+    df = pd.read_csv(ID_TO_METRICS_PATH)
+    df["combined_score"] = compute_combined_score(df)
+    df.to_csv(ID_TO_METRICS_PATH, index=False)
+    print(f"Updated {ID_TO_METRICS_PATH} with combined_score column ({len(df)} rows)")
+
+
+if __name__ == "__main__":
+    main()
+
