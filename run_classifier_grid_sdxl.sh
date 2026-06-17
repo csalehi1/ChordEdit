@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_ROOT="$HOME/models/sd-turbo"
+MODEL_ROOT="/shared/ssd_30T/zarageddes/models/sdxl-base-1.0"
 PIE_ROOT="$HOME/datasets/PIE-Bench_v1"
 EXPORT_ROOT="/shared/ssd_30T/zarageddes/llm_timestep_policy"
 
-# Start with strat20 so we can debug quickly before full PIE-Bench.
 MAPPING_FILE="mapping_file.json"
 
 GPU="${GPU:-6}"
@@ -16,7 +15,7 @@ STEP_SCALE="1.0"
 
 for T_START in 0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0; do
   T_TAG=$(echo "$T_START" | tr -d '.')
-  METHOD_NAME="classifier_full_sdturbo_t${T_TAG}_delta0_tc030"
+  METHOD_NAME="classifier_full_sdxl_t${T_TAG}_delta0_tc030"
 
   echo "============================================================"
   echo "Running $METHOD_NAME"
