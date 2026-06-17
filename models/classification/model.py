@@ -166,8 +166,37 @@ class SiameseEncoder(nn.Module):
 
 
 """
-Classifier.
+CORAL head and classifier.
 """
+
+
+class CoralHead(nn.Module):
+    """
+    Ordinal output head with shared weights across all K-1 thresholds (CORAL).
+
+    Every threshold computes σ(w·x + b_k) with the same weight vector w and
+    a per-threshold scalar bias b_k. Because the K-1 outputs differ only in
+    their bias, the activation values are a rigid shift of a single dot product:
+    exceeding threshold k forces all lower thresholds to be at least as likely,
+    which is exactly the rank-consistency guarantee.
+
+    Biases are initialised in decreasing order so the implied class probabilities
+    are spread out from the first training step.
+    """
+
+    def __init__(self, in_features: int, num_thresholds: int):
+        super().__init__()
+        self.weight = nn.Linear(in_features, 1, bias=False)
+        self.bias = nn.Parameter(torch.linspace(2.0, -2.0, num_thresholds))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Arguments:
+            x: (batch, in_features)
+        Returns:
+            (batch, num_thresholds) logits
+        """
+        return self.weight(x) + self.bias  # (N, 1) + (K-1,) → (N, K-1)
 
 
 class OrdinalPairClassifier(nn.Module):
@@ -182,6 +211,7 @@ class OrdinalPairClassifier(nn.Module):
     def __init__(
         self,
         encoder_name: str = ENCODER_MODEL,
+        mlp_wide: int = 512,
         mlp_hidden: int = 256,
         mlp_inner: int = 128,
         dropout: float = 0.2,
@@ -192,8 +222,9 @@ class OrdinalPairClassifier(nn.Module):
         """
         Arguments:
             encoder_name:  HuggingFace model name for the Siamese encoder.
-            mlp_hidden:    Width of the first MLP projection.
-            mlp_inner:     Width of the second MLP projection (head input size).
+            mlp_wide:      Width of the first MLP projection.
+            mlp_hidden:    Width of the second MLP projection.
+            mlp_inner:     Width of the third MLP projection (head input size).
             dropout:       Dropout probability between MLP layers.
             buckets1:      1-D tensor of ordered output values for t_start (head1).
                            Defaults to 5 evenly-spaced values in [0, 1].
@@ -222,16 +253,19 @@ class OrdinalPairClassifier(nn.Module):
         # LayerNorm after the first linear stabilises training when the encoder is
         # fine-tuned, since embedding norms can shift significantly early in training.
         self.body = nn.Sequential(
-            nn.Linear(h * 4, mlp_hidden),
-            nn.LayerNorm(mlp_hidden),
+            nn.Linear(h * 4, mlp_wide),
+            nn.LayerNorm(mlp_wide),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_wide, mlp_hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(mlp_hidden, mlp_inner),
             nn.ReLU(),
         )
 
-        self.head1 = nn.Linear(mlp_inner, len(buckets1) - 1)
-        self.head2 = nn.Linear(mlp_inner, len(buckets2) - 1)
+        self.head1 = CoralHead(mlp_inner, len(buckets1) - 1)
+        self.head2 = CoralHead(mlp_inner, len(buckets2) - 1)
 
     """
     Internal helpers.
