@@ -48,22 +48,22 @@ def decode_ordinal(logits: torch.Tensor) -> torch.Tensor:
 
 class CoralHead(nn.Module):
     """
-    Ordinal output head with shared weights across all K-1 thresholds (CORAL).
+    Ordinal output head with per-threshold classifiers.
 
-    Every threshold computes σ(w·x + b_k) with the same weight vector w and
-    a per-threshold scalar bias b_k. Because the K-1 outputs differ only in
-    their bias, the activation values are a rigid shift of a single dot product:
-    exceeding threshold k forces all lower thresholds to be at least as likely,
-    which is exactly the rank-consistency guarantee.
+    Each of the K-1 thresholds has its own full weight vector (in_features → 1),
+    giving the head enough capacity to learn independent decision boundaries when
+    the optimal separating hyperplane differs across thresholds. The ordinal
+    structure is enforced entirely by the loss (ordinal_loss), not by weight sharing.
 
-    Biases are initialised in decreasing order so the implied class probabilities
-    are spread out from the first training step.
+    Biases are initialised in decreasing order so the model starts with a spread
+    prediction rather than collapsing to the center class from step one.
     """
 
     def __init__(self, in_features: int, num_thresholds: int):
         super().__init__()
-        self.weight = nn.Linear(in_features, 1, bias=False)
-        self.bias = nn.Parameter(torch.linspace(2.0, -2.0, num_thresholds))
+        self.fc = nn.Linear(in_features, num_thresholds)
+        if num_thresholds > 0:
+            self.fc.bias.data = torch.linspace(2.0, -2.0, num_thresholds)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.weight(x) + self.bias  # (N, 1) + (K-1,) → (N, K-1)
+        return self.fc(x)  # (N, K-1)

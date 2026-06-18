@@ -30,9 +30,9 @@ DELTA_VALUE = 0.0
 ENCODER_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 # Prevent the encoding model from training
-FREEZE_ENCODER = True
+FREEZE_ENCODER = False
 # Choose between "CORAL" or "MSE"
-HEAD_TYPE = "MSE"
+HEAD_TYPE = "CORAL"
 # Weight loss by inverse class frequency to counteract imbalance
 USE_CLASS_WEIGHTS = True   
 
@@ -41,3 +41,4 @@ EPOCHS = 20
 BATCH_SIZE = 32
 ENCODER_LR = 2e-5
 BODY_LR = 1e-3
+WEIGHT_DECAY = 0.01
