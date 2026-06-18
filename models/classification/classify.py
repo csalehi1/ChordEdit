@@ -23,20 +23,25 @@ from models.classification.model import (
     decode_ordinal,
     mae_buckets,
 )
+import models.classification.settings as _settings
 from models.classification.settings import (
-    DATA_DIR,
-    METRICS_CSV,
-    STRINGS_CSV,
-    OUTPUTS_DIR,
-    COMPUTED_METRIC_FN,
+    BATCH_SIZE,
     COMPUTED_METRIC_COL,
+    COMPUTED_METRIC_FN,
     COMPUTED_METRIC_LABEL,
-    TARGET_COLUMN,
+    DATA_DIR,
     DELTA_VALUE,
     EPOCHS,
-    BATCH_SIZE,
-    LR,
+    ENCODER_LR,
+    FREEZE_ENCODER,
+    BODY_LR,
+    METRICS_CSV,
+    N_BUCKETS_END,
+    N_BUCKETS_START,
+    OUTPUTS_DIR,
     SEED,
+    STRINGS_CSV,
+    TARGET_COLUMN,
 )
 
 
@@ -62,15 +67,24 @@ def load_data() -> pd.DataFrame:
     metrics = pd.read_csv(METRICS_CSV, dtype={"sample_id": str})
     strings = pd.read_csv(STRINGS_CSV, dtype={"id": str})
 
+    # Validate bucket counts on the original data
+    for col, expected in (("t_start", N_BUCKETS_START), ("t_end", N_BUCKETS_END)):
+        sorted_levels = sorted(metrics[col].unique())
+        if len(sorted_levels) != expected:
+            raise ValueError(
+                f"{col} has {len(sorted_levels)} distinct values {sorted_levels}, "
+                f"but expected {expected} from settings.py."
+            )
+
     filtered = metrics[metrics["t_delta"] == DELTA_VALUE]
     best_idx = filtered.groupby("sample_id")[TARGET_COLUMN].idxmax()
     best = filtered.loc[best_idx, ["sample_id", "t_start", "t_end"]].reset_index(drop=True)
 
     df = pd.merge(best, strings, left_on="sample_id", right_on="id")
 
-    # Map each discrete t_start / t_end value to an ordinal index (0, 1, 2, …)
+    # Build ordinal mappings from the full dataset, not the filtered one
     for col in ("t_start", "t_end"):
-        sorted_levels = sorted(df[col].unique())
+        sorted_levels = sorted(metrics[col].unique())
         level_to_index = {v: i for i, v in enumerate(sorted_levels)}
         df[f"{col}_idx"] = df[col].map(level_to_index)
 
@@ -156,14 +170,21 @@ def train() -> OrdinalPairClassifier:
     val_loader = DataLoader(PairDataset(val_df), batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate)
     test_loader = DataLoader(PairDataset(test_df), batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate)
 
-    # Distinct ordered float values for each target — may differ between t_start and t_end
+    # Distinct ordered float values for each target, may differ between t_start and t_end
     buckets_start = torch.tensor(sorted(df["t_start"].unique()), dtype=torch.float)
     buckets_end = torch.tensor(sorted(df["t_end"].unique()), dtype=torch.float)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = OrdinalPairClassifier(buckets1=buckets_start, buckets2=buckets_end, freeze_encoder=True).to(device)
-    # Only pass non-frozen parameters; the encoder is frozen via freeze_encoder=True
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(trainable_params, lr=LR)
+    model = OrdinalPairClassifier(buckets1=buckets_start, buckets2=buckets_end, freeze_encoder=FREEZE_ENCODER).to(device)
+    if FREEZE_ENCODER:
+        optimizer = torch.optim.Adam(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=BODY_LR,
+        )
+    else:
+        optimizer = torch.optim.Adam([
+            {"params": model.encoder.parameters(), "lr": ENCODER_LR},
+            {"params": list(model.body.parameters()) + list(model.head1.parameters()) + list(model.head2.parameters()), "lr": BODY_LR},
+        ])
 
     weights_out = run_dir / "classifier_weights.pt"
     best_val_mae = float("inf")
@@ -193,12 +214,11 @@ def train() -> OrdinalPairClassifier:
                     "buckets2": buckets_end.tolist(),
                     "config": {
                         "run_dir": str(run_dir),
-                        "METRICS_CSV": str(METRICS_CSV),
-                        "STRINGS_CSV": str(STRINGS_CSV),
-                        "TARGET_COLUMN": TARGET_COLUMN,
-                        "DELTA_VALUE": DELTA_VALUE,
-                        "COMPUTED_METRIC_COL": COMPUTED_METRIC_COL,
-                        "COMPUTED_METRIC_LABEL": COMPUTED_METRIC_LABEL,
+                        **{
+                            k: str(v) if isinstance(v, Path) else (v.__name__ if callable(v) else v)
+                            for k, v in vars(_settings).items()
+                            if k.isupper()
+                        },
                     },
                 },
                 weights_out,

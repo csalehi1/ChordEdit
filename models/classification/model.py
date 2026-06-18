@@ -46,6 +46,9 @@ def ordinal_loss(logits: torch.Tensor, target_idx: torch.Tensor) -> torch.Tensor
     scale.
     """
     k_minus_1 = logits.size(-1)
+    if k_minus_1 == 0:
+        # Return 0.0 if N_BUCKETS_* for that tensor is 1, no learning possible
+        return torch.tensor(0.0, device=logits.device, requires_grad=False)
     thresholds = torch.arange(k_minus_1, device=logits.device).unsqueeze(0)   # (1, K-1)
     targets = (thresholds < target_idx.unsqueeze(1)).float()                   # (batch, K-1)
     return F.binary_cross_entropy_with_logits(logits, targets)
