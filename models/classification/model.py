@@ -24,6 +24,10 @@ from models.classification.head_coral import CoralHead, decode_ordinal
 from models.classification.head_mse import RegressionHead, decode_regression
 from models.classification.head_mae import mae_buckets  # noqa: F401
 
+from models.classification.settings import (
+    MLP_DROPOUT,
+    MLP_INNER
+)
 
 """
 Encoder.
@@ -95,8 +99,8 @@ class OrdinalPairClassifier(nn.Module):
         encoder_name: str = ENCODER_MODEL,
         mlp_wide: int = 512,
         mlp_hidden: int = 256,
-        mlp_inner: int = 128,
-        dropout: float = 0.2,
+        mlp_inner: int = MLP_INNER,
+        dropout: float = MLP_DROPOUT,
         buckets1: torch.Tensor | None = None,
         buckets2: torch.Tensor | None = None,
         freeze_encoder: bool = True,
@@ -204,7 +208,7 @@ class OrdinalPairClassifier(nn.Module):
         self,
         strings_a: list[str],
         strings_b: list[str],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """
         Run inference and return bucket values (not indices).
         """
