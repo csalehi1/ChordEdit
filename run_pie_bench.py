@@ -84,9 +84,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-type",
-        choices=["auto", "sd", "sdxl"],
+        choices=["auto", "sd", "sdxl", "flux"],
         default="auto",
-        help="Model family. auto selects SDXL when tokenizer_2/text_encoder_2 folders are present.",
+        help="Model family. auto selects SDXL when tokenizer_2/text_encoder_2 folders are present; use flux for FLUX.1/Schnell.",
     )
     parser.add_argument("--device", type=str, default=None, help="Torch device override, e.g. cuda:0 or cpu.")
     parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default=None, help="Computation precision.")
@@ -217,6 +217,10 @@ def dtype_from_precision(value: Optional[str]) -> torch.dtype:
 
 
 def expand_component_paths(path_map: Dict[str, Optional[str]], model_type: str = "auto") -> Dict[str, str]:
+    if model_type == "flux":
+        if "model_root" not in path_map:
+            raise ValueError("Missing model_root for FLUX.")
+        return {"model_root": str(Path(path_map["model_root"]).expanduser().resolve())}
     expanded: Dict[str, str] = {}
     for key in SD_COMPONENT_SUBDIRS:
         value = path_map.get(key)
@@ -238,6 +242,8 @@ def expand_component_paths(path_map: Dict[str, Optional[str]], model_type: str =
 
 def paths_from_model_root(model_root: str | Path, model_type: str = "auto") -> Dict[str, str]:
     root = Path(model_root).expanduser().resolve()
+    if model_type == "flux":
+        return {"model_root": str(root)}
     component_paths = {key: str((root / subdir).resolve()) for key, subdir in SD_COMPONENT_SUBDIRS.items()}
     sdxl_paths = {key: (root / subdir).resolve() for key, subdir in SDXL_COMPONENT_SUBDIRS.items()}
     if model_type == "sdxl" or (model_type == "auto" and all(path.exists() for path in sdxl_paths.values())):
@@ -392,14 +398,18 @@ def main() -> None:
 
     precision_choice_raw = args.precision or precision or DEFAULT_PRECISION
     precision_choice = precision_choice_raw.lower()
-    if precision_choice != "fp32":
+    if precision_choice != "fp32" and args.model_type != "flux":
         LOGGER.warning(
             "Precision '%s' requested, but PIE export forces fp32 for numerical stability.",
             precision_choice_raw,
         )
         precision_choice = "fp32"
+    if args.model_type == "flux" and precision_choice == "fp32":
+        LOGGER.warning(
+            "FLUX requested with fp32; this may OOM. Prefer --precision bf16 or --precision fp16."
+        )
     torch_dtype = dtype_from_precision(precision_choice)
-    compute_dtype = torch.float32
+    compute_dtype = torch_dtype if args.model_type == "flux" else torch.float32
 
     pie_root = Path(args.pie_root).expanduser().resolve() if args.pie_root else DEFAULT_PIE_ROOT
     export_root = Path(args.export_root).expanduser().resolve() if args.export_root else pie_root
