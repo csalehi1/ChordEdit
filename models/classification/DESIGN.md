@@ -1,5 +1,7 @@
 # Classification Model Design
 
+***NOTE***: Parts of this file may be currently out-of-date with the model, although the overall plan is still consistent
+
 ## Task
 
 Given a `(source_prompt, target_prompt)` string pair, predict two diffusion timestep parameters $t^*$ and $t^{**}$, referenced in code as `t_start` and `t_end`. Each takes a value from an ordered linear space in $[0.0, 1.0]$. The choice of these parameters controls where in the diffusion trajectory the edit is applied.
