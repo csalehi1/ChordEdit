@@ -18,16 +18,23 @@ N_BUCKETS_END = 1
 
 # Computed metric from data
 COMPUTED_METRIC_FN = compute_combined_score
-COMPUTED_METRIC_COL = "combined_score"
-COMPUTED_METRIC_LABEL = "Combined Score"
+COMPUTED_METRIC_COL = "agreement_score"
+COMPUTED_METRIC_LABEL = "Agreement Score"
 
 # Train on computed metric
 TARGET_COLUMN = COMPUTED_METRIC_COL
+# The variable 
 DELTA_VALUE = 0.0
 
 # Pretrained transformer for the Siamese Encoder
 ENCODER_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-FREEZE_ENCODER = False
+
+# Prevent the encoding model from training
+FREEZE_ENCODER = True
+# Choose between "CORAL" or "MSE"
+HEAD_TYPE = "MSE"
+# Weight loss by inverse class frequency to counteract imbalance
+USE_CLASS_WEIGHTS = True   
 
 SEED = 42
 EPOCHS = 20

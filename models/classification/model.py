@@ -1,15 +1,15 @@
 """
-Ordinal String-Pair Classifier. Accepts two strings and predicts two 
-independent values (t_start and t_end), each from their respective set of 
-discrete values, using ordinal threshold encoding.
+Ordinal String-Pair Classifier. Accepts two strings and predicts two
+independent values (t_start and t_end), each from their respective set of
+discrete values.
 
     1.  Shared Siamese encoder (pretrained transformer, mean-pool) encodes both
         strings in a single batched forward pass.
     2.  Combiner builds [emb_A | emb_B | emb_A-emb_B | emb_A⊙emb_B].
     3.  Shared MLP body produces a common feature vector.
-    4.  Two independent linear heads emit K1-1 and K2-1 raw logits respectively,
-        where K1 and K2 are the number of distinct buckets for each output.
-    5.  At inference, counting exceeded thresholds gives the bucket index.
+    4.  Two independent heads — CORAL (ordinal) or MSE (scalar regression) —
+        each predict one output value.
+    5.  At inference, the head output is mapped to a bucket index.
 
 """
 
@@ -17,61 +17,12 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 
 from models.classification.settings import ENCODER_MODEL
-
-
-"""
-Loss and decoding utilities.
-"""
-
-
-def ordinal_loss(logits: torch.Tensor, target_idx: torch.Tensor) -> torch.Tensor:
-    """
-    Ordinal binary cross-entropy loss over K-1 cumulative thresholds.
-
-    Each class index c is encoded as a binary vector where the first c
-    entries are 1 and the rest are 0 (shown here for K=5 buckets):
-
-        class 0 -> [0, 0, 0, 0]
-        class 1 -> [1, 0, 0, 0]
-        class 2 -> [1, 1, 0, 0]
-        class 3 -> [1, 1, 1, 0]
-        class 4 -> [1, 1, 1, 1]
-
-    Because off-by-one errors flip fewer thresholds than large misses, the
-    loss naturally penalises large errors more — consistent with an ordinal
-    scale.
-    """
-    k_minus_1 = logits.size(-1)
-    if k_minus_1 == 0:
-        # Return 0.0 if N_BUCKETS_* for that tensor is 1, no learning possible
-        return torch.tensor(0.0, device=logits.device, requires_grad=False)
-    thresholds = torch.arange(k_minus_1, device=logits.device).unsqueeze(0)   # (1, K-1)
-    targets = (thresholds < target_idx.unsqueeze(1)).float()                   # (batch, K-1)
-    return F.binary_cross_entropy_with_logits(logits, targets)
-
-
-def decode_ordinal(logits: torch.Tensor) -> torch.Tensor:
-    """
-    Convert raw head logits to bucket indices by counting exceeded thresholds.
-
-    A threshold is considered exceeded when sigmoid(logit) > 0.5, which is
-    equivalent to logit > 0.
-    """
-    return (logits > 0).long().sum(dim=-1)
-
-
-def mae_buckets(pred_idx: torch.Tensor, true_idx: torch.Tensor) -> torch.Tensor:
-    """
-    Mean Absolute Error over bucket indices.
-
-    Preferred over accuracy because it rewards near-misses. An MAE of 1.0
-    means the model is off by one bucket on average.
-    """
-    return (pred_idx - true_idx).abs().float().mean()
+from models.classification.head_coral import CoralHead, decode_ordinal
+from models.classification.head_mse import RegressionHead, decode_regression
+from models.classification.head_mae import mae_buckets  # noqa: F401
 
 
 """
@@ -125,40 +76,18 @@ class SiameseEncoder(nn.Module):
 
 
 """
-CORAL head and classifier.
+Classifier.
 """
-
-
-class CoralHead(nn.Module):
-    """
-    Ordinal output head with shared weights across all K-1 thresholds (CORAL).
-
-    Every threshold computes σ(w·x + b_k) with the same weight vector w and
-    a per-threshold scalar bias b_k. Because the K-1 outputs differ only in
-    their bias, the activation values are a rigid shift of a single dot product:
-    exceeding threshold k forces all lower thresholds to be at least as likely,
-    which is exactly the rank-consistency guarantee.
-
-    Biases are initialised in decreasing order so the implied class probabilities
-    are spread out from the first training step.
-    """
-
-    def __init__(self, in_features: int, num_thresholds: int):
-        super().__init__()
-        self.weight = nn.Linear(in_features, 1, bias=False)
-        self.bias = nn.Parameter(torch.linspace(2.0, -2.0, num_thresholds))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.weight(x) + self.bias  # (N, 1) + (K-1,) → (N, K-1)
 
 
 class OrdinalPairClassifier(nn.Module):
     """
-    Full string-pair ordinal classifier.
+    Full string-pair classifier.
 
     Given strings A and B, predicts two independent scalar values (t_start and
-    t_end) via cumulative-threshold ordinal decoding. Each head's output size
-    is determined by the number of distinct values in the corresponding target.
+    t_end). Head type is selected at construction time: 'CORAL' for cumulative-
+    threshold ordinal decoding, 'MSE' for scalar regression snapped to the
+    nearest bucket.
     """
 
     def __init__(
@@ -171,6 +100,7 @@ class OrdinalPairClassifier(nn.Module):
         buckets1: torch.Tensor | None = None,
         buckets2: torch.Tensor | None = None,
         freeze_encoder: bool = True,
+        head_type: str = "CORAL",
     ):
         """
         Arguments:
@@ -185,9 +115,13 @@ class OrdinalPairClassifier(nn.Module):
                            Defaults to 10 evenly-spaced values in [0, 1].
             freeze_encoder: If True, encoder weights are fixed during training.
                             Recommended when training data is small (< ~1000 pairs).
+            head_type:     "CORAL" for ordinal classification, "MSE" for scalar regression.
         """
+        if head_type not in ("CORAL", "MSE"):
+            raise ValueError(f"head_type must be 'CORAL' or 'MSE', got {head_type!r}")
         super().__init__()
 
+        self.head_type = head_type
         self.encoder = SiameseEncoder(encoder_name)
         if freeze_encoder:
             for param in self.encoder.parameters():
@@ -217,8 +151,12 @@ class OrdinalPairClassifier(nn.Module):
             nn.ReLU(),
         )
 
-        self.head1 = CoralHead(mlp_inner, len(buckets1) - 1)
-        self.head2 = CoralHead(mlp_inner, len(buckets2) - 1)
+        if head_type == "CORAL":
+            self.head1 = CoralHead(mlp_inner, len(buckets1) - 1)
+            self.head2 = CoralHead(mlp_inner, len(buckets2) - 1)
+        elif head_type == "MSE":
+            self.head1 = RegressionHead(mlp_inner)
+            self.head2 = RegressionHead(mlp_inner)
 
     """
     Internal helpers.
@@ -255,7 +193,7 @@ class OrdinalPairClassifier(nn.Module):
         strings_b: list[str],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute raw logits for both output heads.
+        Compute raw head outputs for both targets.
         """
         emb_a, emb_b = self._encode_pair(strings_a, strings_b)
         combined = self._combine(emb_a, emb_b)
@@ -275,4 +213,8 @@ class OrdinalPairClassifier(nn.Module):
         with torch.no_grad():
             l1, l2 = self(strings_a, strings_b)
         self.train(training)
-        return self.buckets1[decode_ordinal(l1)], self.buckets2[decode_ordinal(l2)]
+
+        if self.head_type == "CORAL":
+            return self.buckets1[decode_ordinal(l1)], self.buckets2[decode_ordinal(l2)]
+        elif self.head_type == "MSE":
+            return self.buckets1[decode_regression(l1, self.buckets1)], self.buckets2[decode_regression(l2, self.buckets2)]

@@ -17,12 +17,10 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from models.classification.model import (
-    OrdinalPairClassifier,
-    ordinal_loss,
-    decode_ordinal,
-    mae_buckets,
-)
+from models.classification.model import OrdinalPairClassifier
+from models.classification.head_coral import ordinal_loss, decode_ordinal
+from models.classification.head_mse import regression_loss, decode_regression
+from models.classification.head_mae import mae_buckets
 import models.classification.settings as _settings
 from models.classification.settings import (
     BATCH_SIZE,
@@ -35,6 +33,8 @@ from models.classification.settings import (
     ENCODER_LR,
     FREEZE_ENCODER,
     BODY_LR,
+    HEAD_TYPE,
+    USE_CLASS_WEIGHTS,
     METRICS_CSV,
     N_BUCKETS_END,
     N_BUCKETS_START,
@@ -77,6 +77,9 @@ def load_data() -> pd.DataFrame:
             )
 
     filtered = metrics[metrics["t_delta"] == DELTA_VALUE]
+    if TARGET_COLUMN not in filtered.columns:
+        filtered[COMPUTED_METRIC_COL] = COMPUTED_METRIC_FN(filtered)
+    best_idx = filtered.groupby("sample_id")[TARGET_COLUMN].idxmax()
     best_idx = filtered.groupby("sample_id")[TARGET_COLUMN].idxmax()
     best = filtered.loc[best_idx, ["sample_id", "t_start", "t_end"]].reset_index(drop=True)
 
@@ -122,6 +125,13 @@ def collate(batch):
     return list(srcs), list(tgts), torch.stack(y1s), torch.stack(y2s)
 
 
+def _class_weights(indices: torch.Tensor, n_classes: int) -> torch.Tensor:
+    """Inverse-frequency weights from training label indices, normalized so mean = 1."""
+    counts = torch.bincount(indices, minlength=n_classes).float().clamp(min=1)
+    w = 1.0 / counts
+    return w / w.mean()
+
+
 def eval_loader(
     model: OrdinalPairClassifier, loader: DataLoader, device: torch.device
     ) -> dict[str, float]:
@@ -134,8 +144,12 @@ def eval_loader(
             l1 = l1.to(device)
             l2 = l2.to(device)
             out1, out2 = model(srcs, tgts)
-            all_p1.append(decode_ordinal(out1))
-            all_p2.append(decode_ordinal(out2))
+            if model.head_type == "CORAL":
+                all_p1.append(decode_ordinal(out1))
+                all_p2.append(decode_ordinal(out2))
+            else:
+                all_p1.append(decode_regression(out1, model.buckets1))
+                all_p2.append(decode_regression(out2, model.buckets2))
             all_l1.append(l1)
             all_l2.append(l2)
     p1 = torch.cat(all_p1)
@@ -174,7 +188,7 @@ def train() -> OrdinalPairClassifier:
     buckets_start = torch.tensor(sorted(df["t_start"].unique()), dtype=torch.float)
     buckets_end = torch.tensor(sorted(df["t_end"].unique()), dtype=torch.float)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = OrdinalPairClassifier(buckets1=buckets_start, buckets2=buckets_end, freeze_encoder=FREEZE_ENCODER).to(device)
+    model = OrdinalPairClassifier(buckets1=buckets_start, buckets2=buckets_end, freeze_encoder=FREEZE_ENCODER, head_type=HEAD_TYPE).to(device)
     if FREEZE_ENCODER:
         optimizer = torch.optim.Adam(
             [p for p in model.parameters() if p.requires_grad],
@@ -186,6 +200,18 @@ def train() -> OrdinalPairClassifier:
             {"params": list(model.body.parameters()) + list(model.head1.parameters()) + list(model.head2.parameters()), "lr": BODY_LR},
         ])
 
+    if USE_CLASS_WEIGHTS:
+        class_w_start = _class_weights(
+            torch.tensor(train_df["t_start_idx"].values), len(buckets_start)
+        ).to(device)
+        class_w_end = _class_weights(
+            torch.tensor(train_df["t_end_idx"].values), len(buckets_end)
+        ).to(device)
+        print(f"Class weights  t_start: {class_w_start.tolist()}")
+        print(f"Class weights  t_end:   {class_w_end.tolist()}")
+    else:
+        class_w_start = class_w_end = None
+
     weights_out = run_dir / "classifier_weights.pt"
     best_val_mae = float("inf")
 
@@ -196,7 +222,14 @@ def train() -> OrdinalPairClassifier:
             y1 = y1.to(device)
             y2 = y2.to(device)
             l1, l2 = model(srcs, tgts)
-            loss = ordinal_loss(l1, y1) + ordinal_loss(l2, y2)
+            w1 = class_w_start[y1] if class_w_start is not None else None
+            w2 = class_w_end[y2]   if class_w_end   is not None else None
+            if HEAD_TYPE == "CORAL":
+                loss = ordinal_loss(l1, y1, w1) + ordinal_loss(l2, y2, w2)
+            else:
+                y1_val = model.buckets1[y1]
+                y2_val = model.buckets2[y2]
+                loss = regression_loss(l1, y1_val, w1) + regression_loss(l2, y2_val, w2)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
