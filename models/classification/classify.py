@@ -23,20 +23,21 @@ from models.classification.model import (
     decode_ordinal,
     mae_buckets,
 )
-
-PARENT_DIR = Path(__file__).resolve().parent
-DATA_DIR = PARENT_DIR / "data"
-METRICS_CSV = DATA_DIR / "id_to_metrics.csv"
-STRINGS_CSV = DATA_DIR / "id_to_string_pair.csv"
-WEIGHTS_DIR = PARENT_DIR / "weights"
-
-TARGET_COLUMN = "combined_score"
-DELTA_VALUE = 0.0
-
-EPOCHS = 20
-BATCH_SIZE = 32
-LR = 1e-3
-SEED = 42
+from models.classification.settings import (
+    DATA_DIR,
+    METRICS_CSV,
+    STRINGS_CSV,
+    OUTPUTS_DIR,
+    COMPUTED_METRIC_FN,
+    COMPUTED_METRIC_COL,
+    COMPUTED_METRIC_LABEL,
+    TARGET_COLUMN,
+    DELTA_VALUE,
+    EPOCHS,
+    BATCH_SIZE,
+    LR,
+    SEED,
+)
 
 
 class PairDataset(Dataset):
@@ -137,10 +138,15 @@ def eval_loader(
 
 
 def train() -> OrdinalPairClassifier:
-    """Train the classifier and save weights to WEIGHTS_OUT."""
+    """Train the classifier and save weights + splits to a timestamped run directory."""
     df = load_data()
     train_df, val_df, test_df = split_data(df, seed=SEED)
-    save_splits(train_df, val_df, test_df)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = OUTPUTS_DIR / timestamp
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    save_splits(train_df, val_df, test_df, data_dir=run_dir)
     print(
         f"Dataset: {len(df)} samples  (t_delta={DELTA_VALUE}, target={TARGET_COLUMN})"
         f"  split: train={len(train_df)} / val={len(val_df)} / test={len(test_df)}"
@@ -159,9 +165,7 @@ def train() -> OrdinalPairClassifier:
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable_params, lr=LR)
 
-    WEIGHTS_DIR.mkdir(exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    weights_out = WEIGHTS_DIR / f"classifier_weights_{timestamp}.pt"
+    weights_out = run_dir / "classifier_weights.pt"
     best_val_mae = float("inf")
 
     for epoch in range(1, EPOCHS + 1):
@@ -182,7 +186,23 @@ def train() -> OrdinalPairClassifier:
         improved = val_mae < best_val_mae
         if improved:
             best_val_mae = val_mae
-            torch.save(model.state_dict(), weights_out)
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    "buckets1": buckets_start.tolist(),
+                    "buckets2": buckets_end.tolist(),
+                    "config": {
+                        "run_dir": str(run_dir),
+                        "METRICS_CSV": str(METRICS_CSV),
+                        "STRINGS_CSV": str(STRINGS_CSV),
+                        "TARGET_COLUMN": TARGET_COLUMN,
+                        "DELTA_VALUE": DELTA_VALUE,
+                        "COMPUTED_METRIC_COL": COMPUTED_METRIC_COL,
+                        "COMPUTED_METRIC_LABEL": COMPUTED_METRIC_LABEL,
+                    },
+                },
+                weights_out,
+            )
         print(
             f"Epoch {epoch:02d}  loss={epoch_loss / len(train_df):.4f}"
             f"  val: MAE_start={val_metrics['mae_t_start']:.3f}  MAE_end={val_metrics['mae_t_end']:.3f}"
@@ -190,8 +210,8 @@ def train() -> OrdinalPairClassifier:
             + ("  *" if improved else "")
         )
 
-    print(f"Saved {weights_out}  (best val MAE={best_val_mae:.4f})")
-    model.load_state_dict(torch.load(weights_out, map_location=device, weights_only=True))
+    print(f"Saved {weights_out}  (best val MAE={best_val_mae:.3f})")
+    model.load_state_dict(torch.load(weights_out, map_location=device, weights_only=False)["state_dict"])
 
     test_metrics = eval_loader(model, test_loader, device)
     print(

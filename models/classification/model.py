@@ -20,9 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 
-
-ENCODER_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-"""Pretrained transformer for the Siamese encoder."""
+from models.classification.settings import ENCODER_MODEL
 
 
 """

@@ -1,11 +1,5 @@
-from pathlib import Path
-
 import pandas as pd
 import numpy as np
-
-
-PARENT_DIR = Path(__file__).resolve().parent
-ID_TO_METRICS_PATH = PARENT_DIR / "pie_grid_evaluation.csv"
 
 
 def compute_combined_score(
@@ -42,13 +36,19 @@ def compute_combined_score(
     return pd.Series(combined, index=df.index, name="combined_score")
 
 
-def main() -> None:
-    df = pd.read_csv(ID_TO_METRICS_PATH)
-    df["combined_score"] = compute_combined_score(df)
-    df.to_csv(ID_TO_METRICS_PATH, index=False)
-    print(f"Updated {ID_TO_METRICS_PATH} with combined_score column ({len(df)} rows)")
+def compute_agreement_score(
+    df: pd.DataFrame,
+    psnr_col: str = "psnr",
+    clip_col: str = "clip_similarity_target_image",
+) -> pd.Series:
+    """Return a score in [0, 1] measuring how closely PSNR and CLIP similarity
+    agree on raw values.
 
+    Returns a score of 1 when the two metrics are equal, 0 at the point of 
+    maximum disagreement in the population.
+    """
+    psnr = df[psnr_col].to_numpy(dtype=float)
+    clip = df[clip_col].to_numpy(dtype=float)
 
-if __name__ == "__main__":
-    main()
-
+    diff = np.abs(psnr - clip)
+    return pd.Series(1.0 - diff / (diff.max() + 1e-8), index=df.index, name="agreement_score")
