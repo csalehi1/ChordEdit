@@ -106,6 +106,7 @@ class ChordEditPipeline(DiffusionPipeline):
         self._compute_dtype = compute_dtype
         self._use_attention_mask = bool(use_attention_mask)
         self._is_sdxl = tokenizer_2 is not None and text_encoder_2 is not None
+        self._model_family = "sdxl" if self._is_sdxl else "sd"
         self.to(self._device)
         self._set_compute_precision()
 
@@ -704,6 +705,13 @@ class ChordEditPipeline(DiffusionPipeline):
         return alpha_t, sigma_t
 
     def _pred_x0(self, x_anchor, timesteps, cond, noise):
+        """Predict the clean latent endpoint for the active model backend."""
+        if self._model_family == "flux":
+            return self._pred_x0_flux(x_anchor, timesteps, cond, noise)
+        return self._pred_x0_ddpm(x_anchor, timesteps, cond, noise)
+
+    def _pred_x0_ddpm(self, x_anchor, timesteps, cond, noise):
+        """DDPM/DDIM x0 prediction used by SD and SDXL backends."""
         alpha_t, sigma_t = self._get_alpha_sigma(x_anchor, timesteps)
         z_t = alpha_t * x_anchor + sigma_t * noise
         noise_pred = self._predict_noise(
@@ -713,6 +721,46 @@ class ChordEditPipeline(DiffusionPipeline):
         )
         x0_pred = (z_t - sigma_t * noise_pred) / alpha_t
         return x0_pred
+
+    def _pred_x0_flux(self, x_anchor, timesteps, cond, noise):
+        raise NotImplementedError("FLUX backend is not wired yet. This will be added after API introspection.")
+
+    def _predict_x0_from_noised_samples(
+        self,
+        samples: torch.Tensor,
+        timesteps: torch.Tensor,
+        cond: torch.Tensor | _PromptCondition,
+        *,
+        alpha: Optional[torch.Tensor] = None,
+        sigma: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Convert backend model predictions at noised/interpolated samples into x0 estimates."""
+        if self._model_family == "flux":
+            return self._predict_x0_flux_from_noised_samples(
+                samples=samples,
+                timesteps=timesteps,
+                cond=cond,
+                sigma=sigma,
+            )
+
+        if alpha is None or sigma is None:
+            raise ValueError("DDPM x0 prediction requires alpha and sigma.")
+        noise_pred = self._predict_noise(
+            sample=samples,
+            timesteps=timesteps,
+            cond=cond,
+        )
+        return (samples - sigma * noise_pred) / alpha
+
+    def _predict_x0_flux_from_noised_samples(
+        self,
+        samples: torch.Tensor,
+        timesteps: torch.Tensor,
+        cond: torch.Tensor | _PromptCondition,
+        *,
+        sigma: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError("FLUX noised-sample x0 prediction is not wired yet.")
     
     def _u_estimate(self, x_anchor, src_embed, edit_embed, noise, t_s: float, delta: float):
         if self._chord_edit_mode == "sym":
@@ -760,13 +808,13 @@ class ChordEditPipeline(DiffusionPipeline):
             dim=1,
         ).reshape(num_noises * 4 * batch, 1, 1, 1)
 
-        noise_pred = self._predict_noise(
-            sample=samples,
+        x0_all = self._predict_x0_from_noised_samples(
+            samples=samples,
             timesteps=timesteps,
             cond=conds,
+            alpha=alpha_cat,
+            sigma=sigma_cat,
         )
-
-        x0_all = (samples - sigma_cat * noise_pred) / alpha_cat
         x0_all = x0_all.reshape(num_noises, 4, batch, *x_anchor.shape[1:])
         x_src_p_s, x_tar_p_s, x_src_p_s0, x_tar_p_s0 = x0_all.unbind(dim=1)
 
@@ -818,13 +866,13 @@ class ChordEditPipeline(DiffusionPipeline):
             dim=1,
         ).reshape(num_noises * 4 * batch, 1, 1, 1)
 
-        noise_pred = self._predict_noise(
-            sample=samples,
+        x0_all = self._predict_x0_from_noised_samples(
+            samples=samples,
             timesteps=timesteps,
             cond=conds,
+            alpha=alpha_cat,
+            sigma=sigma_cat,
         )
-
-        x0_all = (samples - sigma_cat * noise_pred) / alpha_cat
         x0_all = x0_all.reshape(num_noises, 4, batch, *x_anchor.shape[1:])
         x_src_p_s, x_tar_p_s, x_src_p_s0, x_tar_p_s0 = x0_all.unbind(dim=1)
 
