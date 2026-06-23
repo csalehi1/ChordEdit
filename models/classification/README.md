@@ -33,7 +33,7 @@ Before running anything, open [settings.py](settings.py) and update these settin
 | `METRICS_CSV` | Path to your `id_to_metrics_*.csv` file (e.g. `DATA_DIR / "id_to_metrics_sdturbo.csv"`). `OUTPUTS_DIR` is derived from this name automatically. |
 | `N_BUCKETS_START` | Number of distinct `t_start` ($t^{*}$) values in your CSV. The loader raises at runtime if the data doesn't match. |
 | `N_BUCKETS_END` | Number of distinct `t_end` ($t^{**}$) values in your CSV. Same enforcement applies. |
-| `DELTA_VALUE` | `t_delta` value used to select rows from the data. Reflects $\delta$ values used to generate image. |
+| `T_DELTA_TARGET` | `t_delta` value used to select rows from the data. Reflects $\delta$ values used to generate image. |
 
 Wrong values here will cause a load-time error, so set them before anything else.
 

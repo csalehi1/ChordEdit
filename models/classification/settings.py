@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Callable
 
 from models.classification.utils import (
-    compute_combined_score,
     compute_weighted_combined_score,
     compute_agreement_score,
     compute_naive_pareto_score,
@@ -20,7 +19,7 @@ _PARENT_DIR = Path(__file__).resolve().parent
 DATA_DIR = _PARENT_DIR / "data"
 
 # NOTE: Adjust METRICS_CSV dependent on the data
-METRICS_CSV = DATA_DIR / "id_to_metrics_sdturbo.csv"
+METRICS_CSV = DATA_DIR / "id_to_metrics_sdxlturbo_tstart.csv"
 STRINGS_CSV = DATA_DIR / "id_to_string_pair.csv"
 
 # Files for image data should be named `id_to_metrics_*`
@@ -38,7 +37,9 @@ within each sample group.
 """
 
 N_BUCKETS_START = 11
-N_BUCKETS_END = 11
+N_BUCKETS_END = 1
+# Value in `t_delta` column to select data from 
+T_DELTA_TARGET = 0.0
 
 PAPER_T_START = 0.9
 PAPER_T_END = 0.3
@@ -102,10 +103,10 @@ columns can use a single dict.
 
 _METRICS = {
     "psnr": "Whole PSNR",
-    "clip_target_similarity": "CLIP Target Similarity",
+    "clip_edited": "CLIP-Edited",
 }
 
-METRIC_COLS = _METRICS.keys()
+METRIC_COLS = list(_METRICS.keys())
 METRIC_LABELS = {
     **_METRICS,
     COMPUTED_METRIC_COL: COMPUTED_METRIC_LABEL,
@@ -135,17 +136,13 @@ USE_CLASS_WEIGHTS = True
 
 """
 Training hyperparameters. TARGET_COLUMN is the regression/ordinal
-target; DELTA_VALUE is the value of the paper's delta that was used to
-generate images. ENCODER_LR and MLP_LR are kept separate because the
-encoder backbone and the MLP head typically benefit from different
-learning rates. MLP_WIDE / MLP_HIDDEN / MLP_INNER define the three
-hidden layer widths of the head network.
+target; ENCODER_LR and MLP_LR are kept separate because the encoder
+backbone and the MLP head typically benefit from different learning
+rates. MLP_WIDE / MLP_HIDDEN / MLP_INNER define the three hidden layer
+widths of the head network.
 """
 
 TARGET_COLUMN = COMPUTED_METRIC_COL
-
-# Select data from this `t_delta` column
-DELTA_VALUE = 0.15
 
 SEED = 42
 EPOCHS = 20

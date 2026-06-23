@@ -2,8 +2,8 @@
 Train OrdinalPairClassifier to predict t_start and t_end
 from (source_prompt, target_prompt) pairs.
 
-Rows are filtered to those matching DELTA_VALUE for t_delta, then for each
-sample_id the row with the highest combined_score is selected. The resulting
+Rows are filtered to those matching T_DELTA_TARGET for t_delta, then for each
+sample_id the row with the highest TARGET_COLUMN is selected. The resulting
 t_start and t_end values are quantile-binned into N_BINS ordinal buckets
 passed to OrdinalPairClassifier.
 """
@@ -27,7 +27,7 @@ from models.classification.settings import (
     COMPUTED_METRIC_FN,
     COMPUTED_METRIC_LABEL,
     DATA_DIR,
-    DELTA_VALUE,
+    T_DELTA_TARGET,
     EPOCHS,
     ENCODER_LR,
     FREEZE_ENCODER,
@@ -61,7 +61,7 @@ class PairDataset(Dataset):
 
 
 def load_data() -> pd.DataFrame:
-    """Filter metrics to DELTA_VALUE rows, pick the highest TARGET_COLUMN row per id,
+    """Filter metrics to T_DELTA_TARGET rows, pick the highest TARGET_COLUMN row per id,
     and join with prompt strings. Maps discrete t_start/t_end values to ordinal indices."""
     metrics = pd.read_csv(METRICS_CSV, dtype={"sample_id": str})
     strings = pd.read_csv(STRINGS_CSV, dtype={"id": str})
@@ -75,10 +75,18 @@ def load_data() -> pd.DataFrame:
                 f"but expected {expected} from settings.py."
             )
 
-    filtered = metrics[metrics["t_delta"] == DELTA_VALUE]
+    # Validate that T_DELTA_TARGET exists in the data
+    if T_DELTA_TARGET not in metrics["t_delta"].values:
+        raise ValueError(
+            f"{T_DELTA_TARGET=} not found in t_delta column "
+            f"(distinct values: {sorted(metrics['t_delta'].unique())})."
+        )
+
+    filtered = metrics[metrics["t_delta"] == T_DELTA_TARGET]
     if TARGET_COLUMN not in filtered.columns:
         filtered[COMPUTED_METRIC_COL] = COMPUTED_METRIC_FN(filtered)
-    best_idx = filtered.groupby("sample_id")[TARGET_COLUMN].idxmax()
+    # Rows with default t-values will score 1 on Pareto Score so that
+    # a maximum value will always exist.
     best_idx = filtered.groupby("sample_id")[TARGET_COLUMN].idxmax()
     best = filtered.loc[best_idx, ["sample_id", "t_start", "t_end"]].reset_index(drop=True)
 
@@ -175,7 +183,7 @@ def train() -> OrdinalPairClassifier:
 
     save_splits(train_df, val_df, test_df, data_dir=run_dir)
     print(
-        f"Dataset: {len(df)} samples  (t_delta={DELTA_VALUE}, target={TARGET_COLUMN})"
+        f"Dataset: {len(df)} samples  (t_delta={T_DELTA_TARGET}, target={TARGET_COLUMN})"
         f"  split: train={len(train_df)} / val={len(val_df)} / test={len(test_df)}"
     )
 
@@ -249,7 +257,7 @@ def train() -> OrdinalPairClassifier:
                         **{
                             k: str(v) if isinstance(v, Path) else (v.__name__ if callable(v) else v)
                             for k, v in vars(_settings).items()
-                            if k.isupper()
+                            if k.isupper() and not k.startswith("_") and not isinstance(v, type({}.keys()))
                         },
                     },
                 },
