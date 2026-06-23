@@ -22,9 +22,14 @@ from transformers import AutoModel, AutoTokenizer
 from models.classification.settings import ENCODER_MODEL
 from models.classification.head_coral import CoralHead, decode_ordinal
 from models.classification.head_mse import RegressionHead, decode_regression
-from models.classification.head_mae import mae_buckets  # noqa: F401
 
 from models.classification.settings import *
+
+
+def mae_buckets(pred_idx: torch.Tensor, true_idx: torch.Tensor) -> torch.Tensor:
+    """Mean Absolute Error over bucket indices. An MAE of 1.0 means off by one bucket on average."""
+    return (pred_idx - true_idx).abs().float().mean()
+
 
 """
 Encoder.

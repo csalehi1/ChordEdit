@@ -17,10 +17,9 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from models.classification.model import OrdinalPairClassifier
+from models.classification.model import OrdinalPairClassifier, mae_buckets
 from models.classification.head_coral import ordinal_loss, decode_ordinal
 from models.classification.head_mse import regression_loss, decode_regression
-from models.classification.head_mae import mae_buckets
 import models.classification.settings as _settings
 from models.classification.settings import (
     BATCH_SIZE,
