@@ -514,15 +514,34 @@ class ChordEditPipeline(DiffusionPipeline):
 
     def _encode_image_to_latent(self, pixel_values: torch.Tensor) -> torch.Tensor:
         scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
+        shift_factor = getattr(self.vae.config, "shift_factor", 0.0)
+
         pixel_values = pixel_values.to(device=self._device, dtype=self._compute_dtype)
         latents = self.vae.encode(pixel_values).latent_dist.mode()
-        latents = latents * scaling_factor
+
+        if self._model_family == "flux":
+            # FLUX VAE latents use both scaling and shift.
+            latents = (latents - shift_factor) * scaling_factor
+        else:
+            # SD/SDXL VAE latents use scaling only.
+            latents = latents * scaling_factor
+
         return latents.to(device=self._device, dtype=self._compute_dtype)
 
     def _decode_latent_to_image(self, latents: torch.Tensor) -> torch.Tensor:
         scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
+        shift_factor = getattr(self.vae.config, "shift_factor", 0.0)
+
         latents = latents.to(device=self._device, dtype=self._compute_dtype)
-        decoded = self.vae.decode(latents / scaling_factor).sample
+
+        if self._model_family == "flux":
+            # Invert FLUX VAE latent normalization.
+            vae_latents = (latents / scaling_factor) + shift_factor
+        else:
+            # Invert SD/SDXL VAE latent normalization.
+            vae_latents = latents / scaling_factor
+
+        decoded = self.vae.decode(vae_latents).sample
         decoded = (decoded.clamp(-1.0, 1.0) + 1.0) / 2.0
         # Keep model computations in the requested dtype, but return float32 for
         # downstream PIL/torchvision/export code. torchvision image conversion
@@ -945,20 +964,22 @@ class ChordEditPipeline(DiffusionPipeline):
     def _u_estimate_flux(self, x_anchor, src_embed, edit_embed, noise, t_s: float, delta: float):
         """FLUX ChordEdit residual.
 
-        FLUX_CHORDEDIT_RESIDUAL=clean_disp:
-            R = x0_tgt - x0_src = -sigma * (v_tgt - v_src).
-            This is the default because x_curr is a clean latent.
-
         FLUX_CHORDEDIT_RESIDUAL=velocity:
-            R = v_tgt - v_src, the paper-literal velocity comparison domain.
+        R = v_tgt - v_src, the paper-literal B_t = I residual.
+        This is the default.
+
+        FLUX_CHORDEDIT_RESIDUAL=clean_disp:
+        R = x0_tgt - x0_src = -sigma * (v_tgt - v_src).
+        This is an experimental clean-latent displacement variant.
         """
         batch, device = x_anchor.shape[0], x_anchor.device
+        batch_size = batch
         noises = noise if isinstance(noise, (list, tuple)) else [noise]
         mode = os.environ.get("FLUX_CHORDEDIT_RESIDUAL", "velocity").lower()
 
         def query_residual(t_query: float, eps: torch.Tensor):
             t_query = float(max(0.0, min(1.0, t_query)))
-            t_idx = self._time_to_index(batch, t_query, device=device)
+            t_idx = self._time_to_index(batch_size, t_query, device=device)
 
             sigma = self._flux_timestep_to_sigma(t_idx, x_anchor)
             sigma = sigma.to(device=x_anchor.device, dtype=x_anchor.dtype)
@@ -982,6 +1003,8 @@ class ChordEditPipeline(DiffusionPipeline):
             if mode in {"velocity", "paper", "paper_velocity"}:
                 residual = dv
             elif mode in {"neg_velocity", "minus_velocity"}:
+                # Sign sanity check: test whether the FLUX/Diffusers velocity convention
+                # is opposite of the assumed paper direction.
                 residual = -dv
             else:
                 # Diffusers FLUX clean extrapolation:
