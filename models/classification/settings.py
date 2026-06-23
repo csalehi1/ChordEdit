@@ -1,4 +1,7 @@
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
+from typing import Callable
 
 from models.classification.utils import (
     compute_combined_score,
@@ -7,61 +10,147 @@ from models.classification.utils import (
     compute_naive_pareto_score,
 )
 
-PARENT_DIR = Path(__file__).resolve().parent
-DATA_DIR = PARENT_DIR / "data"
+"""
+Paths. Root directories and CSV inputs derived from the location of this
+file. The outputs subdirectory is named after the metrics CSV stem so
+that different datasets write to isolated folders automatically.
+"""
 
+_PARENT_DIR = Path(__file__).resolve().parent
+DATA_DIR = _PARENT_DIR / "data"
+
+# NOTE: Adjust METRICS_CSV dependent on the data
 METRICS_CSV = DATA_DIR / "id_to_metrics_sdturbo.csv"
 STRINGS_CSV = DATA_DIR / "id_to_string_pair.csv"
 
-OUTPUTS_SUBDIR = "sdturbo"
-OUTPUTS_DIR = PARENT_DIR / "outputs" / OUTPUTS_SUBDIR
+# Files for image data should be named `id_to_metrics_*`
+_OUTPUTS_SUBDIR = METRICS_CSV.stem.removeprefix("id_to_metrics_")
+OUTPUTS_DIR = _PARENT_DIR / "outputs" / _OUTPUTS_SUBDIR
 
-# Expected number of distinct t_start/t_end levels in the training data.
-# Values must be in [0, 1]. Raise an error at load time if the data differs.
+
+"""
+Parameters that describe the shape and structure of the training data.
+N_BUCKETS_* defines the expected number of distinct timestep levels; the
+loader raises at import time if the data does not match. The PAPER_T_*
+constants reproduce the baseline timestep bounds from the original paper
+and are used by compute_naive_pareto_score to identify the reference row
+within each sample group.
+"""
+
 N_BUCKETS_START = 11
 N_BUCKETS_END = 11
 
-# Baseline timestep bounds from the paper
 PAPER_T_START = 0.9
-PAPER_T_END  = 0.3
+PAPER_T_END = 0.3
 PAPER_T_DELTA = 0.15
 
-# Computed metric to add to data from PSNR/CLIP
-COMPUTED_METRIC_FN = compute_naive_pareto_score
-COMPUTED_METRIC_COL = f"naive_pareto_score"
-COMPUTED_METRIC_LABEL = f"Naive Pareto Score$"
 
-# _lambda_psnr, _lambda_clip = 0.5, 0.5
-# COMPUTED_METRIC_FN = lambda *args: compute_weighted_combined_score(lambda_psnr=_lambda_psnr, lambda_clip=_lambda_clip, *args)
-# COMPUTED_METRIC_COL = f"combined_score_p{_lambda_psnr}_c_{_lambda_clip}"
-# COMPUTED_METRIC_LABEL = f"Combined Score $\\lambda_{{\\text{{PSNR}}}}={_lambda_psnr}, \\lambda_{{\\text{{CLIP}}}}={_lambda_clip}$"
+"""
+Computed metrics. Each MetricOption bundles the DataFrame column name,
+the callable that produces  it, and a display label. Parameterized
+variants (e.g. weighted combined score)  use functools.partial so
+every option has the same zero-argument-from-df call  signature. To
+switch the metric used throughout training and evaluation, change the
+key passed to _COMPUTED_METRIC_OPTIONS on the _ACTIVE line. The three
+module-level constants below it are then derived automatically.
+"""
 
-#
-METRIC_COLS = ["psnr", "clip_target_similarity", COMPUTED_METRIC_COL]
-METRIC_LABELS = {
+
+@dataclass(frozen=True)
+class MetricOption:
+    col: str
+    fn: Callable
+    label: str
+
+
+# Possible computed metric options linked to their associated functions
+_LAMBDA_PSNR, _LAMBDA_CLIP = 0.5, 0.5
+_COMPUTED_METRIC_OPTIONS: dict[str, MetricOption] = {
+    "weighted_combined_score": MetricOption(
+        col="weighted_combined_score",
+        fn=partial(compute_weighted_combined_score, lambda_psnr=_LAMBDA_PSNR, lambda_clip=_LAMBDA_CLIP),
+        label=(
+            "Combined Score" f" $\\lambda_{{\\text{{PSNR}}}}={_LAMBDA_PSNR}, \\lambda_{{\text{{CLIP}}}}={_LAMBDA_CLIP}$"
+        ),
+    ),
+    "agreement_score": MetricOption(
+        col="agreement_score",
+        fn=compute_agreement_score,
+        label="Agreement Score",
+    ),
+    "naive_pareto_score": MetricOption(
+        col="naive_pareto_score",
+        fn=compute_naive_pareto_score,
+        label="Naive Pareto Score",
+    ),
+}
+
+# NOTE: May be "weighted_combined_score", "agreement_score",
+# "naive_pareto_score". Select preference.
+_ACTIVE = _COMPUTED_METRIC_OPTIONS["naive_pareto_score"]
+COMPUTED_METRIC_COL = _ACTIVE.col
+COMPUTED_METRIC_FN = _ACTIVE.fn
+COMPUTED_METRIC_LABEL = _ACTIVE.label
+
+
+"""
+Metric columns. _METRICS maps the base signal column names to their
+display labels. METRIC_LABELS extends that mapping with the active
+computed metric so any plot or table that iterates over all tracked
+columns can use a single dict.
+"""
+
+_METRICS = {
     "psnr": "Whole PSNR",
     "clip_target_similarity": "CLIP Target Similarity",
+}
+
+METRIC_COLS = _METRICS.keys()
+METRIC_LABELS = {
+    **_METRICS,
     COMPUTED_METRIC_COL: COMPUTED_METRIC_LABEL,
 }
 
-# Train on computed metric
-TARGET_COLUMN = COMPUTED_METRIC_COL
-# The variable 
-DELTA_VALUE = 0.15
 
-# Pretrained transformer for the Siamese Encoder
+"""
+Model architecture. ENCODER_MODEL names the HuggingFace checkpoint
+used as the Siamese backbone. FREEZE_ENCODER prevents its weights from
+updating during training; set to False to fine-tune end-to-end.
+HEAD_TYPE selects between ordinal regression ("CORAL") and plain
+mean-squared-error ("MSE"). USE_CLASS_WEIGHTS re-weights the loss by
+inverse class frequency to counteract label imbalance in the training
+split.
+"""
+
+# Name of HuggingFace checkpoint for text-encoder
 ENCODER_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-
-# Prevent the encoding model from training
+# Prevent encoder weights from updating during training
 FREEZE_ENCODER = True
-# Choose between "CORAL" or "MSE"
+# Select head type to use for last step of model,
+# NOTE: May be "CORAL" or "MSE"
 HEAD_TYPE = "CORAL"
-# Weight loss by inverse class frequency to counteract imbalance
-USE_CLASS_WEIGHTS = True   
+# Counteract label imbalance in the training split.
+USE_CLASS_WEIGHTS = True
+
+
+"""
+Training hyperparameters. TARGET_COLUMN is the regression/ordinal
+target; DELTA_VALUE is the value of the paper's delta that was used to
+generate images. ENCODER_LR and MLP_LR are kept separate because the
+encoder backbone and the MLP head typically benefit from different
+learning rates. MLP_WIDE / MLP_HIDDEN / MLP_INNER define the three
+hidden layer widths of the head network.
+"""
+
+TARGET_COLUMN = COMPUTED_METRIC_COL
+
+# Select data from this `t_delta` column
+DELTA_VALUE = 0.15
 
 SEED = 42
 EPOCHS = 20
 BATCH_SIZE = 32
+
 ENCODER_LR = 2e-5
 WEIGHT_DECAY = 0.01
 

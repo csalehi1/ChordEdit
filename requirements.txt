@@ -11,7 +11,10 @@ diffusers
 gradio
 matplotlib
 numpy
-Pillow
+pillow
 pyyaml
 seaborn
 transformers
+matplotlib
+pandas
+pyyaml
