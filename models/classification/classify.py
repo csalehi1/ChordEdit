@@ -32,7 +32,7 @@ from models.classification.settings import (
     EPOCHS,
     ENCODER_LR,
     FREEZE_ENCODER,
-    BODY_LR,
+    MLP_LR,
     HEAD_TYPE,
     USE_CLASS_WEIGHTS,
     METRICS_CSV,
@@ -192,12 +192,12 @@ def train() -> OrdinalPairClassifier:
     if FREEZE_ENCODER:
         optimizer = torch.optim.Adam(
             [p for p in model.parameters() if p.requires_grad],
-            lr=BODY_LR,
+            lr=MLP_LR,
         )
     else:
         optimizer = torch.optim.Adam([
             {"params": model.encoder.parameters(), "lr": ENCODER_LR},
-            {"params": list(model.body.parameters()) + list(model.head1.parameters()) + list(model.head2.parameters()), "lr": BODY_LR},
+            {"params": list(model.body.parameters()) + list(model.head1.parameters()) + list(model.head2.parameters()), "lr": MLP_LR},
         ])
 
     if USE_CLASS_WEIGHTS:
