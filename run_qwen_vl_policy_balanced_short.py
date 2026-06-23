@@ -9,75 +9,43 @@ from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 
 # ---------------------------------------------------------------------
-# Prompt variant: long axis-rubric prompt
+# Prompt variant: shorter balanced prompt
 #
 # Full-700 result:
 #   Output CSV:
-#   /shared/ssd_30T/zarageddes/llm_timestep_policy/qwen_vl_4b_policy_predictions_full700_axis_rubric_v1.csv
+#   /shared/ssd_30T/zarageddes/llm_timestep_policy/qwen_vl_4b_policy_predictions_full700_balanced_short.csv
 #
-#   Accuracy: 34.71%
+#   Accuracy: 33.57%
 #
 # Notes:
-#   This was the best full-dataset prompt-only Qwen-VL result tested so far.
-#   It remains weak overall, but it was the most reliable prompt among the
-#   tested variants.
+#   This shorter prompt was designed to keep the main calibration cautions:
+#   do not overuse HIGH for semantically meaningful edits, and do not overuse
+#   LOW for small-looking edits that change salient color/material/style/identity.
+#   It was close to the long prompt but still worse, mainly because predictions
+#   collapsed too much toward MID.
 # ---------------------------------------------------------------------
-SYSTEM_PROMPT = """You are choosing a ChordEdit timestep bucket for an image edit.
+SYSTEM_PROMPT = """You are predicting the best ChordEdit timestep bucket for an image edit.
 
-Choose the bucket by estimating how much the edit must change the original image.
+Choose the bucket that best balances:
+1. making the requested edit visible, and
+2. preserving the original image.
 
 Buckets:
-LOW = t_start 0.3 or 0.4
-MID = t_start 0.5 or 0.6
-HIGH = t_start 0.7, 0.8, or 0.9
+LOW = t_start 0.3 or 0.4: weak edit, strongest preservation.
+MID = t_start 0.5 or 0.6: moderate edit.
+HIGH = t_start 0.7, 0.8, or 0.9: strong edit, more source override.
 
-Do not choose based only on whether the instruction sounds easy or hard. Judge the edit along these three axes:
+Do not choose HIGH just because the instruction sounds semantically meaningful.
+Many meaningful edits still work best at LOW if preserving the source layout, shape, pose, and composition is important.
 
-1. Region scope:
+Do not choose LOW just because the edited region looks small.
+A small-looking edit may need MID or HIGH if it changes a defining color, material, texture, style, or identity of a salient object.
 
-* small/local region = lower strength
-* main subject or large salient region = higher strength
-* whole image or global scene/style = highest strength
+Choose LOW when preservation likely matters more than forcing a strong edit.
+Choose MID when both LOW and HIGH seem plausible.
+Choose HIGH only when the edit would likely be weak or absent without strong source override.
 
-2. Visual identity change:
-
-* small attribute/detail change = lower strength
-* object/category/pose/background change = moderate strength
-* change to the defining color, material, style, or identity of a salient object = higher strength
-
-3. Preservation need:
-
-* if the original layout, object shape, pose, or scene should stay nearly the same, lower the strength
-* if preserving the source would prevent the requested edit from appearing, raise the strength
-
-Choose LOW when the edit is mostly local or attribute-level and the original image should stay very similar.
-
-Choose MID when the edit needs a clear visible change but should still preserve most source structure.
-
-Choose HIGH when the edit must strongly change a salient object, defining color/material, global style, lighting, background, or scene identity, and lower strengths would likely leave the edit weak or absent.
-
-Examples of edits that may be LOW:
-
-* small object addition/removal
-* slight pose, expression, or state change
-* changing a local detail or pattern
-* object replacement where preserving the original shape/layout is important
-
-Examples of edits that may be MID:
-
-* local object replacement
-* noticeable pose/state/expression change
-* changing an important object detail
-* background change that should preserve the main subject
-
-Examples of edits that may be HIGH:
-
-* changing the global style of the image
-* changing the defining color or material of a main object
-* changing the main subject into a substantially different subject
-* changing the scene, atmosphere, or lighting in a way that affects the whole image
-
-Use the examples as guidance, not fixed rules. The same edit type can be LOW, MID, or HIGH depending on scope, visual identity change, and preservation need.
+Use the source image, original prompt, edit prompt, and edit instruction.
 
 Return only valid JSON:
 {"bucket": "LOW|MID|HIGH", "reason": "one short sentence"}
