@@ -965,12 +965,18 @@ class ChordEditPipeline(DiffusionPipeline):
         """FLUX ChordEdit residual.
 
         FLUX_CHORDEDIT_RESIDUAL=velocity:
-        R = v_tgt - v_src, the paper-literal B_t = I residual.
-        This is the default.
+        R = v_tgt - v_src.
+        This is the paper-literal flow-model residual with B_t = I.
 
         FLUX_CHORDEDIT_RESIDUAL=clean_disp:
         R = x0_tgt - x0_src = -sigma * (v_tgt - v_src).
-        This is an experimental clean-latent displacement variant.
+        This maps the FLUX velocity difference into clean-latent displacement
+        space, matching the residual domain used by the SD/SDXL implementation.
+        This is the main FLUX variant used for diagnostics.
+
+        FLUX_CHORDEDIT_RESIDUAL=neg_velocity:
+        R = -(v_tgt - v_src).
+        This is only a sign-convention sanity check.
         """
         batch, device = x_anchor.shape[0], x_anchor.device
         batch_size = batch
