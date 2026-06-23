@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
+import os
 from PIL import Image, ImageOps
 from diffusers import DDPMScheduler, AutoencoderKL, UNet2DConditionModel, FluxPipeline
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
@@ -808,7 +809,6 @@ class ChordEditPipeline(DiffusionPipeline):
         return alpha_t, sigma_t
 
     def _pred_x0(self, x_anchor, timesteps, cond, noise):
-        """Predict the clean latent endpoint for the active model backend."""
         if self._model_family == "flux":
             return self._pred_x0_flux(x_anchor, timesteps, cond, noise)
         return self._pred_x0_ddpm(x_anchor, timesteps, cond, noise)
@@ -862,14 +862,18 @@ class ChordEditPipeline(DiffusionPipeline):
             self._compute_dtype,
         )
 
-        timestep = timesteps.to(device=self._device, dtype=self._compute_dtype)
+        # Diffusers FLUX transformer expects normalized timesteps in [0, 1],
+        # while ChordEdit's generic timestep index uses [0, 1000].
+        timestep = timesteps.to(device=self._device, dtype=self._compute_dtype) / 1000.0
         guidance = None
+        
         if getattr(self.transformer.config, "guidance_embeds", False):
+            guidance_scale = float(os.environ.get("FLUX_CHORDEDIT_GUIDANCE", "3.5"))
             guidance = torch.full(
                 (packed.shape[0],),
-                0.0,
+                guidance_scale,
                 device=self._device,
-                dtype=self._compute_dtype,
+                dtype=torch.float32,
             )
 
         pred = self.transformer(
@@ -938,10 +942,106 @@ class ChordEditPipeline(DiffusionPipeline):
         )
         return samples - sigma * velocity_pred
     
+    def _u_estimate_flux(self, x_anchor, src_embed, edit_embed, noise, t_s: float, delta: float):
+        """FLUX ChordEdit residual.
+
+        FLUX_CHORDEDIT_RESIDUAL=clean_disp:
+            R = x0_tgt - x0_src = -sigma * (v_tgt - v_src).
+            This is the default because x_curr is a clean latent.
+
+        FLUX_CHORDEDIT_RESIDUAL=velocity:
+            R = v_tgt - v_src, the paper-literal velocity comparison domain.
+        """
+        batch, device = x_anchor.shape[0], x_anchor.device
+        noises = noise if isinstance(noise, (list, tuple)) else [noise]
+        mode = os.environ.get("FLUX_CHORDEDIT_RESIDUAL", "velocity").lower()
+
+        def query_residual(t_query: float, eps: torch.Tensor):
+            t_query = float(max(0.0, min(1.0, t_query)))
+            t_idx = self._time_to_index(batch, t_query, device=device)
+
+            sigma = self._flux_timestep_to_sigma(t_idx, x_anchor)
+            sigma = sigma.to(device=x_anchor.device, dtype=x_anchor.dtype)
+            alpha = 1.0 - sigma
+
+            z_t = alpha * x_anchor + sigma * eps
+
+            v_src = self._predict_flux_velocity(
+                z_t,
+                t_idx,
+                src_embed,
+            )
+            v_tgt = self._predict_flux_velocity(
+                z_t,
+                t_idx,
+                edit_embed,
+            )
+
+            dv = v_tgt - v_src
+
+            if mode in {"velocity", "paper", "paper_velocity"}:
+                residual = dv
+            elif mode in {"neg_velocity", "minus_velocity"}:
+                residual = -dv
+            else:
+                # Diffusers FLUX clean extrapolation:
+                # x0 = z_t - sigma * v.
+                # Therefore x0_tgt - x0_src = -sigma * (v_tgt - v_src).
+                residual = -sigma * dv
+
+            if os.environ.get("FLUX_CHORDEDIT_DEBUG", "0") == "1" and not getattr(self, "_flux_chord_debug_printed", False):
+                self._flux_chord_debug_printed = True
+                print("FLUX_CHORDEDIT_RESIDUAL", mode)
+                print("t_query", t_query)
+                print("sigma mean", float(sigma.float().mean()))
+                print("z_t absmean", float(z_t.float().abs().mean()))
+                print("v_src absmean", float(v_src.float().abs().mean()))
+                print("v_tgt absmean", float(v_tgt.float().abs().mean()))
+                print("dv absmean", float(dv.float().abs().mean()))
+                print("residual absmean", float(residual.float().abs().mean()))
+
+            return residual
+
+        residual_t_all = []
+        residual_prev_all = []
+        t_prev = max(0.0, float(t_s) - float(delta))
+
+        for eps in noises:
+            residual_t_all.append(query_residual(float(t_s), eps))
+            if delta > 1e-8:
+                residual_prev_all.append(query_residual(t_prev, eps))
+
+        residual_t = torch.stack(residual_t_all, dim=0).mean(dim=0)
+
+        if delta <= 1e-8:
+            return residual_t
+
+        residual_prev = torch.stack(residual_prev_all, dim=0).mean(dim=0)
+
+        denom = float(t_s) + float(delta)
+        if denom <= 1e-8:
+            return residual_t
+
+        return (float(t_s) * residual_prev + float(delta) * residual_t) / denom
+
     def _u_estimate(self, x_anchor, src_embed, edit_embed, noise, t_s: float, delta: float):
+        # ChordEdit dispatch:
+        #   SD/SDXL: convert noise/x0 outputs into the comparison domain.
+        #   FLUX: velocity model, so B_t = I and the residual is v_tgt - v_src.
+        if self._model_family == "flux":
+            return self._u_estimate_flux(
+                x_anchor,
+                src_embed,
+                edit_embed,
+                noise,
+                t_s,
+                delta,
+            )
+
         if self._chord_edit_mode == "sym":
             print("Using symmetric edit mode ...")
             return self._u_estimate_sym(x_anchor, src_embed, edit_embed, noise, t_s, delta)
+
         return self._u_estimate_default(x_anchor, src_embed, edit_embed, noise, t_s, delta)
 
     def _u_estimate_default(self, x_anchor, src_embed, edit_embed, noise, t_s: float, delta: float):
@@ -1110,6 +1210,9 @@ class ChordEditPipeline(DiffusionPipeline):
 
         if params["cleanup"]:
             t_end_idx = self._time_to_index(x_src.shape[0], params["t_end"], device=device)
-            x_curr = self._pred_x0(x_curr, t_end_idx, edit_embed, noise[0])
+            if self._model_family == "flux":
+                x_curr = self._pred_x0_flux(x_curr, t_end_idx, edit_embed, noise[0])
+            else:
+                x_curr = self._pred_x0(x_curr, t_end_idx, edit_embed, noise[0])
 
         return x_curr
