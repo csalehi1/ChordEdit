@@ -1,15 +1,7 @@
 """
 Regenerates edit-region masks for every sample in the ReShapeBench export
 using CLIPSeg text-prompted segmentation, driven by each row's `foreground`
-label (e.g. "classic street lamp", "flock of sheep").
-
-This replaces the dataset's own `mask` files, which were found to be
-misaligned with the actual described object (see diagnostic findings).
-
-Usage:
-    python regenerate_masks.py
-    python regenerate_masks.py --threshold 0.4   # tune mask sensitivity
-    python regenerate_masks.py --max-samples 5    # quick test first
+label.
 """
 from __future__ import annotations
 

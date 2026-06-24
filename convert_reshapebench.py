@@ -1,10 +1,6 @@
 """
 Converts the ReShapeBench HF dataset into a PIE-Bench-compatible folder layout
 that run_pie_bench.py can consume directly via --pie-root.
-
-Usage:
-    python convert_reshapebench.py                 # full dataset
-    python convert_reshapebench.py --max-samples 3  # quick smoke test
 """
 from __future__ import annotations
 
@@ -22,8 +18,7 @@ REPO_ID = "3087richard/ReShapeBench"
 
 # The dataset's `mask` field stores a path like "masks/000101.png" that is
 # relative to *some* config subfolder inside the HF repo (e.g. "single_object/").
-# We don't know which subfolder a given row belongs to from the row itself,
-# so we try the known candidates in order until one downloads successfully.
+
 MASK_PREFIX_CANDIDATES = ["single_object", "multi_object", ""]
 
 
@@ -79,11 +74,9 @@ def main() -> None:
         img_filename = f"{sample_id}.png"
         img_path = img_dir / img_filename
 
-        # image is already a decoded PIL.Image -- just save it.
         if not img_path.exists():
             row["image"].convert("RGB").save(img_path)
 
-        # mask is a relative path string pointing into the HF repo -- fetch the real file.
         mask_filename = f"{sample_id}.png"
         mask_dest = mask_dir / mask_filename
         mask_ok = fetch_mask_file(row["mask"], mask_dest)
