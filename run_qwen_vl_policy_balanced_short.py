@@ -46,21 +46,6 @@ Return only valid JSON:
 {"bucket": "LOW|MID|HIGH", "reason": "one short sentence"}
 """
 
-
-def build_user_prompt(row):
-    source_prompt = str(row.get("original_prompt", ""))
-    target_prompt = str(row.get("editing_prompt", ""))
-    edit_instruction = str(row.get("editing_instruction", ""))
-
-    return (
-        'Input: { '
-        f'"source prompt": "{source_prompt}", '
-        f'"target prompt": "{target_prompt}", '
-        f'"edit instruction": "{edit_instruction}" '
-        '}\n'
-        "Choose the timestep bucket."
-    )
-
 def parse_bucket(text):
     # Prefer JSON if model follows instructions.
     try:
