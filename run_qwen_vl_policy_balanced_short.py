@@ -1,4 +1,5 @@
 import argparse
+import os
 import json
 import re
 from pathlib import Path
@@ -35,17 +36,11 @@ LOW = t_start 0.3 or 0.4: weak edit, strongest preservation.
 MID = t_start 0.5 or 0.6: moderate edit.
 HIGH = t_start 0.7, 0.8, or 0.9: strong edit, more source override.
 
-Do not choose HIGH just because the instruction sounds semantically meaningful.
-Many meaningful edits still work best at LOW if preserving the source layout, shape, pose, and composition is important.
-
-Do not choose LOW just because the edited region looks small.
-A small-looking edit may need MID or HIGH if it changes a defining color, material, texture, style, or identity of a salient object.
-
 Choose LOW when preservation likely matters more than forcing a strong edit.
 Choose MID when both LOW and HIGH seem plausible.
 Choose HIGH only when the edit would likely be weak or absent without strong source override.
 
-Use the source image, original prompt, edit prompt, and edit instruction.
+There are some examples with the source image, source prompt, target prompt.
 
 Return only valid JSON:
 {"bucket": "LOW|MID|HIGH", "reason": "one short sentence"}
@@ -53,19 +48,18 @@ Return only valid JSON:
 
 
 def build_user_prompt(row):
-    return f"""Edit type: {row.get("editing_type_name", "")}
+    source_prompt = str(row.get("original_prompt", ""))
+    target_prompt = str(row.get("editing_prompt", ""))
+    edit_instruction = str(row.get("editing_instruction", ""))
 
-Original prompt:
-{row.get("original_prompt", "")}
-
-Target/edit prompt:
-{row.get("editing_prompt", "")}
-
-Editing instruction:
-{row.get("editing_instruction", "")}
-
-Choose the timestep bucket."""
-
+    return (
+        'Input: { '
+        f'"source prompt": "{source_prompt}", '
+        f'"target prompt": "{target_prompt}", '
+        f'"edit instruction": "{edit_instruction}" '
+        '}\n'
+        "Choose the timestep bucket."
+    )
 
 def parse_bucket(text):
     # Prefer JSON if model follows instructions.
@@ -85,6 +79,204 @@ def parse_bucket(text):
 
     return "parse_error", text.strip()
 
+
+DATA_ROOT = Path("/shared/ssd_30T/zarageddes/llm_timestep_policy/data")
+
+# Optional fixed few-shot sets for ablations.
+# Select with: QWEN_FEWSHOT_SET=color_ladder or QWEN_FEWSHOT_SET=mixed
+QWEN_FEWSHOT_POOL_CSV = Path(os.environ.get(
+    "QWEN_FEWSHOT_POOL_CSV",
+    "/shared/ssd_30T/zarageddes/llm_timestep_policy/policy_dataset_strat20_clean.csv",
+))
+
+MANUAL_FEWSHOT_SETS = {
+    "color_ladder": [
+        "613000000003",  # LOW: make wall red, color edit
+        "614000000001",  # MID: roses red to purple, color edit
+        "611000000002",  # HIGH: bear brown to black, color edit
+    ],
+    "mixed": [
+        "613000000003",  # LOW: make wall red, color edit
+        "111000000001",  # MID: cat to tiger, object edit
+        "611000000002",  # HIGH: bear brown to black, color edit
+    ],
+}
+
+_FEWSHOT_POOL_CACHE = None
+
+
+def resolve_source_image_path(row, data_root=DATA_ROOT):
+    """Find the PIE-Bench source image for a row."""
+    raw_file_id = row["file_id"]
+    try:
+        file_id = f"{int(float(raw_file_id)):012d}"
+    except Exception:
+        file_id = str(raw_file_id).strip().zfill(12)
+
+    # First try common direct locations.
+    candidates = [
+        data_root / "annotation_images" / f"{file_id}.jpg",
+        data_root / "annotation_images" / f"{file_id}.png",
+        data_root / f"{file_id}.jpg",
+        data_root / f"{file_id}.png",
+    ]
+
+    # Then try any path-like columns if present.
+    for col in ["image_path", "source_image", "source_path", "input_image"]:
+        if col in row and str(row[col]) not in ["", "nan", "None"]:
+            q = Path(str(row[col]))
+            candidates.append(q if q.is_absolute() else data_root / q)
+
+    for q in candidates:
+        if q.exists():
+            return q
+
+    # PIE-Bench may be nested by edit type/category, so fall back to recursive search.
+    matches = list(data_root.rglob(f"{file_id}.jpg")) + list(data_root.rglob(f"{file_id}.png"))
+    if matches:
+        return matches[0]
+
+    raise FileNotFoundError(f"Could not find source image for file_id={file_id} under {data_root}")
+
+
+
+def get_oracle_bucket(row):
+    """Return oracle bucket as LOW/MID/HIGH from whichever label column exists."""
+    for col in ["timestep_bucket", "oracle_bucket", "bucket", "label", "best_bucket", "target_bucket", "oracle", "oracle_label"]:
+        if col in row and str(row[col]) not in ["", "nan", "None"]:
+            bucket = str(row[col]).strip().upper()
+            if bucket in {"LOW", "MID", "HIGH"}:
+                return bucket
+    raise KeyError("Could not find oracle bucket column in row")
+
+
+def make_example_reason(bucket):
+    if bucket == "LOW":
+        return "Preservation matters more and the edit should be possible with a weaker update."
+    if bucket == "MID":
+        return "The edit needs a moderate update while still preserving the source."
+    return "The edit likely needs a stronger update to become visible."
+
+
+def _normalize_file_id_for_match(value):
+    try:
+        return str(int(float(value)))
+    except Exception:
+        s = str(value).strip()
+        return s.lstrip("0") or "0"
+
+
+def _load_fewshot_pool(fallback_df):
+    global _FEWSHOT_POOL_CACHE
+    if _FEWSHOT_POOL_CACHE is not None:
+        return _FEWSHOT_POOL_CACHE
+
+    if QWEN_FEWSHOT_POOL_CSV.exists():
+        _FEWSHOT_POOL_CACHE = pd.read_csv(QWEN_FEWSHOT_POOL_CSV)
+    else:
+        _FEWSHOT_POOL_CACHE = fallback_df
+
+    return _FEWSHOT_POOL_CACHE
+
+
+def choose_fewshot_examples(df, current_index, max_examples=3):
+    """Choose few-shot examples.
+
+    Default behavior: automatic LOW/MID/HIGH examples.
+    If QWEN_FEWSHOT_SET is set, use a fixed exemplar set from MANUAL_FEWSHOT_SETS.
+    """
+    current_row = df.loc[current_index] if current_index in df.index else None
+    current_file_id = None
+    if current_row is not None and "file_id" in current_row:
+        current_file_id = _normalize_file_id_for_match(current_row["file_id"])
+
+    mode = os.environ.get("QWEN_FEWSHOT_SET", "").strip()
+    pool_df = _load_fewshot_pool(df) if mode in MANUAL_FEWSHOT_SETS else df
+
+    examples = []
+    used_file_ids = {current_file_id}
+
+    # Manual ablation mode.
+    if mode in MANUAL_FEWSHOT_SETS:
+        for wanted in MANUAL_FEWSHOT_SETS[mode]:
+            wanted_norm = _normalize_file_id_for_match(wanted)
+            if wanted_norm in used_file_ids:
+                continue
+
+            matches = pool_df[pool_df["file_id"].map(_normalize_file_id_for_match) == wanted_norm]
+            if len(matches) == 0:
+                continue
+
+            ex = matches.iloc[0]
+            examples.append(ex)
+            used_file_ids.add(wanted_norm)
+
+            if len(examples) >= max_examples:
+                return examples[:max_examples]
+
+    # Fallback/default: one LOW, one MID, one HIGH.
+    for bucket in ["LOW", "MID", "HIGH"]:
+        if len(examples) >= max_examples:
+            break
+
+        for _, ex in pool_df.iterrows():
+            fid = _normalize_file_id_for_match(ex["file_id"])
+            if fid in used_file_ids:
+                continue
+            try:
+                ex_bucket = get_oracle_bucket(ex)
+            except Exception:
+                continue
+            if ex_bucket == bucket:
+                examples.append(ex)
+                used_file_ids.add(fid)
+                break
+
+    return examples[:max_examples]
+
+def build_fewshot_user_content(row, image_path, examples):
+    """Build a multimodal Qwen-VL message with real source-image examples."""
+    content = []
+
+    for k, ex in enumerate(examples, 1):
+        ex_image_path = resolve_source_image_path(ex)
+        ex_bucket = get_oracle_bucket(ex)
+        ex_reason = make_example_reason(ex_bucket)
+
+        content.append({
+            "type": "text",
+            "text": f"Example {k}\nInput source image:"
+        })
+        content.append({"type": "image", "url": str(ex_image_path)})
+        content.append({
+            "type": "text",
+            "text": (
+                'Input: { '
+                f'"source prompt": "{ex.get("original_prompt", "")}", '
+                f'"target prompt": "{ex.get("editing_prompt", "")}" '
+                '}\n'
+                f'Output: {{"bucket": "{ex_bucket}", "reason": "{ex_reason}"}}\n'
+            )
+        })
+
+    content.append({
+        "type": "text",
+        "text": "Now predict the best ChordEdit timestep bucket for this new input.\nInput source image:"
+    })
+    content.append({"type": "image", "url": str(image_path)})
+    content.append({
+        "type": "text",
+        "text": (
+            'Input: { '
+            f'"source prompt": "{row.get("original_prompt", "")}", '
+            f'"target prompt": "{row.get("editing_prompt", "")}", '
+            f'"edit instruction": "{row.get("editing_instruction", "")}" '
+            '}\n'
+            "Return only valid JSON."
+        )
+    })
+
+    return content
 
 def main():
     parser = argparse.ArgumentParser()
@@ -114,6 +306,9 @@ def main():
     outputs = []
 
     for i, row in df.iterrows():
+        image_path = resolve_source_image_path(row)
+        examples = choose_fewshot_examples(df, i, max_examples=3)
+
         messages = [
             {
                 "role": "system",
@@ -121,7 +316,7 @@ def main():
             },
             {
                 "role": "user",
-                "content": [{"type": "text", "text": build_user_prompt(row)}],
+                "content": build_fewshot_user_content(row, image_path, examples),
             },
         ]
 
