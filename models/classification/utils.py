@@ -75,9 +75,9 @@ def compute_naive_pareto_score(
     baseline also score 0. Rows with t_start == base_t_start and t_end
     == base_t_end will score 1.
     """
-    from models.classification.settings import PAPER_T_START, PAPER_T_END
+    from models.classification.settings import PAPER_T_START, PAPER_T_END, PAPER_T_DELTA
 
-    base_t_start = PAPER_T_START if base_t_start is None else base_t_start
+    base_t_start = PAPER_T_START - PAPER_T_DELTA if base_t_start is None else base_t_start
     base_t_end = PAPER_T_END if base_t_end is None else base_t_end
 
     scores = pd.Series(0.0, index=df.index, name="naive_pareto_score")
@@ -87,13 +87,18 @@ def compute_naive_pareto_score(
             np.isclose(group["t_start"], base_t_start)
             & np.isclose(group["t_end"], base_t_end)
         )
-        if base_mask.sum() != 1:
-            # Exactly one such base row must exist
-            raise ValueError(
-                f"Expected exactly one base row, found {base_mask.sum()} "
-                f"for t_start={base_t_start}, t_end={base_t_end}."
-            )
-        base_idx = group.index[base_mask][0]
+        # If the baseline row is not found, use the closest row (e.g.,
+        # t_delta = 0.15 and data is listed by 0.1, will be 0.8).
+        if base_mask.sum() == 0:
+            dist = (np.abs(group["t_start"] - base_t_start) + np.abs(group["t_end"] - base_t_end))
+            base_idx = dist.idxmin()
+            print(f"Baseline ({base_t_start}, {base_t_end}) not found; using closest row {base_idx}.")
+        # If more than one baseline row is found, raise an error.
+        elif base_mask.sum() != 1:
+            raise ValueError(f"Expected exactly one base row, found {base_mask.sum()}")
+        # If exactly one baseline row is found, use it.
+        else:
+            base_idx = group.index[base_mask][0]
         base_psnr = group.loc[base_idx, psnr_col]
         base_clip = group.loc[base_idx, clip_col]
         delta_psnr = group[psnr_col] - base_psnr

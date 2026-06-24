@@ -34,20 +34,46 @@ def mae_buckets(pred_idx: torch.Tensor, true_idx: torch.Tensor) -> torch.Tensor:
 
 def decode_head_pair(
     head_type: str,
-    out1: torch.Tensor,
-    out2: torch.Tensor,
+    out1: torch.Tensor | None,
+    out2: torch.Tensor | None,
     *,
     buckets1: torch.Tensor,
     buckets2: torch.Tensor,
+    predict_start: bool,
+    predict_end: bool,
+    batch_size: int,
+    device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Map raw head outputs to bucket indices for both targets."""
-    if head_type == "CORAL":
-        return decode_ordinal(out1), decode_ordinal(out2)
-    elif head_type == "CE":
-        return decode_classification(out1), decode_classification(out2)
-    elif head_type == "MSE":
-        return decode_regression(out1, buckets1), decode_regression(out2, buckets2)
-    raise ValueError(f"head_type must be 'CORAL', 'MSE', or 'CE', got {head_type!r}")
+    if predict_start:
+        if out1 is None:
+            raise ValueError("out1 is required when t_start has >1 bucket")
+        if head_type == "CORAL":
+            p1 = decode_ordinal(out1)
+        elif head_type == "CE":
+            p1 = decode_classification(out1)
+        elif head_type == "MSE":
+            p1 = decode_regression(out1, buckets1)
+        else:
+            raise ValueError(f"head_type must be 'CORAL', 'MSE', or 'CE', got {head_type!r}")
+    else:
+        p1 = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+    if predict_end:
+        if out2 is None:
+            raise ValueError("out2 is required when t_end has >1 bucket")
+        if head_type == "CORAL":
+            p2 = decode_ordinal(out2)
+        elif head_type == "CE":
+            p2 = decode_classification(out2)
+        elif head_type == "MSE":
+            p2 = decode_regression(out2, buckets2)
+        else:
+            raise ValueError(f"head_type must be 'CORAL', 'MSE', or 'CE', got {head_type!r}")
+    else:
+        p2 = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+    return p1, p2
 
 
 """
@@ -158,6 +184,8 @@ class OrdinalPairClassifier(nn.Module):
             buckets2 = torch.linspace(0, 1, 10)
         self.register_buffer("buckets1", buckets1.float())
         self.register_buffer("buckets2", buckets2.float())
+        self.predict_start = len(buckets1) > 1
+        self.predict_end = len(buckets2) > 1
 
         h = self.encoder.hidden_dim
 
@@ -176,14 +204,20 @@ class OrdinalPairClassifier(nn.Module):
         )
 
         if head_type == "CORAL":
-            self.head1 = CoralHead(mlp_inner, len(buckets1) - 1)
-            self.head2 = CoralHead(mlp_inner, len(buckets2) - 1)
+            if self.predict_start:
+                self.head1 = CoralHead(mlp_inner, len(buckets1) - 1)
+            if self.predict_end:
+                self.head2 = CoralHead(mlp_inner, len(buckets2) - 1)
         elif head_type == "MSE":
-            self.head1 = RegressionHead(mlp_inner)
-            self.head2 = RegressionHead(mlp_inner)
+            if self.predict_start:
+                self.head1 = RegressionHead(mlp_inner)
+            if self.predict_end:
+                self.head2 = RegressionHead(mlp_inner)
         elif head_type == "CE":
-            self.head1 = ClassificationHead(mlp_inner, len(buckets1))
-            self.head2 = ClassificationHead(mlp_inner, len(buckets2))
+            if self.predict_start:
+                self.head1 = ClassificationHead(mlp_inner, len(buckets1))
+            if self.predict_end:
+                self.head2 = ClassificationHead(mlp_inner, len(buckets2))
         else:
             raise ValueError(f"head_type must be 'CORAL', 'MSE', or 'CE', got {head_type!r}")
 
@@ -213,11 +247,31 @@ class OrdinalPairClassifier(nn.Module):
         return all_emb[:n], all_emb[n:]
 
     def decode_bucket_indices(
-        self, out1: torch.Tensor, out2: torch.Tensor
+        self,
+        out1: torch.Tensor | None,
+        out2: torch.Tensor | None,
+        *,
+        batch_size: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Map raw head outputs to bucket indices for both targets."""
+        if batch_size is None:
+            if out1 is not None:
+                batch_size = out1.size(0)
+            elif out2 is not None:
+                batch_size = out2.size(0)
+            else:
+                raise ValueError("batch_size is required when both head outputs are None")
+        device = self.buckets1.device
         return decode_head_pair(
-            self.head_type, out1, out2, buckets1=self.buckets1, buckets2=self.buckets2
+            self.head_type,
+            out1,
+            out2,
+            buckets1=self.buckets1,
+            buckets2=self.buckets2,
+            predict_start=self.predict_start,
+            predict_end=self.predict_end,
+            batch_size=batch_size,
+            device=device,
         )
 
     """
@@ -228,14 +282,17 @@ class OrdinalPairClassifier(nn.Module):
         self,
         strings_a: list[str],
         strings_b: list[str],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """
-        Compute raw head outputs for both targets.
+        Compute raw head outputs for targets with >1 bucket.
+        Skipped heads return None.
         """
         emb_a, emb_b = self._encode_pair(strings_a, strings_b)
         combined = self._combine(emb_a, emb_b)
         features = self.body(combined)
-        return self.head1(features), self.head2(features)
+        out1 = self.head1(features) if self.predict_start else None
+        out2 = self.head2(features) if self.predict_end else None
+        return out1, out2
 
     def predict(
         self,
@@ -251,5 +308,5 @@ class OrdinalPairClassifier(nn.Module):
             l1, l2 = self(strings_a, strings_b)
         self.train(training)
 
-        idx1, idx2 = self.decode_bucket_indices(l1, l2)
+        idx1, idx2 = self.decode_bucket_indices(l1, l2, batch_size=len(strings_a))
         return self.buckets1[idx1], self.buckets2[idx2]

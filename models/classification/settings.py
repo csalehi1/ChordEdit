@@ -126,7 +126,7 @@ counteract label imbalance in the training split.
 # Name of HuggingFace checkpoint for text-encoder
 ENCODER_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 # Prevent encoder weights from updating during training
-FREEZE_ENCODER = False
+FREEZE_ENCODER = True
 # Select head type to use for last step of model,
 # NOTE: May be "CORAL", "MSE", or "CE"
 HEAD_TYPE = "CE"

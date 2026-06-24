@@ -152,44 +152,72 @@ def _balanced_accuracy(pred: torch.Tensor, true: torch.Tensor, n_classes: int) -
     return sum(recalls) / len(recalls) if recalls else 0.0
 
 
+def _head_params(model: OrdinalPairClassifier) -> list[torch.nn.Parameter]:
+    """Trainable parameters for the MLP body and any active prediction heads."""
+    params = list(model.body.parameters())
+    if model.predict_start:
+        params += list(model.head1.parameters())
+    if model.predict_end:
+        params += list(model.head2.parameters())
+    return params
+
+
 def _compute_loss(
     model: OrdinalPairClassifier,
-    l1: torch.Tensor,
-    l2: torch.Tensor,
+    l1: torch.Tensor | None,
+    l2: torch.Tensor | None,
     y1: torch.Tensor,
     y2: torch.Tensor,
     *,
     class_w_start: torch.Tensor | None,
     class_w_end: torch.Tensor | None,
+    n_buckets_start: int,
     n_buckets_end: int,
 ) -> torch.Tensor:
-    """Training/eval loss for the active head type."""
-    if HEAD_TYPE == "CORAL":
-        w1 = class_w_start[y1] if class_w_start is not None else None
-        w2 = class_w_end[y2] if class_w_end is not None else None
-        loss = ordinal_loss(l1, y1, w1)
-        if n_buckets_end > 1:
-            loss = loss + ordinal_loss(l2, y2, w2)
-    elif HEAD_TYPE == "CE":
-        loss = one_hot_ce_loss(
-            l1, y1,
-            class_weights=class_w_start,
-            label_smoothing=LABEL_SMOOTHING,
-        )
-        if n_buckets_end > 1:
-            loss = loss + one_hot_ce_loss(
+    """Training/eval loss for active head(s) only."""
+    loss_parts: list[torch.Tensor] = []
+
+    if n_buckets_start > 1:
+        if l1 is None:
+            raise ValueError("t_start head output required when n_buckets_start > 1")
+        if HEAD_TYPE == "CORAL":
+            w1 = class_w_start[y1] if class_w_start is not None else None
+            loss_parts.append(ordinal_loss(l1, y1, w1))
+        elif HEAD_TYPE == "CE":
+            loss_parts.append(one_hot_ce_loss(
+                l1, y1,
+                class_weights=class_w_start,
+                label_smoothing=LABEL_SMOOTHING,
+            ))
+        elif HEAD_TYPE == "MSE":
+            w1 = class_w_start[y1] if class_w_start is not None else None
+            loss_parts.append(regression_loss(l1, model.buckets1[y1], w1))
+        else:
+            raise ValueError(f"HEAD_TYPE must be 'CORAL', 'MSE', or 'CE', got {HEAD_TYPE!r}")
+
+    if n_buckets_end > 1:
+        if l2 is None:
+            raise ValueError("t_end head output required when n_buckets_end > 1")
+        if HEAD_TYPE == "CORAL":
+            w2 = class_w_end[y2] if class_w_end is not None else None
+            loss_parts.append(ordinal_loss(l2, y2, w2))
+        elif HEAD_TYPE == "CE":
+            loss_parts.append(one_hot_ce_loss(
                 l2, y2,
                 class_weights=class_w_end,
                 label_smoothing=LABEL_SMOOTHING,
-            )
-    elif HEAD_TYPE == "MSE":
-        w1 = class_w_start[y1] if class_w_start is not None else None
-        w2 = class_w_end[y2] if class_w_end is not None else None
-        loss = regression_loss(l1, model.buckets1[y1], w1)
-        if n_buckets_end > 1:
-            loss = loss + regression_loss(l2, model.buckets2[y2], w2)
-    else:
-        raise ValueError(f"HEAD_TYPE must be 'CORAL', 'MSE', or 'CE', got {HEAD_TYPE!r}")
+            ))
+        elif HEAD_TYPE == "MSE":
+            w2 = class_w_end[y2] if class_w_end is not None else None
+            loss_parts.append(regression_loss(l2, model.buckets2[y2], w2))
+        else:
+            raise ValueError(f"HEAD_TYPE must be 'CORAL', 'MSE', or 'CE', got {HEAD_TYPE!r}")
+
+    if not loss_parts:
+        raise ValueError("At least one of t_start or t_end must have >1 bucket to train.")
+    loss = loss_parts[0]
+    for part in loss_parts[1:]:
+        loss = loss + part
     return loss
 
 
@@ -226,11 +254,12 @@ def eval_loader(
                 model, out1, out2, l1, l2,
                 class_w_start=class_w_start,
                 class_w_end=class_w_end,
+                n_buckets_start=n_buckets_start or 1,
                 n_buckets_end=n_buckets_end,
             )
             val_loss += batch_loss.item() * len(srcs)
             n_samples += len(srcs)
-            p1, p2 = model.decode_bucket_indices(out1, out2)
+            p1, p2 = model.decode_bucket_indices(out1, out2, batch_size=len(srcs))
             all_p1.append(p1)
             all_p2.append(p2)
             all_l1.append(l1)
@@ -247,6 +276,9 @@ def eval_loader(
         "acc_both": ((p1 == l1_out) & (p2 == l2_out)).float().mean().item(),
         "bal_acc_t_start": _balanced_accuracy(
             p1, l1_out, n_buckets_start or int(l1_out.max().item()) + 1
+        ),
+        "bal_acc_t_end": _balanced_accuracy(
+            p2, l2_out, n_buckets_end or int(l2_out.max().item()) + 1
         ),
     }
     if n_samples > 0:
@@ -281,8 +313,15 @@ def train() -> OrdinalPairClassifier:
     # Distinct ordered float values for each target, may differ between t_start and t_end
     buckets_start = torch.tensor(sorted(df["t_start"].unique()), dtype=torch.float)
     buckets_end = torch.tensor(sorted(df["t_end"].unique()), dtype=torch.float)
+    n_buckets_start = len(buckets_start)
+    n_buckets_end = len(buckets_end)
+    if n_buckets_start <= 1 and n_buckets_end <= 1:
+        raise ValueError("At least one of t_start or t_end must have >1 bucket to train.")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = OrdinalPairClassifier(buckets1=buckets_start, buckets2=buckets_end, freeze_encoder=FREEZE_ENCODER, head_type=HEAD_TYPE).to(device)
+    active_heads = [name for name, on in (("t_start", model.predict_start), ("t_end", model.predict_end)) if on]
+    print(f"Training heads: {', '.join(active_heads)}")
     if FREEZE_ENCODER:
         optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
@@ -292,23 +331,28 @@ def train() -> OrdinalPairClassifier:
     else:
         optimizer = torch.optim.AdamW([
             {"params": model.encoder.parameters(), "lr": ENCODER_LR, "weight_decay": WEIGHT_DECAY},
-            {"params": list(model.body.parameters()) + list(model.head1.parameters()) + list(model.head2.parameters()), "lr": MLP_LR, "weight_decay": WEIGHT_DECAY},
+            {"params": _head_params(model), "lr": MLP_LR, "weight_decay": WEIGHT_DECAY},
         ])
 
     if USE_CLASS_WEIGHTS:
-        class_w_start = _class_weights(
-            torch.tensor(train_df["t_start_idx"].values), len(buckets_start)
-        ).to(device)
-        class_w_end = _class_weights(
-            torch.tensor(train_df["t_end_idx"].values), len(buckets_end)
-        ).to(device)
-        print(f"Class weights  t_start: {class_w_start.tolist()}")
-        print(f"Class weights  t_end:   {class_w_end.tolist()}")
+        class_w_start = None
+        class_w_end = None
+        if model.predict_start:
+            class_w_start = _class_weights(
+                torch.tensor(train_df["t_start_idx"].values), n_buckets_start
+            ).to(device)
+            print(f"Class weights  t_start: {class_w_start.tolist()}")
+        if model.predict_end:
+            class_w_end = _class_weights(
+                torch.tensor(train_df["t_end_idx"].values), n_buckets_end
+            ).to(device)
+            print(f"Class weights  t_end:   {class_w_end.tolist()}")
     else:
         class_w_start = class_w_end = None
 
     weights_out = run_dir / "classifier_weights.pt"
     best_val_score = 0.0
+    checkpoint_metric = "bal_acc_t_start" if model.predict_start else "bal_acc_t_end"
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -321,7 +365,8 @@ def train() -> OrdinalPairClassifier:
                 model, l1, l2, y1, y2,
                 class_w_start=class_w_start,
                 class_w_end=class_w_end,
-                n_buckets_end=len(buckets_end),
+                n_buckets_start=n_buckets_start,
+                n_buckets_end=n_buckets_end,
             )
             optimizer.zero_grad()
             loss.backward()
@@ -332,18 +377,18 @@ def train() -> OrdinalPairClassifier:
             model, train_loader, device,
             class_w_start=class_w_start,
             class_w_end=class_w_end,
-            n_buckets_end=len(buckets_end),
-            n_buckets_start=len(buckets_start),
+            n_buckets_end=n_buckets_end,
+            n_buckets_start=n_buckets_start,
         )
         train_metrics["loss"] = epoch_loss / len(train_df)
         val_metrics = eval_loader(
             model, val_loader, device,
             class_w_start=class_w_start,
             class_w_end=class_w_end,
-            n_buckets_end=len(buckets_end),
-            n_buckets_start=len(buckets_start),
+            n_buckets_end=n_buckets_end,
+            n_buckets_start=n_buckets_start,
         )
-        val_score = val_metrics["bal_acc_t_start"]
+        val_score = val_metrics[checkpoint_metric]
         improved = val_score > best_val_score
         if improved:
             best_val_score = val_score
@@ -369,15 +414,18 @@ def train() -> OrdinalPairClassifier:
             + ("  *" if improved else "")
         )
 
-    print(f"Saved {weights_out}  (best val bal_acc_start={best_val_score:.3f})")
-    model.load_state_dict(torch.load(weights_out, map_location=device, weights_only=False)["state_dict"])
+    print(f"Saved {weights_out}  (best val {checkpoint_metric}={best_val_score:.3f})")
+    model.load_state_dict(
+        torch.load(weights_out, map_location=device, weights_only=False)["state_dict"],
+        strict=False,
+    )
 
     test_metrics = eval_loader(
         model, test_loader, device,
         class_w_start=class_w_start,
         class_w_end=class_w_end,
-        n_buckets_end=len(buckets_end),
-        n_buckets_start=len(buckets_start),
+        n_buckets_end=n_buckets_end,
+        n_buckets_start=n_buckets_start,
     )
     print(f"\nTest: {_fmt_split_metrics(test_metrics)}")
     return model
