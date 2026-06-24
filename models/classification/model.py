@@ -7,8 +7,8 @@ discrete values.
         strings in a single batched forward pass.
     2.  Combiner builds [emb_A | emb_B | emb_A-emb_B | emb_A⊙emb_B].
     3.  Shared MLP body produces a common feature vector.
-    4.  Two independent heads — CORAL (ordinal) or MSE (scalar regression) —
-        each predict one output value.
+    4.  Two independent heads — CORAL (ordinal), MSE (scalar regression), or
+        CE (cost-sensitive multiclass) — each predict one output value.
     5.  At inference, the head output is mapped to a bucket index.
 
 """
@@ -22,6 +22,7 @@ from transformers import AutoModel, AutoTokenizer
 from models.classification.settings import ENCODER_MODEL
 from models.classification.head_coral import CoralHead, decode_ordinal
 from models.classification.head_mse import RegressionHead, decode_regression
+from models.classification.head_ce import ClassificationHead, decode_classification
 
 from models.classification.settings import *
 
@@ -29,6 +30,24 @@ from models.classification.settings import *
 def mae_buckets(pred_idx: torch.Tensor, true_idx: torch.Tensor) -> torch.Tensor:
     """Mean Absolute Error over bucket indices. An MAE of 1.0 means off by one bucket on average."""
     return (pred_idx - true_idx).abs().float().mean()
+
+
+def decode_head_pair(
+    head_type: str,
+    out1: torch.Tensor,
+    out2: torch.Tensor,
+    *,
+    buckets1: torch.Tensor,
+    buckets2: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map raw head outputs to bucket indices for both targets."""
+    if head_type == "CORAL":
+        return decode_ordinal(out1), decode_ordinal(out2)
+    elif head_type == "CE":
+        return decode_classification(out1), decode_classification(out2)
+    elif head_type == "MSE":
+        return decode_regression(out1, buckets1), decode_regression(out2, buckets2)
+    raise ValueError(f"head_type must be 'CORAL', 'MSE', or 'CE', got {head_type!r}")
 
 
 """
@@ -93,7 +112,7 @@ class OrdinalPairClassifier(nn.Module):
     Given strings A and B, predicts two independent scalar values (t_start and
     t_end). Head type is selected at construction time: 'CORAL' for cumulative-
     threshold ordinal decoding, 'MSE' for scalar regression snapped to the
-    nearest bucket.
+    nearest bucket, or 'CE' for cost-sensitive multiclass classification.
     """
 
     def __init__(
@@ -121,10 +140,10 @@ class OrdinalPairClassifier(nn.Module):
                            Defaults to 10 evenly-spaced values in [0, 1].
             freeze_encoder: If True, encoder weights are fixed during training.
                             Recommended when training data is small (< ~1000 pairs).
-            head_type:     "CORAL" for ordinal classification, "MSE" for scalar regression.
+            head_type:     "CORAL", "MSE", or "CE".
         """
-        if head_type not in ("CORAL", "MSE"):
-            raise ValueError(f"head_type must be 'CORAL' or 'MSE', got {head_type!r}")
+        if head_type not in ("CORAL", "MSE", "CE"):
+            raise ValueError(f"head_type must be 'CORAL', 'MSE', or 'CE', got {head_type!r}")
         super().__init__()
 
         self.head_type = head_type
@@ -162,6 +181,11 @@ class OrdinalPairClassifier(nn.Module):
         elif head_type == "MSE":
             self.head1 = RegressionHead(mlp_inner)
             self.head2 = RegressionHead(mlp_inner)
+        elif head_type == "CE":
+            self.head1 = ClassificationHead(mlp_inner, len(buckets1))
+            self.head2 = ClassificationHead(mlp_inner, len(buckets2))
+        else:
+            raise ValueError(f"head_type must be 'CORAL', 'MSE', or 'CE', got {head_type!r}")
 
     """
     Internal helpers.
@@ -187,6 +211,14 @@ class OrdinalPairClassifier(nn.Module):
         n = len(strings_a)
         all_emb = self.encoder(strings_a + strings_b)   # (2N, h)
         return all_emb[:n], all_emb[n:]
+
+    def decode_bucket_indices(
+        self, out1: torch.Tensor, out2: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map raw head outputs to bucket indices for both targets."""
+        return decode_head_pair(
+            self.head_type, out1, out2, buckets1=self.buckets1, buckets2=self.buckets2
+        )
 
     """
     Forward and predict.
@@ -219,7 +251,5 @@ class OrdinalPairClassifier(nn.Module):
             l1, l2 = self(strings_a, strings_b)
         self.train(training)
 
-        if self.head_type == "CORAL":
-            return self.buckets1[decode_ordinal(l1)], self.buckets2[decode_ordinal(l2)]
-        elif self.head_type == "MSE":
-            return self.buckets1[decode_regression(l1, self.buckets1)], self.buckets2[decode_regression(l2, self.buckets2)]
+        idx1, idx2 = self.decode_bucket_indices(l1, l2)
+        return self.buckets1[idx1], self.buckets2[idx2]

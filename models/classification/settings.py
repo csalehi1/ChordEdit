@@ -19,7 +19,7 @@ _PARENT_DIR = Path(__file__).resolve().parent
 DATA_DIR = _PARENT_DIR / "data"
 
 # NOTE: Adjust METRICS_CSV dependent on the data
-METRICS_CSV = DATA_DIR / "id_to_metrics_sdxlturbo_tstart.csv"
+METRICS_CSV = DATA_DIR / "id_to_metrics_sdturbo_tstart.csv"
 STRINGS_CSV = DATA_DIR / "id_to_string_pair.csv"
 
 # Files for image data should be named `id_to_metrics_*`
@@ -117,21 +117,23 @@ METRIC_LABELS = {
 Model architecture. ENCODER_MODEL names the HuggingFace checkpoint
 used as the Siamese backbone. FREEZE_ENCODER prevents its weights from
 updating during training; set to False to fine-tune end-to-end.
-HEAD_TYPE selects between ordinal regression ("CORAL") and plain
-mean-squared-error ("MSE"). USE_CLASS_WEIGHTS re-weights the loss by
-inverse class frequency to counteract label imbalance in the training
-split.
+HEAD_TYPE selects between ordinal regression ("CORAL"), plain
+mean-squared-error ("MSE"), and cost-sensitive multiclass CE ("CE").
+USE_CLASS_WEIGHTS re-weights the loss by inverse class frequency to
+counteract label imbalance in the training split.
 """
 
 # Name of HuggingFace checkpoint for text-encoder
 ENCODER_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 # Prevent encoder weights from updating during training
-FREEZE_ENCODER = True
+FREEZE_ENCODER = False
 # Select head type to use for last step of model,
-# NOTE: May be "CORAL" or "MSE"
-HEAD_TYPE = "CORAL"
+# NOTE: May be "CORAL", "MSE", or "CE"
+HEAD_TYPE = "CE"
 # Counteract label imbalance in the training split.
-USE_CLASS_WEIGHTS = True
+USE_CLASS_WEIGHTS = False
+# Softens overconfident majority-class collapse in CE training.
+LABEL_SMOOTHING = 0.1
 
 
 """
