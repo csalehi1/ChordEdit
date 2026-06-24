@@ -57,10 +57,13 @@ def parse_bucket(text):
     except Exception:
         pass
 
-    # Fallback: regex search.
-    m = re.search(r"\b(LOW|MID|HIGH)\b", text.upper())
-    if m:
-        return m.group(1).lower(), text.strip()
+    # Conservative fallback: only accept regex parsing if exactly one unique
+    # bucket label appears. This avoids misparsing explanations like
+    # "LOW is too weak, MID is better" as LOW just because LOW appears first.
+    matches = re.findall(r"\b(LOW|MID|HIGH)\b", text.upper())
+    unique = list(dict.fromkeys(matches))
+    if len(unique) == 1:
+        return unique[0].lower(), text.strip()
 
     return "parse_error", text.strip()
 
@@ -69,10 +72,8 @@ DATA_ROOT = Path("/shared/ssd_30T/zarageddes/llm_timestep_policy/data")
 
 # Optional fixed few-shot sets for ablations.
 # Select with: QWEN_FEWSHOT_SET=color_ladder or QWEN_FEWSHOT_SET=mixed
-QWEN_FEWSHOT_POOL_CSV = Path(os.environ.get(
-    "QWEN_FEWSHOT_POOL_CSV",
-    "/shared/ssd_30T/zarageddes/llm_timestep_policy/policy_dataset_strat20_clean.csv",
-))
+QWEN_FEWSHOT_POOL_CSV = os.environ.get("QWEN_FEWSHOT_POOL_CSV")
+QWEN_FEWSHOT_POOL_CSV = Path(QWEN_FEWSHOT_POOL_CSV) if QWEN_FEWSHOT_POOL_CSV else None
 
 MANUAL_FEWSHOT_SETS = {
     "color_ladder": [
@@ -156,7 +157,7 @@ def _load_fewshot_pool(fallback_df):
     if _FEWSHOT_POOL_CACHE is not None:
         return _FEWSHOT_POOL_CACHE
 
-    if QWEN_FEWSHOT_POOL_CSV.exists():
+    if QWEN_FEWSHOT_POOL_CSV is not None and QWEN_FEWSHOT_POOL_CSV.exists():
         _FEWSHOT_POOL_CACHE = pd.read_csv(QWEN_FEWSHOT_POOL_CSV)
     else:
         _FEWSHOT_POOL_CACHE = fallback_df
@@ -190,7 +191,10 @@ def choose_fewshot_examples(df, current_index, max_examples=3):
 
             matches = pool_df[pool_df["file_id"].map(_normalize_file_id_for_match) == wanted_norm]
             if len(matches) == 0:
-                continue
+                raise ValueError(
+                    f"Manual few-shot example file_id={wanted} was not found in the few-shot pool. "
+                    "Set QWEN_FEWSHOT_POOL_CSV explicitly or choose examples present in the input CSV."
+                )
 
             ex = matches.iloc[0]
             examples.append(ex)
@@ -265,8 +269,8 @@ def build_fewshot_user_content(row, image_path, examples):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_csv", default="/shared/ssd_30T/zarageddes/llm_timestep_policy/policy_dataset_strat20_clean.csv")
-    parser.add_argument("--output_csv", default="/shared/ssd_30T/zarageddes/llm_timestep_policy/qwen_vl_policy_predictions_strat20_clean.csv")
+    parser.add_argument("--input_csv", required=True)
+    parser.add_argument("--output_csv", required=True)
     parser.add_argument("--model_id", default="Qwen/Qwen3-VL-4B-Instruct")
     parser.add_argument("--max_examples", type=int, default=None)
     parser.add_argument("--max_new_tokens", type=int, default=140)
