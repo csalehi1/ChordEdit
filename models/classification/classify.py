@@ -3,7 +3,7 @@ Train OrdinalPairClassifier to predict t_start and t_end
 from (source_prompt, target_prompt) pairs.
 
 Rows are filtered to those matching T_DELTA_TARGET for t_delta, then for each
-sample_id the row with the highest TARGET_COLUMN is selected. The resulting
+sample_id the row with the highest TARGET_METRIC_COL is selected. The resulting
 t_start and t_end values are quantile-binned into N_BINS ordinal buckets
 passed to OrdinalPairClassifier.
 """
@@ -25,11 +25,8 @@ from models.classification.head_ce import one_hot_ce_loss
 import models.classification.settings as _settings
 from models.classification.settings import (
     BATCH_SIZE,
-    COMPUTED_METRIC_COL,
-    COMPUTED_METRIC_FN,
-    COMPUTED_METRIC_LABEL,
     DATA_DIR,
-    T_DELTA_TARGET,
+    TARGET_T_DELTA,
     EPOCHS,
     ENCODER_LR,
     FREEZE_ENCODER,
@@ -44,7 +41,8 @@ from models.classification.settings import (
     OUTPUTS_DIR,
     SEED,
     STRINGS_CSV,
-    TARGET_COLUMN,
+    TARGET_METRIC_COL,
+    TARGET_METRIC_COL_FN,
 )
 
 
@@ -75,7 +73,7 @@ class PairDataset(Dataset):
 
 
 def load_data() -> pd.DataFrame:
-    """Filter metrics to T_DELTA_TARGET rows, pick the highest TARGET_COLUMN row per id,
+    """Filter metrics to T_DELTA_TARGET rows, pick the highest TARGET_METRIC_COL row per id,
     and join with prompt strings. Maps discrete t_start/t_end values to ordinal indices."""
     metrics = pd.read_csv(METRICS_CSV, dtype={"sample_id": str})
     strings = pd.read_csv(STRINGS_CSV, dtype={"id": str})
@@ -90,18 +88,18 @@ def load_data() -> pd.DataFrame:
             )
 
     # Validate that T_DELTA_TARGET exists in the data
-    if T_DELTA_TARGET not in metrics["t_delta"].values:
+    if TARGET_T_DELTA not in metrics["t_delta"].values:
         raise ValueError(
-            f"{T_DELTA_TARGET=} not found in t_delta column "
+            f"{TARGET_T_DELTA=} not found in t_delta column "
             f"(distinct values: {sorted(metrics['t_delta'].unique())})."
         )
 
-    filtered = metrics[metrics["t_delta"] == T_DELTA_TARGET]
-    if TARGET_COLUMN not in filtered.columns:
-        filtered[COMPUTED_METRIC_COL] = COMPUTED_METRIC_FN(filtered)
+    filtered = metrics[metrics["t_delta"] == TARGET_T_DELTA]
+    if TARGET_METRIC_COL not in filtered.columns:
+        filtered[TARGET_METRIC_COL] = TARGET_METRIC_COL_FN(filtered)
     # Rows with default t-values will score 1 on Pareto Score so that
     # a maximum value will always exist.
-    best_idx = filtered.groupby("sample_id")[TARGET_COLUMN].idxmax()
+    best_idx = filtered.groupby("sample_id")[TARGET_METRIC_COL].idxmax()
     best = filtered.loc[best_idx, ["sample_id", "t_start", "t_end"]].reset_index(drop=True)
 
     df = pd.merge(best, strings, left_on="sample_id", right_on="id")
@@ -313,7 +311,7 @@ def train() -> OrdinalPairClassifier:
 
     save_splits(train_df, val_df, test_df, data_dir=run_dir)
     print(
-        f"Dataset: {len(df)} samples  (t_delta={T_DELTA_TARGET}, target={TARGET_COLUMN})"
+        f"Dataset: {len(df)} samples  (t_delta={TARGET_T_DELTA}, target={TARGET_METRIC_COL})"
         f"  split: train={len(train_df)} / val={len(val_df)} / test={len(test_df)}"
     )
 

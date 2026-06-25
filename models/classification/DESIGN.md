@@ -152,7 +152,7 @@ At inference, the continuous prediction is snapped to the nearest bucket index. 
 
 ### Target Score Options
 
-The score used to select the best row per `sample_id` is configurable in `settings.py` via `_ACTIVE`. Four options are available:
+The score used to select the best row per `sample_id` is configurable in `settings.py` via `TARGET_METRIC`.
 
 - **`weighted_combined_score`**: $\lambda_{\text{PSNR}} \cdot \hat{p} + \lambda_{\text{CLIP}} \cdot \hat{c}$, where $\hat{p}$ and $\hat{c}$ are min-max normalised PSNR and CLIP similarity, with $\lambda_{\text{PSNR}} = \lambda_{\text{CLIP}} = 0.5$ by default.
 

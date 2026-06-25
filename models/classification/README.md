@@ -45,20 +45,20 @@ Open [eval_data.ipynb](eval_data.ipynb) to study input data before training.
 
 ### 3. Select a computed metric
 
-The training target is derived from the raw PSNR and CLIP columns. To change which metric is used, set `_ACTIVE` in [settings.py](settings.py) to one of the keys in `_COMPUTED_METRIC_OPTIONS`:
+The training target is derived from the raw PSNR and CLIP columns. To change which metric is used, set `TARGET_METRIC` in [settings.py](settings.py):
 
 ```python
-_ACTIVE = _COMPUTED_METRIC_OPTIONS["naive_pareto_score"]
+TARGET_METRIC = "naive_pareto_score"
 ```
 
 | Key | Description |
 |---|---|
 | `"naive_pareto_score"` | $\max(0, \Delta\text{PSNR}) \cdot \max(0, \Delta\text{CLIP})$ relative to the paper's baseline row per sample group. |
-| `"pareto_biased_score"` | Smooth Pareto score $s(a-A)+s(b-B)+\alpha\, s(a-A)\, s(b-B)$ with shifted softplus $s$; default $\alpha=2$ via `_PARETO_BIAS_ALPHA`. |
+| `"softplus_score"` | Smooth baseline-relative score; configure `_SOFTPLUS_ALPHA` and `_SOFTPLUS_BETA`. |
 | `"agreement_score"` | Similarity between PSNR and CLIP similarity scores. |
 | `"weighted_combined_score"` | Weighted blend of normalized PSNR and CLIP, adjust `_LAMBDA_PSNR` and `_LAMBDA_CLIP`. |
 
-Each option is a `MetricOption(col, fn, label)`. The module-level constants `COMPUTED_METRIC_COL`, `COMPUTED_METRIC_FN`, and `COMPUTED_METRIC_LABEL` are derived from `_ACTIVE` automatically and do not need to be edited directly.
+`TARGET_METRIC_COL` (the DataFrame column name), `TARGET_METRIC_COL_FN`, and `TARGET_METRIC_COL_LABEL` are derived automatically. Parameterized metrics encode their partial kwargs in the column name, e.g. `softplus_score_a1-b2`.
 
 ### 4. Adjust remaining settings
 
@@ -66,7 +66,8 @@ If wanted, further edit [settings.py](settings.py) to adjust training behavior b
 
 | Setting | Description |
 |---|---|
-| `TARGET_COLUMN` | Which metric column to train on; defaults to `COMPUTED_METRIC_COL`. |
+| `TARGET_METRIC` | Which score function to use from `_METRIC_REGISTRY`. |
+| `TARGET_METRIC_COL` | Derived column name (includes partial kwargs, e.g. `softplus_score_a1-b2`). |
 | `ENCODER_MODEL` | Pretrained sentence-transformer checkpoint for the Siamese encoder. |
 | `FREEZE_ENCODER` | If `True`, encoder weights are frozen during training. Default `False` (fine-tune end-to-end). |
 | `HEAD_TYPE` | `"CE"` (multiclass, default), `"CORAL"` (ordinal), or `"MSE"` (regression). |

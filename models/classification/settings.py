@@ -7,7 +7,7 @@ from models.classification.utils import (
     compute_weighted_combined_score,
     compute_agreement_score,
     compute_naive_pareto_score,
-    compute_pareto_biased_score,
+    compute_softplus_score,
 )
 
 """
@@ -20,7 +20,7 @@ _PARENT_DIR = Path(__file__).resolve().parent
 DATA_DIR = _PARENT_DIR / "data"
 
 # NOTE: Adjust METRICS_CSV dependent on the data
-METRICS_CSV = DATA_DIR / "id_to_metrics_sdturbo_tstart.csv"
+METRICS_CSV = DATA_DIR / "id_to_metrics_sdturbo.csv"
 STRINGS_CSV = DATA_DIR / "id_to_string_pair.csv"
 
 # Files for image data should be named `id_to_metrics_*`
@@ -37,68 +37,105 @@ and are used by the Pareto score functions to identify the reference row
 within each sample group.
 """
 
-N_BUCKETS_START = 11
-N_BUCKETS_END = 1
-# Value in `t_delta` column to select data from 
-T_DELTA_TARGET = 0.0
+# NOTE: May be "weighted_combined_score", "agreement_score",
+# "naive_pareto_score", or "softplus_score". Choose one.
+TARGET_METRIC = "naive_pareto_score"
 
+# NOTE: Must match number of distinct `t_start`, `t_end` values in METRICS_CSV
+N_BUCKETS_START = 9
+N_BUCKETS_END = 1
+
+# Value in `t_delta` column to select data from 
+TARGET_T_DELTA = 0.0
+
+# By default, use DEFAULT_T_START = PAPER_T_START - (PAPER_T_DELTA - TARGET_T_DELTA)
+DEFAULT_T_START = 0.9
+DEFAULT_T_END = 0.3
+
+# Values from the original paper, should *not* be modified
 PAPER_T_START = 0.9
 PAPER_T_END = 0.3
 PAPER_T_DELTA = 0.15
 
 
 """
-Computed metrics. Each MetricOption bundles the DataFrame column name,
-the callable that produces  it, and a display label. Parameterized
-variants (e.g. weighted combined score)  use functools.partial so
-every option has the same zero-argument-from-df call  signature. To
-switch the metric used throughout training and evaluation, change the
-key passed to _COMPUTED_METRIC_OPTIONS on the _ACTIVE line. The module-level
-constants below it are then derived automatically.
+Computed metrics. Set TARGET_METRIC to one of the keys in _METRIC_REGISTRY.
+TARGET_METRIC_COL is derived from the metric key plus any partial() keyword
+arguments (e.g. softplus_score with alpha=1, beta=2 -> softplus_score_a1-b2).
 """
 
 
 @dataclass(frozen=True)
 class MetricOption:
-    col: str
     fn: Callable
     label: str
 
 
-# Possible computed metric options linked to their associated functions
+_PARAM_ABBREV: dict[str, str] = {
+    "alpha": "a",
+    "beta": "b",
+    "lambda_psnr": "lp",
+    "lambda_clip": "lc",
+    "do_normalize": "n",
+}
+
+
+def _format_param_value(val) -> str:
+    if isinstance(val, bool):
+        return "1" if val else "0"
+    if isinstance(val, float):
+        return f"{val:g}"
+    return str(val)
+
+
+def metric_col_name(base: str, fn: Callable) -> str:
+    """Build a column name from a metric key and partial keyword arguments."""
+    if isinstance(fn, partial):
+        kw = fn.keywords
+        if kw:
+            parts = [
+                f"{_PARAM_ABBREV.get(key, key[:1])}{_format_param_value(val)}"
+                for key, val in sorted(kw.items())
+            ]
+            return f"{base}_{'-'.join(parts)}"
+    return base
+
+
 _LAMBDA_PSNR, _LAMBDA_CLIP = 0.5, 0.5
 _PARETO_BIAS_ALPHA = 2.0
-_COMPUTED_METRIC_OPTIONS: dict[str, MetricOption] = {
+_SOFTPLUS_ALPHA = 1.0
+_SOFTPLUS_BETA = 2.0
+_DO_NORMALIZE = True
+_METRIC_REGISTRY: dict[str, MetricOption] = {
     "weighted_combined_score": MetricOption(
-        col="weighted_combined_score",
         fn=partial(compute_weighted_combined_score, lambda_psnr=_LAMBDA_PSNR, lambda_clip=_LAMBDA_CLIP),
-        label=(
-            "Combined Score" f" $\\lambda_{{\\text{{PSNR}}}}={_LAMBDA_PSNR}, \\lambda_{{\text{{CLIP}}}}={_LAMBDA_CLIP}$"
-        ),
+        label=f"Combined Score (\\lambda_{{\\text{{PSNR}}}}={_LAMBDA_PSNR}, \\lambda_{{\text{{CLIP}}}}={_LAMBDA_CLIP})",
     ),
     "agreement_score": MetricOption(
-        col="agreement_score",
         fn=compute_agreement_score,
         label="Agreement Score",
     ),
     "naive_pareto_score": MetricOption(
-        col="naive_pareto_score",
-        fn=compute_naive_pareto_score,
-        label="Naive Pareto Score",
+        fn=partial(compute_naive_pareto_score, do_normalize=_DO_NORMALIZE),
+        label=f"Naive Pareto Score (normalize={_DO_NORMALIZE})",
     ),
-    "pareto_biased_score": MetricOption(
-        col="pareto_biased_score",
-        fn=partial(compute_pareto_biased_score, alpha=_PARETO_BIAS_ALPHA),
-        label=f"Pareto Biased Score $\\alpha={_PARETO_BIAS_ALPHA}$",
+    "softplus_score": MetricOption(
+        fn=partial(compute_softplus_score, alpha=_SOFTPLUS_ALPHA, beta=_SOFTPLUS_BETA),
+        label=f"Softplus Score ($\\alpha={_SOFTPLUS_ALPHA}$, $\\beta={_SOFTPLUS_BETA}$, normalize={_DO_NORMALIZE})",
     ),
 }
 
-# NOTE: May be "weighted_combined_score", "agreement_score",
-# "naive_pareto_score", or "pareto_biased_score". Select preference.
-_ACTIVE = _COMPUTED_METRIC_OPTIONS["pareto_biased_score"]
-COMPUTED_METRIC_COL = _ACTIVE.col
-COMPUTED_METRIC_FN = _ACTIVE.fn
-COMPUTED_METRIC_LABEL = _ACTIVE.label
+if TARGET_METRIC not in _METRIC_REGISTRY:
+    raise ValueError(
+        f"Unknown TARGET_METRIC={TARGET_METRIC!r}; "
+        f"choose from {sorted(_METRIC_REGISTRY)}"
+    )
+
+_active = _METRIC_REGISTRY[TARGET_METRIC]
+TARGET_METRIC_COL = metric_col_name(TARGET_METRIC, _active.fn)
+TARGET_METRIC_COL_FN = _active.fn
+TARGET_METRIC_COL_LABEL = _active.label
+METRIC_REGISTRY = _METRIC_REGISTRY
 
 
 """
@@ -116,7 +153,7 @@ _METRICS = {
 METRIC_COLS = list(_METRICS.keys())
 METRIC_LABELS = {
     **_METRICS,
-    COMPUTED_METRIC_COL: COMPUTED_METRIC_LABEL,
+    TARGET_METRIC_COL: TARGET_METRIC_COL_LABEL,
 }
 
 
@@ -144,24 +181,23 @@ LABEL_SMOOTHING = 0.1
 
 
 """
-Training hyperparameters. TARGET_COLUMN is the regression/ordinal
-target; ENCODER_LR and MLP_LR are kept separate because the encoder
-backbone and the MLP head typically benefit from different learning
-rates. MLP_WIDE / MLP_HIDDEN / MLP_INNER define the three hidden layer
-widths of the head network.
+Training hyperparameters. ENCODER_LR and MLP_LR are kept separate because
+the encoder backbone and the MLP head typically benefit from different
+learning rates. MLP_WIDE / MLP_HIDDEN / MLP_INNER define the three hidden
+layer widths of the head network.
 """
-
-TARGET_COLUMN = COMPUTED_METRIC_COL
 
 SEED = 42
 EPOCHS = 20
 BATCH_SIZE = 32
 
+# Only used when FREEZE_ENCODER is False
 ENCODER_LR = 2e-5
-WEIGHT_DECAY = 0.01
 
+# Body of the model
 MLP_WIDE = 512
 MLP_HIDDEN = 256
 MLP_INNER = 128
 MLP_DROPOUT = 0.1
 MLP_LR = 1e-3
+WEIGHT_DECAY = 0.01
