@@ -53,11 +53,12 @@ _ACTIVE = _COMPUTED_METRIC_OPTIONS["naive_pareto_score"]
 
 | Key | Description |
 |---|---|
-| `"naive_pareto_score"` | Pareto improvement relative to the paper's baseline row per sample group. |
+| `"naive_pareto_score"` | $\max(0, \Delta\text{PSNR}) \cdot \max(0, \Delta\text{CLIP})$ relative to the paper's baseline row per sample group. |
+| `"pareto_biased_score"` | Smooth Pareto score $s(a-A)+s(b-B)+\alpha\, s(a-A)\, s(b-B)$ with shifted softplus $s$; default $\alpha=2$ via `_PARETO_BIAS_ALPHA`. |
 | `"agreement_score"` | Similarity between PSNR and CLIP similarity scores. |
 | `"weighted_combined_score"` | Weighted blend of normalized PSNR and CLIP, adjust `_LAMBDA_PSNR` and `_LAMBDA_CLIP`. |
 
-Each option is a `MetricOption(col, fn, label)`. The three module-level constants `COMPUTED_METRIC_COL`, `COMPUTED_METRIC_FN`, and `COMPUTED_METRIC_LABEL` are derived from `_ACTIVE` automatically and do not need to be edited directly.
+Each option is a `MetricOption(col, fn, label)`. The module-level constants `COMPUTED_METRIC_COL`, `COMPUTED_METRIC_FN`, and `COMPUTED_METRIC_LABEL` are derived from `_ACTIVE` automatically and do not need to be edited directly.
 
 ### 4. Adjust remaining settings
 

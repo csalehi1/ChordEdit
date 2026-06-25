@@ -7,6 +7,7 @@ from models.classification.utils import (
     compute_weighted_combined_score,
     compute_agreement_score,
     compute_naive_pareto_score,
+    compute_pareto_biased_score,
 )
 
 """
@@ -32,7 +33,7 @@ Parameters that describe the shape and structure of the training data.
 N_BUCKETS_* defines the expected number of distinct timestep levels; the
 loader raises at import time if the data does not match. The PAPER_T_*
 constants reproduce the baseline timestep bounds from the original paper
-and are used by compute_naive_pareto_score to identify the reference row
+and are used by the Pareto score functions to identify the reference row
 within each sample group.
 """
 
@@ -52,8 +53,8 @@ the callable that produces  it, and a display label. Parameterized
 variants (e.g. weighted combined score)  use functools.partial so
 every option has the same zero-argument-from-df call  signature. To
 switch the metric used throughout training and evaluation, change the
-key passed to _COMPUTED_METRIC_OPTIONS on the _ACTIVE line. The three
-module-level constants below it are then derived automatically.
+key passed to _COMPUTED_METRIC_OPTIONS on the _ACTIVE line. The module-level
+constants below it are then derived automatically.
 """
 
 
@@ -66,6 +67,7 @@ class MetricOption:
 
 # Possible computed metric options linked to their associated functions
 _LAMBDA_PSNR, _LAMBDA_CLIP = 0.5, 0.5
+_PARETO_BIAS_ALPHA = 2.0
 _COMPUTED_METRIC_OPTIONS: dict[str, MetricOption] = {
     "weighted_combined_score": MetricOption(
         col="weighted_combined_score",
@@ -84,11 +86,16 @@ _COMPUTED_METRIC_OPTIONS: dict[str, MetricOption] = {
         fn=compute_naive_pareto_score,
         label="Naive Pareto Score",
     ),
+    "pareto_biased_score": MetricOption(
+        col="pareto_biased_score",
+        fn=partial(compute_pareto_biased_score, alpha=_PARETO_BIAS_ALPHA),
+        label=f"Pareto Biased Score $\\alpha={_PARETO_BIAS_ALPHA}$",
+    ),
 }
 
 # NOTE: May be "weighted_combined_score", "agreement_score",
-# "naive_pareto_score". Select preference.
-_ACTIVE = _COMPUTED_METRIC_OPTIONS["naive_pareto_score"]
+# "naive_pareto_score", or "pareto_biased_score". Select preference.
+_ACTIVE = _COMPUTED_METRIC_OPTIONS["pareto_biased_score"]
 COMPUTED_METRIC_COL = _ACTIVE.col
 COMPUTED_METRIC_FN = _ACTIVE.fn
 COMPUTED_METRIC_LABEL = _ACTIVE.label

@@ -11,6 +11,7 @@ passed to OrdinalPairClassifier.
 from __future__ import annotations
 
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 import pandas as pd
@@ -45,6 +46,16 @@ from models.classification.settings import (
     STRINGS_CSV,
     TARGET_COLUMN,
 )
+
+
+def _serialize_setting(v):
+    if isinstance(v, Path):
+        return str(v)
+    if isinstance(v, partial):
+        return v.func.__name__
+    if callable(v):
+        return v.__name__
+    return v
 
 
 class PairDataset(Dataset):
@@ -400,7 +411,7 @@ def train() -> OrdinalPairClassifier:
                     "config": {
                         "run_dir": str(run_dir),
                         **{
-                            k: str(v) if isinstance(v, Path) else (v.__name__ if callable(v) else v)
+                            k: _serialize_setting(v)
                             for k, v in vars(_settings).items()
                             if k.isupper() and not k.startswith("_") and not isinstance(v, type({}.keys()))
                         },

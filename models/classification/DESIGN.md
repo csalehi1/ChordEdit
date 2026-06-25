@@ -152,13 +152,15 @@ At inference, the continuous prediction is snapped to the nearest bucket index. 
 
 ### Target Score Options
 
-The score used to select the best row per `sample_id` is configurable in `settings.py` via `_ACTIVE`. Three options are available:
+The score used to select the best row per `sample_id` is configurable in `settings.py` via `_ACTIVE`. Four options are available:
 
 - **`weighted_combined_score`**: $\lambda_{\text{PSNR}} \cdot \hat{p} + \lambda_{\text{CLIP}} \cdot \hat{c}$, where $\hat{p}$ and $\hat{c}$ are min-max normalised PSNR and CLIP similarity, with $\lambda_{\text{PSNR}} = \lambda_{\text{CLIP}} = 0.5$ by default.
 
 - **`agreement_score`**: $1 - \lvert p - c \rvert \,/\, \max(\lvert p - c \rvert)$, measuring how closely PSNR and CLIP agree on raw values.
 
-- **`naive_pareto_score`** (active default): For each `sample_id` group, the baseline row is identified at $t_{\text{start}} = 0.9$, $t_{\text{end}} = 0.3$ (the paper's defaults). Rows where both PSNR and CLIP strictly exceed the baseline receive score $1 + \Delta\text{PSNR} + \Delta\text{CLIP}$; all other rows score $0$, except the baseline itself which receives $1$.
+- **`naive_pareto_score`** (active default): For each `sample_id` group, the baseline row is identified at $t_{\text{start}} = \text{PAPER\_T\_START} - \text{PAPER\_T\_DELTA}$, $t_{\text{end}} = \text{PAPER\_T\_END}$ (defaults $(0.75, 0.3)$). Each row receives score $\max(0, \Delta\text{PSNR}) \cdot \max(0, \Delta\text{CLIP})$ relative to that baseline; the baseline itself scores $0$.
+
+- **`pareto_biased_score`**: Uses the same baseline as `naive_pareto_score`. With $s(t) = \operatorname{softplus}(t) - \log 2$, each row receives $m(a,b) = s(a-A) + s(b-B) + \alpha\, s(a-A)\, s(b-B)$ where $a$, $b$ are PSNR and CLIP and $A$, $B$ are the baseline values. Default $\alpha = 2$ (`_PARETO_BIAS_ALPHA` in `settings.py`). The baseline scores $0$; improvements are rewarded smoothly and regressions penalised.
 
 ## Training
 

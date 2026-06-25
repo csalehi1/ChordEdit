@@ -68,21 +68,18 @@ def compute_naive_pareto_score(
     Return a Pareto improvement score for each row relative to the
     baseline row in its sample_id group.
 
-    The baseline is the row where t_start == DEFAULT_T_START -
-    DEFAULT_T_DELTA and t_end == DEFAULT_T_STOP.  If both PSNR and
-    CLIP strictly exceed the baseline, the score is 1 + delta_psnr +
-    delta_clip; otherwise it is 0. Rows whose group has no unambiguous
-    baseline also score 0. Rows with t_start == base_t_start and t_end
-    == base_t_end will score 1.
+    The baseline is the row where t_start == PAPER_T_START - T_DELTA_TARGET and
+    t_end == PAPER_T_END. Each row's score is max(0, delta_psnr) * max(0,
+    delta_clip) relative to that baseline (the baseline itself scores 0).
     """
-    from models.classification.settings import PAPER_T_START, PAPER_T_END, PAPER_T_DELTA
+    from models.classification.settings import PAPER_T_START, PAPER_T_END, T_DELTA_TARGET
 
-    base_t_start = PAPER_T_START - PAPER_T_DELTA if base_t_start is None else base_t_start
+    base_t_start = PAPER_T_START - T_DELTA_TARGET if base_t_start is None else base_t_start
     base_t_end = PAPER_T_END if base_t_end is None else base_t_end
 
     scores = pd.Series(0.0, index=df.index, name="naive_pareto_score")
 
-    for _, group in df.groupby(sample_id_col):
+    for sample_id, group in df.groupby(sample_id_col):
         base_mask = (
             np.isclose(group["t_start"], base_t_start)
             & np.isclose(group["t_end"], base_t_end)
@@ -92,7 +89,11 @@ def compute_naive_pareto_score(
         if base_mask.sum() == 0:
             dist = (np.abs(group["t_start"] - base_t_start) + np.abs(group["t_end"] - base_t_end))
             base_idx = dist.idxmin()
-            print(f"Baseline ({base_t_start}, {base_t_end}) not found; using closest row {base_idx}.")
+            base_row = group.loc[base_idx]
+            print(
+                f"Baseline ({base_t_start}, {base_t_end}) not found for sample_id={sample_id!r}; "
+                f"using ({base_row['t_start']}, {base_row['t_end']})."
+            )
         # If more than one baseline row is found, raise an error.
         elif base_mask.sum() != 1:
             raise ValueError(f"Expected exactly one base row, found {base_mask.sum()}")
@@ -103,11 +104,71 @@ def compute_naive_pareto_score(
         base_clip = group.loc[base_idx, clip_col]
         delta_psnr = group[psnr_col] - base_psnr
         delta_clip = group[clip_col] - base_clip
-        improving = (delta_psnr > 0) & (delta_clip > 0)
-        row_scores = np.zeros(len(group), dtype=float)
-        row_scores[:] = 0.0
-        row_scores[np.where(group.index == base_idx)[0][0]] = 1.0
-        row_scores[improving.to_numpy()] = 1 + delta_psnr[improving] + delta_clip[improving]
+        row_scores = np.maximum(0, delta_psnr) * np.maximum(0, delta_clip)
+        scores.loc[group.index] = row_scores
+
+    return scores
+
+
+def compute_pareto_biased_score(
+    df: pd.DataFrame,
+    psnr_col: str = "psnr",
+    clip_col: str = "clip_edited",
+    sample_id_col: str = "sample_id",
+    base_t_start: float | None = None,
+    base_t_end: float | None = None,
+    alpha: float = 2.0,
+) -> pd.Series:
+    """
+    Return a smooth Pareto-improvement-inclined score for each row
+    relative to the baseline row in its sample_id group.
+
+    The baseline is the row where t_start == PAPER_T_START -
+    T_DELTA_TARGET and t_end == PAPER_T_END. With a = PSNR, b = CLIP,
+    and A, B the baseline values, each row receives:
+
+        m(a, b) = s(a - A) + s(b - B) + alpha * s(a - A) * s(b - B)
+
+    where s(t) = softplus(t) - log(2) and softplus(t) = log(1 +
+    exp(t)). At the baseline, s(0) = 0 so m(A, B) = 0.
+    """
+    from models.classification.settings import PAPER_T_START, PAPER_T_END, T_DELTA_TARGET
+
+    def shifted_softplus(t: np.ndarray) -> np.ndarray:
+        softplus = np.log1p(np.exp(-np.abs(t))) + np.maximum(t, 0)
+        return softplus - np.log(2)
+
+    base_t_start = PAPER_T_START - T_DELTA_TARGET if base_t_start is None else base_t_start
+    base_t_end = PAPER_T_END if base_t_end is None else base_t_end
+
+    scores = pd.Series(0.0, index=df.index, name="pareto_biased_score")
+
+    for sample_id, group in df.groupby(sample_id_col):
+        base_mask = (
+            np.isclose(group["t_start"], base_t_start)
+            & np.isclose(group["t_end"], base_t_end)
+        )
+        # If the baseline row is not found, use the closest row (e.g.,
+        # t_delta = 0.15 and data is listed by 0.1, will be 0.8).
+        if base_mask.sum() == 0:
+            dist = (np.abs(group["t_start"] - base_t_start) + np.abs(group["t_end"] - base_t_end))
+            base_idx = dist.idxmin()
+            base_row = group.loc[base_idx]
+            print(
+                f"Baseline ({base_t_start}, {base_t_end}) not found for sample_id={sample_id!r}; "
+                f"using ({base_row['t_start']}, {base_row['t_end']})."
+            )
+        # If more than one baseline row is found, raise an error.
+        elif base_mask.sum() != 1:
+            raise ValueError(f"Expected exactly one base row, found {base_mask.sum()}")
+        # If exactly one baseline row is found, use it.
+        else:
+            base_idx = group.index[base_mask][0]
+        base_psnr = group.loc[base_idx, psnr_col]
+        base_clip = group.loc[base_idx, clip_col]
+        s_psnr = shifted_softplus((group[psnr_col] - base_psnr).to_numpy(dtype=float))
+        s_clip = shifted_softplus((group[clip_col] - base_clip).to_numpy(dtype=float))
+        row_scores = s_psnr + s_clip + alpha * s_psnr * s_clip
         scores.loc[group.index] = row_scores
 
     return scores
