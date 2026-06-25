@@ -36,13 +36,16 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger("grid_ablation")
 GRID_VALUES_SYM = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
-GRID_VALUES = [0.0, 0.3, 0.6, 0.9, 1.0]
+GRID_VALUES = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+DEFAULT_OUTPUT_ROOT = "ablation_outputs/grid_t_start_t_end_sdxl_turbo"
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Run a 5x5 ChordEdit grid ablation: x-axis=t_start, y-axis=t_end."
-    )
+def build_argument_parser(
+    *,
+    description: str = "Run a 5x5 ChordEdit grid ablation: x-axis=t_start, y-axis=t_end.",
+    output_root_default: str = DEFAULT_OUTPUT_ROOT,
+) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--model-root",
         type=str,
@@ -64,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         type=str,
-        default="ablation_outputs/grid_t_start_t_end_sdxl_turbo",
+        default=output_root_default,
         help="Where to save 5x5 ablation grids and cell images.",
     )
     parser.add_argument("--device", type=str, default=None, help="Torch device override, e.g. cuda:0 or cpu.")
@@ -109,7 +112,11 @@ def parse_args() -> argparse.Namespace:
         help="Chord edit mode. default uses the default edit mode, sym uses a symmetric edit.",
     )
     parser.add_argument("--cell-size", type=int, default=192, help="Pixel size of each image in the grid.")
-    return parser.parse_args()
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    return build_argument_parser().parse_args()
 
 
 def make_axis_grid(
