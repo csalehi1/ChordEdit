@@ -39,7 +39,7 @@ within each sample group.
 
 # NOTE: May be "weighted_combined_score", "agreement_score",
 # "naive_pareto_score", or "softplus_score". Choose one.
-TARGET_METRIC = "naive_pareto_score"
+TARGET_METRIC = "softplus_score"
 
 # NOTE: Must match number of distinct `t_start`, `t_end` values in METRICS_CSV
 N_BUCKETS_START = 9
@@ -65,12 +65,6 @@ arguments (e.g. softplus_score with alpha=1, beta=2 -> softplus_score_a1-b2).
 """
 
 
-@dataclass(frozen=True)
-class MetricOption:
-    fn: Callable
-    label: str
-
-
 _PARAM_ABBREV: dict[str, str] = {
     "alpha": "a",
     "beta": "b",
@@ -78,6 +72,12 @@ _PARAM_ABBREV: dict[str, str] = {
     "lambda_clip": "lc",
     "do_normalize": "n",
 }
+
+
+@dataclass(frozen=True)
+class MetricOption:
+    fn: Callable
+    label: str
 
 
 def _format_param_value(val) -> str:
@@ -120,8 +120,8 @@ _METRIC_REGISTRY: dict[str, MetricOption] = {
         label=f"Naive Pareto Score (normalize={_DO_NORMALIZE})",
     ),
     "softplus_score": MetricOption(
-        fn=partial(compute_softplus_score, alpha=_SOFTPLUS_ALPHA, beta=_SOFTPLUS_BETA),
-        label=f"Softplus Score ($\\alpha={_SOFTPLUS_ALPHA}$, $\\beta={_SOFTPLUS_BETA}$, normalize={_DO_NORMALIZE})",
+        fn=partial(compute_softplus_score, alpha=_SOFTPLUS_ALPHA, beta=_SOFTPLUS_BETA, do_normalize=_DO_NORMALIZE),
+        label=f"Softplus Score ($\\alpha={_SOFTPLUS_ALPHA}$, $\\beta={_SOFTPLUS_BETA}$, n={_DO_NORMALIZE:d})",
     ),
 }
 

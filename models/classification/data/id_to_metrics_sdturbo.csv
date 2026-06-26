@@ -1,4 +1,4 @@
-sample_id,t_delta,t_start,t_end,psnr,clip_similarity_target_image
+sample_id,t_delta,t_start,t_end,psnr,clip_edited
 0,0.15,0.0,0.0,27.31409159928856,21.19316291809082
 0,0.15,0.0,0.1,27.31409159928856,21.19316291809082
 0,0.15,0.0,0.2,27.31409159928856,21.19316291809082

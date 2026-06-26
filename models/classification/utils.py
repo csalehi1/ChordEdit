@@ -156,7 +156,7 @@ def compute_softplus_score(
                 + (1/beta)*ln(1+e^{beta*(b-B)})
                 - (1/beta)*2*ln(2)
 
-                Optional: Bias score towards Pareto improvement.
+                Optional (alpha > 0): Bias towards Pareto improvement.
                 + alpha*ln(1+e^{beta*(a-A)})*ln(1+e^{beta*(b-B)})
 
     The baseline scores 0. Rows that also score 0 but differ from the baseline
@@ -165,11 +165,17 @@ def compute_softplus_score(
     """
     from models.classification.settings import DEFAULT_T_START, DEFAULT_T_END
 
+    # Calculate the shifted softplus score.
     def _shifted_softplus(x: np.ndarray, beta: float) -> np.ndarray:
         """Calculate (1/beta)*ln(1+e^{beta*x})-(1/beta)*ln(2)"""
-        sp = np.logaddexp(0, beta * x) / beta
-        return sp - np.log(2) / beta
+        return np.logaddexp(0, beta * x) / beta - np.log(2) / beta
 
+    # Optional: Bias score towards Pareto improvement.
+    def _pareto_bias(x: np.ndarray, alpha: float, beta: float) -> np.ndarray:
+        """Calculate sqrt(alpha)*ln(1+e^{beta*x})"""
+        return np.sqrt(alpha) * np.logaddexp(0, beta * x)
+
+    # Penalize rows where the score is 0 but it is not the baseline.
     def _penalize_spurious_zeros(scores, delta_psnr, delta_clip):
         """Zero out rows where the score is 0 but it is not the baseline."""
         mask = (scores == 0) & (delta_psnr != 0) & (delta_clip != 0)
@@ -182,11 +188,9 @@ def compute_softplus_score(
     for sample_id, group in df.groupby(sample_id_col):
         base_idx = _find_baseline_idx(group, base_t_start, base_t_end, sample_id)
         delta_psnr, delta_clip = _group_deltas(group, psnr_col, clip_col, base_idx, do_normalize)
-        s_psnr = _shifted_softplus(delta_psnr, beta)
-        s_clip = _shifted_softplus(delta_clip, beta)
-        row_scores = s_psnr + s_clip
-        if alpha:
-            row_scores += alpha * s_psnr * s_clip
+        s_psnr, s_clip = _shifted_softplus(delta_psnr, beta), _shifted_softplus(delta_clip, beta)
+        b_psnr, b_clip = _pareto_bias(delta_psnr, alpha, beta), _pareto_bias(delta_clip, alpha, beta)
+        row_scores = s_psnr + s_clip + b_psnr * b_clip
         row_scores = _penalize_spurious_zeros(row_scores, delta_psnr, delta_clip)
         scores.loc[group.index] = row_scores
 
