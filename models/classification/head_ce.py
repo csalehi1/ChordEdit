@@ -7,15 +7,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def index_to_one_hot(target_idx: torch.Tensor, num_classes: int) -> torch.Tensor:
+def index_to_one_hot(target_idx: torch.Tensor, n_classes: int) -> torch.Tensor:
     """Map integer bucket indices to one-hot class vectors."""
-    if num_classes == 0:
+    if n_classes == 0:
         raise ValueError("num_classes must be positive")
-    return F.one_hot(target_idx.long(), num_classes=num_classes).float()
+    return F.one_hot(target_idx.long(), num_classes=n_classes).float()
 
 
 def ordinal_cost_matrix(
-    num_classes: int,
+    n_classes: int,
     *,
     power: float = 1.0,
     normalize: bool = True,
@@ -28,12 +28,12 @@ def ordinal_cost_matrix(
     When normalize=True, costs are scaled to [0, 1] by the maximum pairwise
     distance so the loss magnitude stays comparable across different K.
     """
-    if num_classes <= 1:
-        return torch.zeros(num_classes, num_classes, device=device)
+    if n_classes <= 1:
+        return torch.zeros(n_classes, n_classes, device=device)
 
-    idx = torch.arange(num_classes, device=device, dtype=torch.float32)
+    idx = torch.arange(n_classes, device=device, dtype=torch.float32)
     costs = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs().pow(power)
-    if normalize and num_classes > 1:
+    if normalize and n_classes > 1:
         costs = costs / costs.max().clamp(min=1e-9)
     return costs
 
@@ -53,25 +53,30 @@ def cost_sensitive_ce_loss(
 
         sum_j  p(j | x) * cost[y, j]
 
-    where y is the true class, p = softmax(logits), and cost[y, j] penalises
+    where y is the true class, p = softmax(logits), and cost[y, j] penalizes
     assigning probability mass to distant buckets. This keeps training
-    differentiable while encoding ordinal nearness — nearby wrong classes cost
+    differentiable while encoding ordinal nearness, nearby wrong classes cost
     less than far ones.
 
     When cost_matrix is None, an ordinal |i - j| matrix is built from the
     number of logits. Diagonal entries are zero so confident correct
-    predictions are not penalised.
+    predictions are not penalized.
 
-    Class-frequency reweighting (inverse count) is applied via class_weights[y]
-    per sample. Optional sample_weights multiply each per-sample loss (same
-    role as the weights argument in ordinal_loss / regression_loss).
+    class_weights is a length-K vector indexed by the true label (same effect as
+    passing class_weights[y] into ordinal_loss / regression_loss in classify.py).
+    sample_weights is an optional length-N vector for extra per-example scaling
+    applied after class reweighting.
     """
-    num_classes = logits.size(-1)
-    if num_classes == 0:
+    n_classes = logits.size(-1)
+    if n_classes == 0:
+        # Return 0.0 if N_BUCKETS_* for that tensor is *0*, no classes to predict.
         return torch.tensor(0.0, device=logits.device, requires_grad=False)
+    if n_classes == 1:
+        # Return 0.0 if N_BUCKETS_* for that tensor is *1*, no learning possible.
+        return logits.sum() * 0.0
 
     if cost_matrix is None:
-        cost_matrix = ordinal_cost_matrix(num_classes, device=logits.device)
+        cost_matrix = ordinal_cost_matrix(n_classes, device=logits.device)
     else:
         cost_matrix = cost_matrix.to(device=logits.device, dtype=logits.dtype)
 
@@ -99,11 +104,17 @@ def one_hot_ce_loss(
     Standard cross-entropy against one-hot targets (no ordinal cost matrix).
 
     Useful as an ablation against cost_sensitive_ce_loss.
+
+    class_weights is passed to F.cross_entropy as its weight argument (length-K
+    vector, per-class reweighting). sample_weights is an optional length-N vector
+    multiplied onto per-sample losses after CE.
     """
-    num_classes = logits.size(-1)
-    if num_classes == 0:
+    n_classes = logits.size(-1)
+    if n_classes == 0:
+        # Return 0.0 if N_BUCKETS_* for that tensor is *0*, no classes to predict.
         return torch.tensor(0.0, device=logits.device, requires_grad=False)
-    if num_classes == 1:
+    if n_classes == 1:
+        # Return 0.0 if N_BUCKETS_* for that tensor is *1*, no learning possible.
         return logits.sum() * 0.0
 
     loss = F.cross_entropy(
@@ -115,6 +126,7 @@ def one_hot_ce_loss(
     )
     if sample_weights is not None:
         loss = loss * sample_weights
+
     return loss.mean()
 
 

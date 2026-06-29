@@ -21,7 +21,7 @@ from torch.utils.data import Dataset, DataLoader
 from models.classification.model import OrdinalPairClassifier, mae_buckets
 from models.classification.head_coral import ordinal_loss
 from models.classification.head_mse import regression_loss
-from models.classification.head_ce import one_hot_ce_loss
+from models.classification.head_ce import cost_sensitive_ce_loss, one_hot_ce_loss
 import models.classification.settings as _settings
 from models.classification.settings import (
     BATCH_SIZE,
@@ -32,6 +32,7 @@ from models.classification.settings import (
     FREEZE_ENCODER,
     MLP_LR,
     HEAD_TYPE,
+    CE_LOSS_TYPE,
     USE_CLASS_WEIGHTS,
     LABEL_SMOOTHING,
     WEIGHT_DECAY,
@@ -171,6 +172,20 @@ def _head_params(model: OrdinalPairClassifier) -> list[torch.nn.Parameter]:
     return params
 
 
+def _ce_loss(
+    logits: torch.Tensor,
+    target_idx: torch.Tensor,
+    *,
+    class_weights: torch.Tensor | None,
+) -> torch.Tensor:
+    if CE_LOSS_TYPE == "cost_sensitive_ce_loss":
+        return cost_sensitive_ce_loss(logits, target_idx, class_weights=class_weights)
+    elif CE_LOSS_TYPE == "one_hot_ce_loss":
+        return one_hot_ce_loss(logits, target_idx, class_weights=class_weights, label_smoothing=LABEL_SMOOTHING)
+    else:
+        raise ValueError(f"CE_LOSS_TYPE {CE_LOSS_TYPE!r} not recognized")
+
+
 def _compute_loss(
     model: OrdinalPairClassifier,
     l1: torch.Tensor | None,
@@ -193,11 +208,7 @@ def _compute_loss(
             w1 = class_w_start[y1] if class_w_start is not None else None
             loss_parts.append(ordinal_loss(l1, y1, w1))
         elif HEAD_TYPE == "CE":
-            loss_parts.append(one_hot_ce_loss(
-                l1, y1,
-                class_weights=class_w_start,
-                label_smoothing=LABEL_SMOOTHING,
-            ))
+            loss_parts.append(_ce_loss(l1, y1, class_weights=class_w_start))
         elif HEAD_TYPE == "MSE":
             w1 = class_w_start[y1] if class_w_start is not None else None
             loss_parts.append(regression_loss(l1, model.buckets1[y1], w1))
@@ -211,11 +222,7 @@ def _compute_loss(
             w2 = class_w_end[y2] if class_w_end is not None else None
             loss_parts.append(ordinal_loss(l2, y2, w2))
         elif HEAD_TYPE == "CE":
-            loss_parts.append(one_hot_ce_loss(
-                l2, y2,
-                class_weights=class_w_end,
-                label_smoothing=LABEL_SMOOTHING,
-            ))
+            loss_parts.append(_ce_loss(l2, y2, class_weights=class_w_end))
         elif HEAD_TYPE == "MSE":
             w2 = class_w_end[y2] if class_w_end is not None else None
             loss_parts.append(regression_loss(l2, model.buckets2[y2], w2))

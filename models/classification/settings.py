@@ -20,7 +20,7 @@ _PARENT_DIR = Path(__file__).resolve().parent
 DATA_DIR = _PARENT_DIR / "data"
 
 # NOTE: Adjust METRICS_CSV dependent on the data
-METRICS_CSV = DATA_DIR / "id_to_metrics_sdturbo.csv"
+METRICS_CSV = DATA_DIR / "id_to_metrics_sdturbo-tstart.csv"
 STRINGS_CSV = DATA_DIR / "id_to_string_pair.csv"
 
 # Files for image data should be named `id_to_metrics_*`
@@ -42,7 +42,7 @@ within each sample group.
 TARGET_METRIC = "softplus_score"
 
 # NOTE: Must match number of distinct `t_start`, `t_end` values in METRICS_CSV
-N_BUCKETS_START = 9
+N_BUCKETS_START = 11
 N_BUCKETS_END = 1
 
 # Value in `t_delta` column to select data from 
@@ -60,68 +60,42 @@ PAPER_T_DELTA = 0.15
 
 """
 Computed metrics. Set TARGET_METRIC to one of the keys in _METRIC_REGISTRY.
-TARGET_METRIC_COL is derived from the metric key plus any partial() keyword
-arguments (e.g. softplus_score with alpha=1, beta=2 -> softplus_score_a1-b2).
+TARGET_METRIC_COL is the column name for the active metric.
 """
-
-
-_PARAM_ABBREV: dict[str, str] = {
-    "alpha": "a",
-    "beta": "b",
-    "lambda_psnr": "lp",
-    "lambda_clip": "lc",
-    "do_normalize": "n",
-}
 
 
 @dataclass(frozen=True)
 class MetricOption:
     fn: Callable
+    col: str
     label: str
 
 
-def _format_param_value(val) -> str:
-    if isinstance(val, bool):
-        return "1" if val else "0"
-    if isinstance(val, float):
-        return f"{val:g}"
-    return str(val)
-
-
-def metric_col_name(base: str, fn: Callable) -> str:
-    """Build a column name from a metric key and partial keyword arguments."""
-    if isinstance(fn, partial):
-        kw = fn.keywords
-        if kw:
-            parts = [
-                f"{_PARAM_ABBREV.get(key, key[:1])}{_format_param_value(val)}"
-                for key, val in sorted(kw.items())
-            ]
-            return f"{base}_{'-'.join(parts)}"
-    return base
-
-
+# Data to connect TARGET_METRIC to the appropriate metric function and label.
 _LAMBDA_PSNR, _LAMBDA_CLIP = 0.5, 0.5
 _PARETO_BIAS_ALPHA = 2.0
-_SOFTPLUS_ALPHA = 1.0
-_SOFTPLUS_BETA = 2.0
-_DO_NORMALIZE = True
+_SOFTPLUS_ALPHA, _SOFTPLUS_BETA = 1.0, 2.0
+_NORMALIZE = False
 _METRIC_REGISTRY: dict[str, MetricOption] = {
     "weighted_combined_score": MetricOption(
         fn=partial(compute_weighted_combined_score, lambda_psnr=_LAMBDA_PSNR, lambda_clip=_LAMBDA_CLIP),
-        label=f"Combined Score (\\lambda_{{\\text{{PSNR}}}}={_LAMBDA_PSNR}, \\lambda_{{\text{{CLIP}}}}={_LAMBDA_CLIP})",
+        col=f"weighted_combined_score_lc{_LAMBDA_CLIP:g}-lp{_LAMBDA_PSNR:g}",
+        label=f"Combined Score (\\lambda_{{\\text{{PSNR}}}}={_LAMBDA_PSNR}, \\lambda_{{\\text{{CLIP}}}}={_LAMBDA_CLIP})",
     ),
     "agreement_score": MetricOption(
         fn=compute_agreement_score,
+        col="agreement_score",
         label="Agreement Score",
     ),
     "naive_pareto_score": MetricOption(
-        fn=partial(compute_naive_pareto_score, do_normalize=_DO_NORMALIZE),
-        label=f"Naive Pareto Score (normalize={_DO_NORMALIZE})",
+        fn=partial(compute_naive_pareto_score, normalize=_NORMALIZE),
+        col=f"naive_pareto_score_n{_NORMALIZE:d}",
+        label=f"Naive Pareto Score (n={_NORMALIZE:d})",
     ),
     "softplus_score": MetricOption(
-        fn=partial(compute_softplus_score, alpha=_SOFTPLUS_ALPHA, beta=_SOFTPLUS_BETA, do_normalize=_DO_NORMALIZE),
-        label=f"Softplus Score ($\\alpha={_SOFTPLUS_ALPHA}$, $\\beta={_SOFTPLUS_BETA}$, n={_DO_NORMALIZE:d})",
+        fn=partial(compute_softplus_score, alpha=_SOFTPLUS_ALPHA, beta=_SOFTPLUS_BETA, normalize=_NORMALIZE),
+        col=f"softplus_score_a{_SOFTPLUS_ALPHA:g}-b{_SOFTPLUS_BETA:g}-n{_NORMALIZE:d}",
+        label=f"Softplus Score ($\\alpha={_SOFTPLUS_ALPHA}$, $\\beta={_SOFTPLUS_BETA}$, n={_NORMALIZE:d})",
     ),
 }
 
@@ -132,7 +106,7 @@ if TARGET_METRIC not in _METRIC_REGISTRY:
     )
 
 _active = _METRIC_REGISTRY[TARGET_METRIC]
-TARGET_METRIC_COL = metric_col_name(TARGET_METRIC, _active.fn)
+TARGET_METRIC_COL = _active.col
 TARGET_METRIC_COL_FN = _active.fn
 TARGET_METRIC_COL_LABEL = _active.label
 METRIC_REGISTRY = _METRIC_REGISTRY
@@ -163,6 +137,7 @@ used as the Siamese backbone. FREEZE_ENCODER prevents its weights from
 updating during training; set to False to fine-tune end-to-end.
 HEAD_TYPE selects between ordinal regression ("CORAL"), plain
 mean-squared-error ("MSE"), and cost-sensitive multiclass CE ("CE").
+When HEAD_TYPE is "CE", CE_LOSS_TYPE selects the CE loss function.
 USE_CLASS_WEIGHTS re-weights the loss by inverse class frequency to
 counteract label imbalance in the training split.
 """
@@ -171,14 +146,16 @@ counteract label imbalance in the training split.
 ENCODER_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 # Prevent encoder weights from updating during training
 FREEZE_ENCODER = True
-# Select head type to use for last step of model,
-# NOTE: May be "CORAL", "MSE", or "CE"
+# NOTE: Select head type to use for last step of model, 
+# may be "CORAL", "MSE", or "CE". Choose one.
 HEAD_TYPE = "CE"
+# NOTE: Only used when HEAD_TYPE = "CE". May be 
+# "cost_sensitive_ce_loss" or "one_hot_ce_loss". Choose one.
+CE_LOSS_TYPE = "one_hot_ce_loss"
 # Counteract label imbalance in the training split.
 USE_CLASS_WEIGHTS = False
 # Softens overconfident majority-class collapse in CE training.
 LABEL_SMOOTHING = 0.1
-
 
 """
 Training hyperparameters. ENCODER_LR and MLP_LR are kept separate because

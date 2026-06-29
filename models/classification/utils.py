@@ -34,7 +34,7 @@ def compute_weighted_combined_score(
 
     weight_sum = lambda_psnr + lambda_clip
     combined = (lambda_psnr * psnr_norm + lambda_clip * clip_norm) / (weight_sum + eps)
-    return pd.Series(combined, index=df.index, name=f"weighted_score_p{lambda_psnr}_c{lambda_clip}")
+    return pd.Series(combined, index=df.index, name=f"weighted_score_p{lambda_psnr}-c{lambda_clip}")
 
 
 def compute_agreement_score(
@@ -106,7 +106,7 @@ def compute_naive_pareto_score(
     sample_id_col: str = "sample_id",
     base_t_start: float | None = None,
     base_t_end: float | None = None,
-    do_normalize: bool = False,
+    normalize: bool = False,
 ) -> pd.Series:
     """
     Return a Pareto improvement score for each row relative to the
@@ -127,7 +127,7 @@ def compute_naive_pareto_score(
 
     for sample_id, group in df.groupby(sample_id_col):
         base_idx = _find_baseline_idx(group, base_t_start, base_t_end, sample_id)
-        delta_psnr, delta_clip = _group_deltas(group, psnr_col, clip_col, base_idx, do_normalize)
+        delta_psnr, delta_clip = _group_deltas(group, psnr_col, clip_col, base_idx, normalize)
         row_scores = np.maximum(0, delta_psnr) * np.maximum(0, delta_clip)
         scores.loc[group.index] = row_scores
 
@@ -144,7 +144,7 @@ def compute_softplus_score(
     alpha: float = 1.0,
     beta: float = 2.0,
     epsilon: float = 1e-6,
-    do_normalize: bool = True,
+    normalize: bool = True,
 ) -> pd.Series:
     """
     Return a smooth score for each row relative to the baseline row in its
@@ -187,7 +187,7 @@ def compute_softplus_score(
     scores = pd.Series(0.0, index=df.index, name="softplus_score")
     for sample_id, group in df.groupby(sample_id_col):
         base_idx = _find_baseline_idx(group, base_t_start, base_t_end, sample_id)
-        delta_psnr, delta_clip = _group_deltas(group, psnr_col, clip_col, base_idx, do_normalize)
+        delta_psnr, delta_clip = _group_deltas(group, psnr_col, clip_col, base_idx, normalize)
         s_psnr, s_clip = _shifted_softplus(delta_psnr, beta), _shifted_softplus(delta_clip, beta)
         b_psnr, b_clip = _pareto_bias(delta_psnr, alpha, beta), _pareto_bias(delta_clip, alpha, beta)
         row_scores = s_psnr + s_clip + b_psnr * b_clip
