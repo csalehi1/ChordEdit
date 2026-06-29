@@ -39,7 +39,7 @@ within each sample group.
 
 # NOTE: May be "weighted_combined_score", "agreement_score",
 # "naive_pareto_score", or "softplus_score". Choose one.
-TARGET_METRIC = "softplus_score"
+TARGET_METRIC = "naive_pareto_score"
 
 # NOTE: Must match number of distinct `t_start`, `t_end` values in METRICS_CSV
 N_BUCKETS_START = 11
@@ -155,7 +155,7 @@ CE_LOSS_TYPE = "one_hot_ce_loss"
 # Counteract label imbalance in the training split.
 USE_CLASS_WEIGHTS = False
 # Softens overconfident majority-class collapse in CE training.
-LABEL_SMOOTHING = 0.1
+LABEL_SMOOTHING = 0.15
 
 """
 Training hyperparameters. ENCODER_LR and MLP_LR are kept separate because
@@ -166,15 +166,16 @@ layer widths of the head network.
 
 SEED = 42
 EPOCHS = 20
-BATCH_SIZE = 32
+BATCH_SIZE = 64
+MLP_LR = 1e-4
 
 # Only used when FREEZE_ENCODER is False
 ENCODER_LR = 2e-5
 
 # Body of the model
-MLP_WIDE = 512
-MLP_HIDDEN = 256
-MLP_INNER = 128
-MLP_DROPOUT = 0.1
-MLP_LR = 1e-3
-WEIGHT_DECAY = 0.01
+MLP_WIDE = 256
+MLP_HIDDEN = 128
+MLP_INNER = 64
+
+MLP_DROPOUT = 0.2
+WEIGHT_DECAY = 0.05
