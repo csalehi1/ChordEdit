@@ -130,6 +130,50 @@ def _normalize_file_id_for_match(value):
         s = str(value).strip()
         return s.lstrip("0") or "0"
 
+def choose_prompt_examples(df, current_index=None, max_examples=3):
+    """Look up the fixed hardcoded prompt examples in df."""
+    examples = []
+
+    current_file_id = None
+    if current_index is not None and current_index in df.index:
+        current_file_id = _normalize_file_id_for_match(df.loc[current_index, "file_id"])
+
+    for spec in PROMPT_EXAMPLES:
+        if len(examples) >= max_examples:
+            break
+
+        wanted = _normalize_file_id_for_match(spec["file_id"])
+
+        # Do not use the current query image as its own example.
+        if wanted == current_file_id:
+            continue
+
+        matches = df[df["file_id"].map(_normalize_file_id_for_match) == wanted]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Expected exactly one row for prompt example file_id={spec['file_id']}, "
+                f"found {len(matches)}."
+            )
+
+        row = matches.iloc[0]
+        expected_bucket = spec["bucket"].strip().upper()
+        actual_bucket = get_oracle_bucket(row)
+
+        if actual_bucket != expected_bucket:
+            raise ValueError(
+                f"Prompt example file_id={spec['file_id']} has oracle bucket "
+                f"{actual_bucket}, but PROMPT_EXAMPLES says {expected_bucket}."
+            )
+
+        examples.append({
+            "row": row,
+            "bucket": expected_bucket,
+            "reason": spec["reason"],
+        })
+
+    return examples
+
+
 def build_example_user_content(row, image_path, examples):
     """Build a multimodal Qwen-VL user message."""
     content = []
