@@ -12,3 +12,7 @@ env/
 datasets/
 checkpoints/
 ablation_outputs/
+
+# Local model weights (large)
+sd-turbo/
+sdxl-turbo/
