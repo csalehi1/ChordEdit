@@ -23,17 +23,44 @@
   - `vae/`
 
 ## 2. Install Dependencies
+Create and activate a Python 3.12 environment:
 ```bash
-pip install -r requirements.txt
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+```
+
+On macOS, if `python3.12` is not available, install it first:
+```bash
+brew install python@3.12
+```
+
+If `.venv` was already created with a different Python version, recreate it:
+```bash
+deactivate 2>/dev/null || true
+rm -rf .venv
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+```
+
+For CUDA 12.4 Linux machines:
+```bash
+python -m pip install -r requirements.txt
+```
+
+For macOS or non-CUDA machines:
+```bash
+python -m pip install -r requirements-macos.txt
 ```
 
 ## 3. Run the Web Demo
 Launch the interactive demo:
 ```bash
-python3 app.py --model-root /path/to/sd-turbo --server-port 7860
+python app.py --model-root /path/to/sd-turbo --server-port 7860
 ```
 
-Running `python3 app.py` now launches a local Gradio web app.
+Running `python app.py` from the activated environment launches a local Gradio web app.
 - Left panel: upload the original image, set source prompt, target prompt, and tuning parameters.
 - Right panel: view the edited output image.
 - Bottom section: click built-in examples (image + source prompt + target prompt) to auto-fill inputs.
@@ -41,17 +68,25 @@ Running `python3 app.py` now launches a local Gradio web app.
 <img src="chord_app.png" alt="ChordEdit app" width="100%" />
 
 ## 4. Run PIE Benchmark Export
-Run PIE-Bench export with:
+Run PIE-Bench export with real local paths:
 ```bash
-python3 run_pie_bench.py --model-root /path/to/sd-turbo --pie-root /path/to/pie_bench
+python run_pie_bench.py --model-root <sd-turbo-folder> --pie-root <pie-bench-folder>
 ```
 
 To run ChordEdit on up to 1000 images from the benchmark mapping, run:
 ```bash
-python3 run_pie_bench.py \
-  --model-root /path/to/sd-turbo \
-  --pie-root /path/to/pie_bench \
+python run_pie_bench.py \
+  --model-root <sd-turbo-folder> \
+  --pie-root <pie-bench-folder> \
   --max-samples 1000
+```
+
+Replace `<sd-turbo-folder>` with the folder containing the local `sd-turbo` weights, and replace `<pie-bench-folder>` with the folder containing `mapping_file.json`. Do not type the angle brackets literally.
+
+Before running, verify the PIE-Bench path:
+```bash
+ls <pie-bench-folder>/mapping_file.json
+ls <pie-bench-folder>/annotation_images
 ```
 
 `--max-samples` processes the first `N` valid records from `mapping_file.json`. The official PIE-Bench set has 700 samples, so a 1000-image run requires a mapping file and image folder with at least 1000 valid entries.
