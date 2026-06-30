@@ -39,7 +39,7 @@ within each sample group.
 
 # NOTE: May be "weighted_combined_score", "agreement_score",
 # "naive_pareto_score", or "softplus_score". Choose one.
-TARGET_METRIC = "naive_pareto_score"
+TARGET_METRIC = "softplus_score"
 
 # NOTE: Must match number of distinct `t_start`, `t_end` values in METRICS_CSV
 N_BUCKETS_START = 11
@@ -75,7 +75,7 @@ class MetricOption:
 _LAMBDA_PSNR, _LAMBDA_CLIP = 0.5, 0.5
 _PARETO_BIAS_ALPHA = 2.0
 _SOFTPLUS_ALPHA, _SOFTPLUS_BETA = 1.0, 2.0
-_NORMALIZE = False
+_NORMALIZE = True
 _METRIC_REGISTRY: dict[str, MetricOption] = {
     "weighted_combined_score": MetricOption(
         fn=partial(compute_weighted_combined_score, lambda_psnr=_LAMBDA_PSNR, lambda_clip=_LAMBDA_CLIP),
@@ -143,7 +143,7 @@ counteract label imbalance in the training split.
 """
 
 # Name of HuggingFace checkpoint for text-encoder
-ENCODER_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+ENCODER_MODEL = "sentence-transformers/Qwen3-VL-Embedding-2B"
 # Prevent encoder weights from updating during training
 FREEZE_ENCODER = True
 # NOTE: Select head type to use for last step of model, 

@@ -152,31 +152,28 @@ def compute_softplus_score(
     scaled within each sample_id group before deltas are taken. With a, b
     the (possibly normalized) metrics and A, B the baseline values:
 
-        m(a, b) = (1/beta)*ln(1+e^{beta*(a-A)})
-                + (1/beta)*ln(1+e^{beta*(b-B)})
-                - (1/beta)*2*ln(2)
-
+        sp(x)   = (1/beta)*(ln(1+e^{beta*x})-ln(2))
+        m(a, b) = sp(a-A) + sp(b-B)
+                
                 Optional (alpha > 0): Bias towards Pareto improvement.
-                + alpha*ln(1+e^{beta*(a-A)})*ln(1+e^{beta*(b-B)})
+                + alpha*sp(a-A)*sp(b-B)
 
     The baseline scores 0. Rows that also score 0 but differ from the baseline
     on both metrics are shifted down by epsilon. Improvements are rewarded
     smoothly and regressions are penalized.
+
+    Plot of the score surface:
+    https://www.desmos.com/3d/9slzoluqbd
     """
     from models.classification.settings import DEFAULT_T_START, DEFAULT_T_END
 
     # Calculate the shifted softplus score.
     def _shifted_softplus(x: np.ndarray, beta: float) -> np.ndarray:
-        """Calculate (1/beta)*ln(1+e^{beta*x})-(1/beta)*ln(2)"""
+        """Calculate (1/beta)*(ln(1+e^{beta*x})-ln(2))"""
         return np.logaddexp(0, beta * x) / beta - np.log(2) / beta
 
-    # Optional: Bias score towards Pareto improvement.
-    def _pareto_bias(x: np.ndarray, alpha: float, beta: float) -> np.ndarray:
-        """Calculate sqrt(alpha)*ln(1+e^{beta*x})"""
-        return np.sqrt(alpha) * np.logaddexp(0, beta * x)
-
     # Penalize rows where the score is 0 but it is not the baseline.
-    def _penalize_spurious_zeros(scores, delta_psnr, delta_clip):
+    def _penalize_zeros(scores, delta_psnr, delta_clip):
         """Zero out rows where the score is 0 but it is not the baseline."""
         mask = (scores == 0) & (delta_psnr != 0) & (delta_clip != 0)
         return scores - epsilon * mask
@@ -188,10 +185,10 @@ def compute_softplus_score(
     for sample_id, group in df.groupby(sample_id_col):
         base_idx = _find_baseline_idx(group, base_t_start, base_t_end, sample_id)
         delta_psnr, delta_clip = _group_deltas(group, psnr_col, clip_col, base_idx, normalize)
-        s_psnr, s_clip = _shifted_softplus(delta_psnr, beta), _shifted_softplus(delta_clip, beta)
-        b_psnr, b_clip = _pareto_bias(delta_psnr, alpha, beta), _pareto_bias(delta_clip, alpha, beta)
-        row_scores = s_psnr + s_clip + b_psnr * b_clip
-        row_scores = _penalize_spurious_zeros(row_scores, delta_psnr, delta_clip)
+        s_psnr = _shifted_softplus(delta_psnr, beta)
+        s_clip = _shifted_softplus(delta_clip, beta)
+        row_scores = s_psnr + s_clip + alpha * s_psnr * s_clip
+        row_scores = _penalize_zeros(row_scores, delta_psnr, delta_clip)
         scores.loc[group.index] = row_scores
 
     return scores
