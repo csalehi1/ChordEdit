@@ -30,10 +30,10 @@ pip install -r requirements.txt
 ## 3. Run the Web Demo
 Launch the interactive demo:
 ```bash
-python app.py --model-root /path/to/sd-turbo --server-port 7860
+python3 app.py --model-root /path/to/sd-turbo --server-port 7860
 ```
 
-Running `python app.py` now launches a local Gradio web app.
+Running `python3 app.py` now launches a local Gradio web app.
 - Left panel: upload the original image, set source prompt, target prompt, and tuning parameters.
 - Right panel: view the edited output image.
 - Bottom section: click built-in examples (image + source prompt + target prompt) to auto-fill inputs.
@@ -43,12 +43,12 @@ Running `python app.py` now launches a local Gradio web app.
 ## 4. Run PIE Benchmark Export
 Run PIE-Bench export with:
 ```bash
-python run_pie_bench.py --model-root /path/to/sd-turbo --pie-root /path/to/pie_bench
+python3 run_pie_bench.py --model-root /path/to/sd-turbo --pie-root /path/to/pie_bench
 ```
 
 To run ChordEdit on up to 1000 images from the benchmark mapping, run:
 ```bash
-python run_pie_bench.py \
+python3 run_pie_bench.py \
   --model-root /path/to/sd-turbo \
   --pie-root /path/to/pie_bench \
   --max-samples 1000
