@@ -1,0 +1,452 @@
+{
+  "000029784.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000029784.jpg.jpg",
+    "editing_instruction": "Remove [the lemon slice] inside the glass, and turn the slice on the rim into an orange slice.",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove the lemon slice inside the glass, and turn the slice on the rim into an orange slice."
+  },
+  "000065904.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000065904.jpg.jpg",
+    "editing_instruction": "Remove [the person] in the front passenger seat.",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove the person in the front passenger seat."
+  },
+  "000066341.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000066341.jpg.jpg",
+    "editing_instruction": "Remove [the small tomato] in the center and keep the others.",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove the small tomato in the center and keep the others."
+  },
+  "000068077.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000068077.jpg.jpg",
+    "editing_instruction": "Remove [the chair that is far] from the camera and next to the plants.",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove the chair that is far from the camera and next to the plants."
+  },
+  "000072858.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000072858.jpg.jpg",
+    "editing_instruction": "Change [the number '26' on the rear of the car] to ['33'].",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Change the number '26' on the rear of the car to '33'."
+  },
+  "000093912.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000093912.jpg.jpg",
+    "editing_instruction": "Replace [the large ship in the hanging painting] with [a small sailboat].",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Replace the large ship in the hanging painting with a small sailboat."
+  },
+  "000103218.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000103218.jpg.jpg",
+    "editing_instruction": "Change [the hair of the green-eyed toy figure] to [blonde].",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Change the hair of the green-eyed toy figure to blonde."
+  },
+  "000107147.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000107147.jpg.jpg",
+    "editing_instruction": "Remove [the pool table] from the scene.",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove the pool table from the scene."
+  },
+  "000107148.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000107148.jpg.jpg",
+    "editing_instruction": "Remove [the pool table] from the scene.",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove the pool table from the scene."
+  },
+  "000120836.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000120836.jpg.jpg",
+    "editing_instruction": "Remove [all people] from the scene.",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove all people from the scene."
+  },
+  "000120837.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000120837.jpg.jpg",
+    "editing_instruction": "Remove [all people] from the scene.",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove all people from the scene."
+  },
+  "000122551.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000122551.jpg.jpg",
+    "editing_instruction": "Repaint the [stool whose style differs] from the others so that it matches them.",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Repaint the stool whose style differs from the others so that it matches them."
+  },
+  "000125936.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000125936.jpg.jpg",
+    "editing_instruction": "Change [all green tablecloths] to [red].",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Change all green tablecloths to red."
+  },
+  "000122552.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000122552.jpg.jpg",
+    "editing_instruction": "Repaint the [stool whose style differs] from the others so that it matches them.",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Repaint the stool whose style differs from the others so that it matches them."
+  },
+  "000138319.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000138319.jpg.jpg",
+    "editing_instruction": "Change [the car] to [dark green].",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Change the car to dark green."
+  },
+  "000146621.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000146621.jpg.jpg",
+    "editing_instruction": "Change [the strawberries in the scene] to [blueberries].",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Change the strawberries in the scene to blueberries."
+  },
+  "000155442.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000155442.jpg.jpg",
+    "editing_instruction": "Change [the rose-shaped jewelry] to [gold].",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Change the rose-shaped jewelry to gold."
+  },
+  "000172967.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000172967.jpg.jpg",
+    "editing_instruction": "Remove [the people] on the bridge.",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove the people on the bridge."
+  },
+  "000218368.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000218368.jpg.jpg",
+    "editing_instruction": "Turn the [nearly spoiled banana] into an unripe banana.",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Turn the nearly spoiled banana into an unripe banana."
+  },
+  "000287805.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000287805.jpg.jpg",
+    "editing_instruction": "Remove [all lanterns] hanging in the tree.",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove all lanterns hanging in the tree."
+  },
+  "000297316.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000297316.jpg.jpg",
+    "editing_instruction": "Change [the trash can next] to [the person to green].",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Change the trash can next to the person to green."
+  },
+  "000301480.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000301480.jpg.jpg",
+    "editing_instruction": "Change [the colors of the cars in the middle and on the right] to [match the car on the left].",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Change the colors of the cars in the middle and on the right to match the car on the left."
+  },
+  "000317135.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000317135.jpg.jpg",
+    "editing_instruction": "Change [the bottle of liquor on the table] to [a bottle of Coke].",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Change the bottle of liquor on the table to a bottle of Coke."
+  },
+  "000378976.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000378976.jpg.jpg",
+    "editing_instruction": "Move the [motorcycle helmet] from the hanging painting onto the table.",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Move the motorcycle helmet from the hanging painting onto the table."
+  },
+  "000388066.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000388066.jpg.jpg",
+    "editing_instruction": "Transform the [tallest building] into a TV tower.",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Transform the tallest building into a TV tower."
+  },
+  "000010901.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000010901.jpg.jpg",
+    "editing_instruction": "Remove the [person wearing green clothes and restore the person wearing orange clothes that he is blocking]",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove the person wearing green clothes and restore the person wearing orange clothes that he is blocking"
+  },
+  "000020019.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000020019.jpg.jpg",
+    "editing_instruction": "Remove [the sign] in the scene",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove the sign in the scene"
+  },
+  "000079000.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000079000.jpg.jpg",
+    "editing_instruction": "Make [the door appear] open",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Make the door appear open"
+  },
+  "000095188.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000095188.jpg.jpg",
+    "editing_instruction": "Remove the [tree blocking the house]",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove the tree blocking the house"
+  },
+  "000122881.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000122881.jpg.jpg",
+    "editing_instruction": "Change [the embroidery] to [a rabbit-shaped design]",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Change the embroidery to a rabbit-shaped design"
+  },
+  "000251405.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000251405.jpg.jpg",
+    "editing_instruction": "Remove [all people] in the scene",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove all people in the scene"
+  },
+  "000258652.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000258652.jpg.jpg",
+    "editing_instruction": "Remove the [slice of pizza that has been cut out]",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove the slice of pizza that has been cut out"
+  },
+  "000267175.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000267175.jpg.jpg",
+    "editing_instruction": "Replace [all Ferrari logos in the scene] with [Porsche logos]",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Replace all Ferrari logos in the scene with Porsche logos"
+  },
+  "000273734.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000273734.jpg.jpg",
+    "editing_instruction": "Remove [all people wearing shorts]",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove all people wearing shorts"
+  },
+  "000275319.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000275319.jpg.jpg",
+    "editing_instruction": "Change the [cup] in the man's hand into a wine glass",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Change the cup in the man's hand into a wine glass"
+  },
+  "000276137.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000276137.jpg.jpg",
+    "editing_instruction": "Darken the [screen directly above the stage]",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Darken the screen directly above the stage"
+  },
+  "000277753.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000277753.jpg.jpg",
+    "editing_instruction": "Remove [the bananas] in the background",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove the bananas in the background"
+  },
+  "000281917.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000281917.jpg.jpg",
+    "editing_instruction": "Change [the small white bag on top of the wardrobe] to [black]",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Change the small white bag on top of the wardrobe to black"
+  },
+  "000287170.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000287170.jpg.jpg",
+    "editing_instruction": "Change [the clothes of the person in the lower right corner] to [green]",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Change the clothes of the person in the lower right corner to green"
+  },
+  "000295920.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000295920.jpg.jpg",
+    "editing_instruction": "Replace [the almonds in the image] with [peanuts]",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Replace the almonds in the image with peanuts"
+  },
+  "000323538.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000323538.jpg.jpg",
+    "editing_instruction": "Remove [the watermark] from the image",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove the watermark from the image"
+  },
+  "000328571.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000328571.jpg.jpg",
+    "editing_instruction": "Make [all the houses white]",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Make all the houses white"
+  },
+  "000337712.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000337712.jpg.jpg",
+    "editing_instruction": "Turn [all the penguins] into rabbits",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Turn all the penguins into rabbits"
+  },
+  "000339492.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000339492.jpg.jpg",
+    "editing_instruction": "Change [the word 'fast' on the billboard] to ['slow']",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Change the word 'fast' on the billboard to 'slow'"
+  },
+  "000347463.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000347463.jpg.jpg",
+    "editing_instruction": "Remove [the couple] on the second floor of the house",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove the couple on the second floor of the house"
+  },
+  "000354280.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000354280.jpg.jpg",
+    "editing_instruction": "Remove [the seeds] from the watermelon slice",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove the seeds from the watermelon slice"
+  },
+  "000356685.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000356685.jpg.jpg",
+    "editing_instruction": "Remove [the man reflected] in the metal surface",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove the man reflected in the metal surface"
+  },
+  "000358514.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000358514.jpg.jpg",
+    "editing_instruction": "Remove the [man] indoors",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove the man indoors"
+  },
+  "000364073.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000364073.jpg.jpg",
+    "editing_instruction": "Make the [man] in the image swing a baseball bat",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Make the man in the image swing a baseball bat"
+  },
+  "000366762.jpg": {
+    "dataset_name": "imgedit",
+    "image_path": "000366762.jpg.jpg",
+    "editing_instruction": "Remove [the pearl necklace] in the scene",
+    "source_prompt": "The original image before editing.",
+    "target_prompt": "The image after the specified edit.",
+    "edit_type": "unknown",
+    "original_prompt": "Remove the pearl necklace in the scene"
+  }
+}
