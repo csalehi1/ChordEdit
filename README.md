@@ -46,7 +46,7 @@ Run PIE-Bench export with:
 python run_pie_bench.py --model-root /path/to/sd-turbo --pie-root /path/to/pie_bench
 ```
 
-To sample up to 1000 images from the benchmark mapping, run:
+To run ChordEdit on up to 1000 images from the benchmark mapping, run:
 ```bash
 python run_pie_bench.py \
   --model-root /path/to/sd-turbo \
