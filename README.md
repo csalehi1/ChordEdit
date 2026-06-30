@@ -45,6 +45,17 @@ Run PIE-Bench export with:
 ```bash
 python run_pie_bench.py --model-root /path/to/sd-turbo --pie-root /path/to/pie_bench
 ```
+
+To sample up to 1000 images from the benchmark mapping, run:
+```bash
+python run_pie_bench.py \
+  --model-root /path/to/sd-turbo \
+  --pie-root /path/to/pie_bench \
+  --max-samples 1000
+```
+
+`--max-samples` processes the first `N` valid records from `mapping_file.json`. The official PIE-Bench set has 700 samples, so a 1000-image run requires a mapping file and image folder with at least 1000 valid entries.
+
 `--pie-root` should point to a PIE-Bench folder containing at least:
 
 1. `annotation_images/` — original PIE-Bench images (subfolders keep the official naming).
