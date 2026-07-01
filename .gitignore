@@ -6,3 +6,5 @@ __pycache__/
 datasets/
 checkpoints/
 ablation_outputs/
+models/classification/data/
+models/classification/outputs/

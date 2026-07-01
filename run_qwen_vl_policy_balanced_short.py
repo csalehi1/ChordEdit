@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import re
 from functools import lru_cache
@@ -60,15 +61,23 @@ Choose HIGH only when the edit would likely be weak or absent without strong sou
 """
 
 def parse_bucket(text):
-    # Prefer JSON if model follows instructions.
-    try:
-        obj = json.loads(text)
-        bucket = str(obj.get("bucket", "")).strip().upper()
-        reason = str(obj.get("reason", "")).strip()
+    # Prefer JSON if model follows instructions. Try the raw text first, then
+    # fall back to the first {...} block in case the model wrapped it in a
+    # markdown code fence or added surrounding prose.
+    json_candidates = [text]
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        json_candidates.append(match.group(0))
+
+    for candidate in json_candidates:
+        try:
+            obj = json.loads(candidate)
+            bucket = str(obj.get("bucket", "")).strip().upper()
+            reason = str(obj.get("reason", "")).strip()
+        except Exception:
+            continue
         if bucket in {"LOW", "MID", "HIGH"}:
             return bucket.lower(), reason
-    except Exception:
-        pass
 
     # Conservative fallback: only accept regex parsing if exactly one unique
     # bucket label appears. This avoids misparsing explanations like
@@ -126,12 +135,20 @@ def _format_file_id_12(raw_file_id):
 
 
 @lru_cache(maxsize=None)
+def _build_image_index(data_root):
+    """Walk annotation_images/ once and index every image by its 12-digit file_id."""
+    image_root = Path(data_root) / "annotation_images"
+    index = {}
+    for path in list(image_root.rglob("*.jpg")) + list(image_root.rglob("*.png")):
+        index.setdefault(path.stem, []).append(path)
+    return index
+
+
 def resolve_source_image_path_for_file_id(raw_file_id, data_root=str(DATA_ROOT)):
-    """Find and cache the PIE-Bench source image path for a file_id."""
+    """Find the PIE-Bench source image path for a file_id, via a cached index."""
     file_id = _format_file_id_12(raw_file_id)
-    data_root = Path(data_root)
-    image_root = data_root / "annotation_images"
-    matches = list(image_root.rglob(f"{file_id}.jpg")) + list(image_root.rglob(f"{file_id}.png"))
+    image_root = Path(data_root) / "annotation_images"
+    matches = _build_image_index(data_root).get(file_id, [])
 
     if len(matches) == 1:
         return matches[0]
@@ -251,9 +268,8 @@ def build_messages(row, image_path, examples):
         ex = spec["row"]
         system_content.append({"type": "image", "url": str(spec["image_path"])})
         system_content.append({"type": "text", "text": _input_text(ex)})
-        system_content.append({"type": "text", "text": (
-            f'Output: {{"bucket": "{spec["bucket"]}", "reason": "{spec["reason"]}"}}\n'
-        )})
+        output_json = json.dumps({"bucket": spec["bucket"], "reason": spec["reason"]}, ensure_ascii=False)
+        system_content.append({"type": "text", "text": f"Output: {output_json}\n"})
 
     system_content.append({"type": "text", "text": '\nReturn only valid JSON:\n{"bucket": "LOW|MID|HIGH", "reason": "one short sentence"}\n'})
 
@@ -268,6 +284,13 @@ def build_messages(row, image_path, examples):
         },
     ]
     return messages
+
+OUTPUT_FIELDNAMES = [
+    "file_id", "editing_type_name", "original_prompt", "editing_prompt",
+    "editing_instruction", "oracle_bucket", "oracle_t_start",
+    "qwen_pred_bucket", "qwen_reason", "raw_output",
+]
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -304,70 +327,82 @@ def main():
     )
     model.eval()
 
-    outputs = []
+    num_written = 0
+    num_failed = 0
 
-    for _, row in df.iterrows():
-        image_path = resolve_source_image_path(row)
-        examples = []
-        if args.num_prompt_examples > 0:
-            examples = choose_prompt_examples(prompt_example_pool, row["file_id"])
+    with open(args.output_csv, "w", newline="") as out_file:
+        writer = csv.DictWriter(out_file, fieldnames=OUTPUT_FIELDNAMES)
+        writer.writeheader()
 
-        messages = build_messages(row, image_path, examples)
+        for _, row in df.iterrows():
+            try:
+                image_path = resolve_source_image_path(row)
+                examples = []
+                if args.num_prompt_examples > 0:
+                    examples = choose_prompt_examples(prompt_example_pool, row["file_id"])
 
-        inputs = processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-            chat_template=patched_template,
-        )
+                messages = build_messages(row, image_path, examples)
 
-        inputs.pop("token_type_ids", None)
-        inputs = {k: v.to(model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
+                inputs = processor.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                    chat_template=patched_template,
+                )
 
-        with torch.no_grad():
-            generated_ids = model.generate(
-                **inputs,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-            )
+                inputs.pop("token_type_ids", None)
+                inputs = {k: v.to(model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
 
-        generated_ids_trimmed = [
-            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
-        ]
+                with torch.no_grad():
+                    generated_ids = model.generate(
+                        **inputs,
+                        max_new_tokens=args.max_new_tokens,
+                        do_sample=False,
+                    )
 
-        text = processor.batch_decode(
-            generated_ids_trimmed,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )[0]
+                generated_ids_trimmed = [
+                    out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
+                ]
 
-        pred_bucket, reason = parse_bucket(text)
+                text = processor.batch_decode(
+                    generated_ids_trimmed,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )[0]
 
-        outputs.append({
-            "file_id": row["file_id"],
-            "editing_type_name": row.get("editing_type_name", ""),
-            "original_prompt": row.get("original_prompt", ""),
-            "editing_prompt": row.get("editing_prompt", ""),
-            "editing_instruction": row.get("editing_instruction", ""),
-            "oracle_bucket": str(row["timestep_bucket"]).strip().lower(),
-            "oracle_t_start": row["t_start"],
-            "qwen_pred_bucket": pred_bucket,
-            "qwen_reason": reason,
-            "raw_output": text,
-        })
+                pred_bucket, reason = parse_bucket(text)
 
-        correct = pred_bucket == str(row["timestep_bucket"]).strip().lower()
-        print(f"[{len(outputs)}/{len(df)}] file_id={row['file_id']} pred={pred_bucket} oracle={row['timestep_bucket']} correct={correct}")
+                writer.writerow({
+                    "file_id": row["file_id"],
+                    "editing_type_name": row.get("editing_type_name", ""),
+                    "original_prompt": row.get("original_prompt", ""),
+                    "editing_prompt": row.get("editing_prompt", ""),
+                    "editing_instruction": row.get("editing_instruction", ""),
+                    "oracle_bucket": str(row["timestep_bucket"]).strip().lower(),
+                    "oracle_t_start": row["t_start"],
+                    "qwen_pred_bucket": pred_bucket,
+                    "qwen_reason": reason,
+                    "raw_output": text,
+                })
+                out_file.flush()
+                num_written += 1
 
-    out = pd.DataFrame(outputs)
-    out.to_csv(args.output_csv, index=False)
+                correct = pred_bucket == str(row["timestep_bucket"]).strip().lower()
+                print(f"[{num_written}/{len(df)}] file_id={row['file_id']} pred={pred_bucket} oracle={row['timestep_bucket']} correct={correct}")
+            except Exception as e:
+                num_failed += 1
+                print(f"Warning: skipping file_id={row.get('file_id')} due to error: {e}")
+
+    out = pd.read_csv(args.output_csv)
 
     valid = out[out["qwen_pred_bucket"].isin(["low", "mid", "high"])].copy()
     acc = (valid["qwen_pred_bucket"] == valid["oracle_bucket"]).mean() if len(valid) else 0.0
 
     print(f"\nSaved: {args.output_csv}")
+    if num_failed:
+        print(f"Skipped {num_failed} row(s) due to errors (see warnings above).")
     print(f"Valid predictions: {len(valid)} / {len(out)}")
     print(f"Accuracy: {acc:.4f}")
 

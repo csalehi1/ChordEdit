@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import re
 from functools import lru_cache
@@ -67,15 +68,23 @@ Choose HIGH only when the edit would likely be weak or absent without strong sou
 """
 
 def parse_bucket(text):
-    # Prefer JSON if model follows instructions.
-    try:
-        obj = json.loads(text)
-        bucket = str(obj.get("bucket", "")).strip().upper()
-        reason = str(obj.get("reason", "")).strip()
+    # Prefer JSON if model follows instructions. Try the raw text first, then
+    # fall back to the first {...} block in case the model wrapped it in a
+    # markdown code fence or added surrounding prose.
+    json_candidates = [text]
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        json_candidates.append(match.group(0))
+
+    for candidate in json_candidates:
+        try:
+            obj = json.loads(candidate)
+            bucket = str(obj.get("bucket", "")).strip().upper()
+            reason = str(obj.get("reason", "")).strip()
+        except Exception:
+            continue
         if bucket in {"LOW", "MID", "HIGH"}:
             return bucket.lower(), reason
-    except Exception:
-        pass
 
     # Conservative fallback: only accept regex parsing if exactly one unique
     # bucket label appears. This avoids misparsing explanations like
@@ -121,6 +130,70 @@ PROMPT_EXAMPLES = [
             "transformation, a high timestep is appropriate."
         ),
     },
+    # Extended pool for --num_prompt_examples > 3 (up to 10 total, roughly balanced
+    # across buckets: 4 LOW, 3 MID, 3 HIGH).
+    {
+        "file_id": "311000000001",
+        "bucket": "LOW",
+        "reason": (
+            "This is a small, localized object removal — the headphones are "
+            "removed from the cat icon. The cat's pose, shape, and background "
+            "should stay almost unchanged, so a low timestep is appropriate."
+        ),
+    },
+    {
+        "file_id": "211000000001",
+        "bucket": "LOW",
+        "reason": (
+            "This is a small, localized addition — a gold chain and a star are "
+            "added to the cat's head. The cat's pose, fur, and background should "
+            "stay almost unchanged, so a low timestep is appropriate."
+        ),
+    },
+    {
+        "file_id": "612000000003",
+        "bucket": "LOW",
+        "reason": (
+            "This only recolors the umbrella from pink to yellow. The woman, her "
+            "pose, the rain, and the background should stay almost unchanged, so "
+            "a low timestep is appropriate."
+        ),
+    },
+    {
+        "file_id": "511000000001",
+        "bucket": "MID",
+        "reason": (
+            "This changes the robot dog's pose from standing to sitting while "
+            "preserving its design, colors, and background, so a moderate "
+            "timestep is appropriate."
+        ),
+    },
+    {
+        "file_id": "112000000006",
+        "bucket": "MID",
+        "reason": (
+            "This replaces the laptop with a notebook while preserving the "
+            "man's pose, expression, desk, and background, so a moderate "
+            "timestep is appropriate."
+        ),
+    },
+    {
+        "file_id": "912000000005",
+        "bucket": "HIGH",
+        "reason": (
+            "This transforms the entire image into an oil painting style, "
+            "changing the texture and rendering across the whole scene, so a "
+            "high timestep is appropriate."
+        ),
+    },
+    {
+        "file_id": "811000000003",
+        "bucket": "HIGH",
+        "reason": (
+            "This changes the entire background behind the cat, affecting a "
+            "large portion of the image, so a high timestep is appropriate."
+        ),
+    },
 ]
 
 def _format_file_id_12(raw_file_id):
@@ -133,12 +206,20 @@ def _format_file_id_12(raw_file_id):
 
 
 @lru_cache(maxsize=None)
+def _build_image_index(data_root):
+    """Walk annotation_images/ once and index every image by its 12-digit file_id."""
+    image_root = Path(data_root) / "annotation_images"
+    index = {}
+    for path in list(image_root.rglob("*.jpg")) + list(image_root.rglob("*.png")):
+        index.setdefault(path.stem, []).append(path)
+    return index
+
+
 def resolve_source_image_path_for_file_id(raw_file_id, data_root=str(DATA_ROOT)):
-    """Find and cache the PIE-Bench source image path for a file_id."""
+    """Find the PIE-Bench source image path for a file_id, via a cached index."""
     file_id = _format_file_id_12(raw_file_id)
-    data_root = Path(data_root)
-    image_root = data_root / "annotation_images"
-    matches = list(image_root.rglob(f"{file_id}.jpg")) + list(image_root.rglob(f"{file_id}.png"))
+    image_root = Path(data_root) / "annotation_images"
+    matches = _build_image_index(data_root).get(file_id, [])
 
     if len(matches) == 1:
         return matches[0]
@@ -231,6 +312,78 @@ def choose_prompt_examples(example_pool, current_file_id):
     ]
 
 
+_CATEGORY_LEVEL_WORDS = {
+    "LOW": "small, localized",
+    "MID": "moderate",
+    "HIGH": "substantial, broad",
+}
+
+
+def _generate_category_example_reason(row, category, bucket):
+    """Auto-generate a reason from the example's own editing_instruction.
+
+    Used by same-category example selection, where examples are picked
+    dynamically per query rather than hand-curated, so a bespoke reason isn't
+    available.
+    """
+    instruction = str(row.get("editing_instruction", "")).strip().rstrip(".")
+    level_word = _CATEGORY_LEVEL_WORDS[bucket]
+    return (
+        f"{instruction}. This is a {level_word} edit within the '{category}' "
+        f"category, so a {bucket.lower()} timestep is appropriate."
+    )
+
+
+def choose_category_examples(df, query_row, num_examples=3):
+    """Dynamically pick in-context examples from the query's own edit category.
+
+    Selects examples from `df` sharing the query's `editing_type_name`
+    (ground-truth PIE-Bench category label), excluding the query itself,
+    cycling round-robin through LOW/MID/HIGH so a 3-example request yields
+    one example per bucket (matching the fixed-pool convention). Reasons are
+    auto-generated from each example's own editing_instruction rather than
+    hand-written, since examples aren't known ahead of time.
+    """
+    category = query_row["editing_type_name"]
+    current_file_id = _normalize_file_id_for_match(query_row["file_id"])
+
+    candidates = df[
+        (df["editing_type_name"] == category)
+        & (df["file_id"].apply(_normalize_file_id_for_match) != current_file_id)
+    ]
+
+    by_bucket = {"LOW": [], "MID": [], "HIGH": []}
+    for _, row in candidates.sort_values("file_id").iterrows():
+        by_bucket[get_oracle_bucket(row)].append(row)
+
+    examples = []
+    bucket_order = ["LOW", "MID", "HIGH"]
+    cursors = {b: 0 for b in bucket_order}
+    while len(examples) < num_examples:
+        added_any = False
+        for bucket in bucket_order:
+            if len(examples) >= num_examples:
+                break
+            rows = by_bucket[bucket]
+            cursor = cursors[bucket]
+            if cursor >= len(rows):
+                continue
+            row = rows[cursor]
+            cursors[bucket] += 1
+            added_any = True
+            examples.append({
+                "row": row,
+                "bucket": bucket,
+                "reason": _generate_category_example_reason(row, category, bucket),
+                "file_id": _normalize_file_id_for_match(row["file_id"]),
+                "image_path": resolve_source_image_path(row),
+            })
+        if not added_any:
+            break  # exhausted all buckets in this category
+
+    return examples
+
+
 def _input_text(r):
     payload = {
         "source prompt": r.get("original_prompt", ""),
@@ -260,9 +413,8 @@ def build_messages(row, image_path, examples):
         ex = spec["row"]
         system_content.append({"type": "image", "url": str(spec["image_path"])})
         system_content.append({"type": "text", "text": _input_text(ex)})
-        system_content.append({"type": "text", "text": (
-            f'Output: {{"bucket": "{spec["bucket"]}", "reason": "{spec["reason"]}"}}\n'
-        )})
+        output_json = json.dumps({"bucket": spec["bucket"], "reason": spec["reason"]}, ensure_ascii=False)
+        system_content.append({"type": "text", "text": f"Output: {output_json}\n"})
 
     system_content.append({"type": "text", "text": '\nReturn only valid JSON:\n{"bucket": "LOW|MID|HIGH", "reason": "one short sentence"}\n'})
 
@@ -277,6 +429,13 @@ def build_messages(row, image_path, examples):
         },
     ]
     return messages
+
+OUTPUT_FIELDNAMES = [
+    "file_id", "editing_type_name", "original_prompt", "editing_prompt",
+    "editing_instruction", "oracle_bucket", "oracle_t_start", "model_id",
+    "pred_bucket", "reason", "raw_output",
+]
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -293,19 +452,65 @@ def main():
     parser.add_argument("--max_examples", type=int, default=None)
     parser.add_argument("--num_prompt_examples", type=int, default=3)
     parser.add_argument("--max_new_tokens", type=int, default=140)
+    parser.add_argument(
+        "--example_selection",
+        choices=["fixed", "same_category"],
+        default="fixed",
+        help=(
+            "'fixed': use the hand-curated PROMPT_EXAMPLES pool for every query "
+            "(default). 'same_category': dynamically pick --num_prompt_examples "
+            "examples per query from rows sharing the query's editing_type_name "
+            "(ground-truth PIE-Bench category label), one per LOW/MID/HIGH bucket, "
+            "with auto-generated reasons."
+        ),
+    )
+    parser.add_argument(
+        "--exclude_editing_types",
+        default="",
+        help=(
+            "Comma-separated editing_type_name values to drop from evaluation, "
+            "e.g. 'random'. Useful with --example_selection same_category, since "
+            "'random' isn't a coherent edit type to match examples against."
+        ),
+    )
     args = parser.parse_args()
 
     full_df = pd.read_csv(args.input_csv)
+    exclude_types = {t.strip() for t in args.exclude_editing_types.split(",") if t.strip()}
+    # example_source_df is the pool same_category examples are drawn from — filtered
+    # by exclude_editing_types (so e.g. 'random' rows can never be picked as ICL
+    # examples) but NOT sliced by --max_examples, so a quick test run doesn't starve
+    # the example pool.
+    example_source_df = full_df
     df = full_df
+    if exclude_types:
+        example_source_df = full_df[~full_df["editing_type_name"].isin(exclude_types)].copy()
+        df = example_source_df
+        print(f"Excluding editing_type_name in {sorted(exclude_types)}: "
+              f"{len(full_df) - len(df)} rows dropped, {len(df)} remain.")
     if args.max_examples is not None:
-        df = full_df.head(args.max_examples).copy()
+        df = df.head(args.max_examples).copy()
 
     prompt_example_pool = []
-    if args.num_prompt_examples > 0:
+    if args.num_prompt_examples > 0 and args.example_selection == "fixed":
         prompt_example_pool = build_prompt_example_pool(
             full_df,
             max_examples=args.num_prompt_examples,
         )
+        if exclude_types:
+            excluded_in_pool = [
+                ex["file_id"] for ex in prompt_example_pool
+                if full_df.loc[
+                    full_df["file_id"].apply(_normalize_file_id_for_match) == ex["file_id"],
+                    "editing_type_name",
+                ].iloc[0] in exclude_types
+            ]
+            if excluded_in_pool:
+                print(
+                    f"Note: --exclude_editing_types {sorted(exclude_types)} does NOT "
+                    f"apply to the fixed example pool; these file_ids remain in it "
+                    f"despite matching an excluded category: {excluded_in_pool}"
+                )
 
     print(f"Loading model: {args.model_id}")
     model_type = AutoConfig.from_pretrained(args.model_id, trust_remote_code=True).model_type
@@ -323,71 +528,94 @@ def main():
     )
     model.eval()
 
-    outputs = []
+    num_written = 0
+    num_failed = 0
 
-    for _, row in df.iterrows():
-        image_path = resolve_source_image_path(row)
-        examples = []
-        if args.num_prompt_examples > 0:
-            examples = choose_prompt_examples(prompt_example_pool, row["file_id"])
+    with open(args.output_csv, "w", newline="") as out_file:
+        writer = csv.DictWriter(out_file, fieldnames=OUTPUT_FIELDNAMES)
+        writer.writeheader()
 
-        messages = build_messages(row, image_path, examples)
+        for _, row in df.iterrows():
+            try:
+                image_path = resolve_source_image_path(row)
+                examples = []
+                if args.num_prompt_examples > 0:
+                    if args.example_selection == "same_category":
+                        examples = choose_category_examples(
+                            example_source_df, row, num_examples=args.num_prompt_examples
+                        )
+                        if len(examples) < args.num_prompt_examples:
+                            print(
+                                f"Warning: file_id={row['file_id']} (category="
+                                f"{row['editing_type_name']!r}) got only {len(examples)} / "
+                                f"{args.num_prompt_examples} same-category examples."
+                            )
+                    else:
+                        examples = choose_prompt_examples(prompt_example_pool, row["file_id"])
 
-        inputs = processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-            chat_template=patched_template,
-        )
+                messages = build_messages(row, image_path, examples)
 
-        inputs.pop("token_type_ids", None)
-        inputs = {k: v.to(model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
+                inputs = processor.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                    chat_template=patched_template,
+                )
 
-        with torch.no_grad():
-            generated_ids = model.generate(
-                **inputs,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-            )
+                inputs.pop("token_type_ids", None)
+                inputs = {k: v.to(model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
 
-        generated_ids_trimmed = [
-            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
-        ]
+                with torch.no_grad():
+                    generated_ids = model.generate(
+                        **inputs,
+                        max_new_tokens=args.max_new_tokens,
+                        do_sample=False,
+                    )
 
-        text = processor.batch_decode(
-            generated_ids_trimmed,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )[0]
+                generated_ids_trimmed = [
+                    out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
+                ]
 
-        pred_bucket, reason = parse_bucket(text)
+                text = processor.batch_decode(
+                    generated_ids_trimmed,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )[0]
 
-        outputs.append({
-            "file_id": row["file_id"],
-            "editing_type_name": row.get("editing_type_name", ""),
-            "original_prompt": row.get("original_prompt", ""),
-            "editing_prompt": row.get("editing_prompt", ""),
-            "editing_instruction": row.get("editing_instruction", ""),
-            "oracle_bucket": str(row["timestep_bucket"]).strip().lower(),
-            "oracle_t_start": row["t_start"],
-            "model_id": args.model_id,
-            "pred_bucket": pred_bucket,
-            "reason": reason,
-            "raw_output": text,
-        })
+                pred_bucket, reason = parse_bucket(text)
 
-        correct = pred_bucket == str(row["timestep_bucket"]).strip().lower()
-        print(f"[{len(outputs)}/{len(df)}] file_id={row['file_id']} pred={pred_bucket} oracle={row['timestep_bucket']} correct={correct}")
+                writer.writerow({
+                    "file_id": row["file_id"],
+                    "editing_type_name": row.get("editing_type_name", ""),
+                    "original_prompt": row.get("original_prompt", ""),
+                    "editing_prompt": row.get("editing_prompt", ""),
+                    "editing_instruction": row.get("editing_instruction", ""),
+                    "oracle_bucket": str(row["timestep_bucket"]).strip().lower(),
+                    "oracle_t_start": row["t_start"],
+                    "model_id": args.model_id,
+                    "pred_bucket": pred_bucket,
+                    "reason": reason,
+                    "raw_output": text,
+                })
+                out_file.flush()
+                num_written += 1
 
-    out = pd.DataFrame(outputs)
-    out.to_csv(args.output_csv, index=False)
+                correct = pred_bucket == str(row["timestep_bucket"]).strip().lower()
+                print(f"[{num_written}/{len(df)}] file_id={row['file_id']} pred={pred_bucket} oracle={row['timestep_bucket']} correct={correct}")
+            except Exception as e:
+                num_failed += 1
+                print(f"Warning: skipping file_id={row.get('file_id')} due to error: {e}")
+
+    out = pd.read_csv(args.output_csv)
 
     valid = out[out["pred_bucket"].isin(["low", "mid", "high"])].copy()
     acc = (valid["pred_bucket"] == valid["oracle_bucket"]).mean() if len(valid) else 0.0
 
     print(f"\nSaved: {args.output_csv}")
+    if num_failed:
+        print(f"Skipped {num_failed} row(s) due to errors (see warnings above).")
     print(f"Valid predictions: {len(valid)} / {len(out)}")
     print(f"Accuracy: {acc:.4f}")
 
