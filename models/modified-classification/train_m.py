@@ -1,24 +1,20 @@
 """
-Train the metric predictor:
+Train the metric surrogate M:
 
     M(img_emb, src_emb, tar_emb, t_start, t_end) -> (psnr, clip)
 
-Each grid-ablation cell is one training example. The source image, source
-prompt, and target prompt are encoded once per sample (encoders are frozen),
-then every (t_start, t_end) cell reuses those embeddings. The trainable MLP
-regresses the two measured metrics. Targets are standardized with train-split
-statistics; reported errors are in raw metric units.
-
 Run from this directory:
 
-    python train.py
+    python m_train.py
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
+# Add the repo root and this package to the Python path.
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_DIR, "..", ".."))
 sys.path.insert(0, _ROOT)
@@ -30,90 +26,17 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from PIL import Image
 from torch.utils.data import DataLoader, TensorDataset
 
 import settings
-from model import MetricPredictor
-from models.classification.classify import split_data
+from data_io import build_tensors, load_data, precompute_embeddings
+from _helpers import split_data_by_sample
+from model_m import MetricPredictor
 from settings import *
 
 
-def _source_path(image_path: str) -> str:
-    # Map a cell-image path to its sample's source.png.
-    return str(Path(image_path).parents[SOURCE_IMAGE_PARENT_LEVEL] / SOURCE_IMAGE_NAME)
-
-
-def _id_from_image_path(image_path: str) -> str:
-    # Extract the 12-digit string-pair id from the sample folder name.
-    sample_folder = Path(image_path).parents[SOURCE_IMAGE_PARENT_LEVEL].name
-    return sample_folder.split("_")[-1]
-
-
-def load_data() -> pd.DataFrame:
-    """Load metrics, attach source-image paths and prompts, one row per cell."""
-    metrics = pd.read_csv(METRICS_CSV)
-    metrics = metrics.rename(columns={PSNR_COL: "psnr", CLIP_COL: "clip"})
-
-    # Select a single t_delta slice if specified.
-    if TARGET_T_DELTA is not None:
-        if TARGET_T_DELTA not in metrics["t_delta"].values:
-            raise ValueError(
-                f"{TARGET_T_DELTA=} not found in t_delta "
-                f"(distinct: {sorted(metrics['t_delta'].unique())})."
-            )
-        metrics = metrics[metrics["t_delta"] == TARGET_T_DELTA].copy()
-
-    metrics["source_path"] = metrics[IMAGE_PATH_COL].map(_source_path)
-    metrics["id"] = metrics[IMAGE_PATH_COL].map(_id_from_image_path)
-
-    # Merge the metrics with the string pairs on the id.
-    strings = pd.read_csv(STRINGS_CSV, dtype={"id": str})
-    df = pd.merge(metrics, strings, on="id", how="left")
-    if df["source_prompt"].isna().any():
-        missing = df.loc[df["source_prompt"].isna(), "id"].unique()
-        raise ValueError(f"No prompt strings found for ids: {missing.tolist()}")
-
-    cols = [
-        "sample_id", "id", "t_start", "t_end", "t_delta",
-        "psnr", "clip", "source_path", "source_prompt", "target_prompt",
-    ]
-    return df[cols].reset_index(drop=True)
-
-
-def precompute_embeddings(
-    df: pd.DataFrame, predictor: MetricPredictor, device: torch.device
-) -> dict[str, dict[str, torch.Tensor]]:
-    """Encode the source image and prompt pair once per sample_id."""
-    samples = df.drop_duplicates(subset="sample_id").sort_values("sample_id")
-    images = [Image.open(p).convert("RGB") for p in samples["source_path"]]
-    src_prompts = samples["source_prompt"].tolist()
-    tar_prompts = samples["target_prompt"].tolist()
-
-    img_emb = predictor.image_encoder(images).to(device)
-    src_emb = predictor.text_encoder(src_prompts).to(device)
-    tar_emb = predictor.text_encoder(tar_prompts).to(device)
-
-    return {
-        sid: {"img": img_emb[i], "src": src_emb[i], "tar": tar_emb[i]}
-        for i, sid in enumerate(samples["sample_id"].tolist())
-    }
-
-
-def build_tensors(
-    df: pd.DataFrame, emb: dict[str, dict[str, torch.Tensor]]
-) -> tuple[torch.Tensor, ...]:
-    """Assemble per-row (img, src, tar, t, y) tensors from cached embeddings."""
-    img = torch.stack([emb[s]["img"] for s in df["sample_id"]])
-    src = torch.stack([emb[s]["src"] for s in df["sample_id"]])
-    tar = torch.stack([emb[s]["tar"] for s in df["sample_id"]])
-    t = torch.tensor(df[["t_start", "t_end"]].values, dtype=torch.float)
-    y = torch.tensor(df[list(TARGET_COLS)].values, dtype=torch.float)
-    return img, src, tar, t, y
-
-
 def save_splits(splits: dict[str, pd.DataFrame], run_dir: Path) -> None:
-    """Save the train/val/test splits to parquet files"""
+    """Save train/val/test splits to parquet for t_train.py to reuse."""
     for name, df in splits.items():
         out = run_dir / f"{name}.parquet.gz"
         df.to_parquet(out, compression="gzip", index=False)
@@ -121,19 +44,60 @@ def save_splits(splits: dict[str, pd.DataFrame], run_dir: Path) -> None:
 
 
 def _loader(tensors: tuple[torch.Tensor, ...], shuffle: bool) -> DataLoader:
-    # Create a data loader for the batch size.
+    # Wrap prebuilt tensors in a batched DataLoader.
     return DataLoader(TensorDataset(*tensors), batch_size=BATCH_SIZE, shuffle=shuffle)
+
+
+def _scalarize_raw(pred: torch.Tensor, stats: tuple[float, float, float, float]) -> torch.Tensor:
+    # Collapse denormalized (psnr, clip) into scalar m for ranking loss.
+    pm, ps, cm, cs = stats
+    zp = (pred[:, 0] - pm) / ps
+    zc = (pred[:, 1] - cm) / cs
+    return W_PSNR * zp + W_CLIP * zc
+
+
+def _ranking_loss(
+    out_std: torch.Tensor,
+    y_std: torch.Tensor,
+    sample_idx: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    scalar_stats: tuple[float, float, float, float],
+) -> torch.Tensor:
+    """Pairwise hinge loss: predicted m order should match true m within each sample."""
+    # De-standardize so scalarization uses raw metric units.
+    pred = out_std * std + mean
+    true = y_std * std + mean
+    m_pred = _scalarize_raw(pred, scalar_stats)
+    m_true = _scalarize_raw(true, scalar_stats)
+    losses = []
+    # Group batch rows by sample_id for within-grid pairwise comparisons.
+    for sid in sample_idx.unique():
+        mask = sample_idx == sid
+        if mask.sum() < 2:
+            continue
+        mp = m_pred[mask]
+        mt = m_true[mask]
+        for i in range(len(mp)):
+            for j in range(i + 1, len(mp)):
+                if mt[i] == mt[j]:
+                    continue
+                sign = 1.0 if mt[i] > mt[j] else -1.0
+                losses.append(torch.relu(sign * (mp[j] - mp[i])))
+    if not losses:
+        return out_std.new_zeros(())
+    return torch.stack(losses).mean()
 
 
 @torch.no_grad()
 def evaluate(model, loader, device) -> dict[str, float]:
-    """Per-target MAE/RMSE/R^2 in raw metric units, plus standardized loss."""
+    """Per-target MAE/RMSE/R² in raw metric units, plus standardized loss."""
     model.regressor.eval()
     preds, trues = [], []
     loss_sum, n = 0.0, 0
     mean, std = model.regressor.target_mean, model.regressor.target_std
-    for img, src, tar, t, y in loader:
-        img, src, tar, t, y = (x.to(device) for x in (img, src, tar, t, y))
+    for batch in loader:
+        img, src, tar, t, y = (x.to(device) for x in batch[:5])
         out = model.regressor(img, src, tar, t)
         y_std = (y - mean) / std
         loss_sum += torch.nn.functional.mse_loss(out, y_std, reduction="sum").item()
@@ -155,29 +119,32 @@ def evaluate(model, loader, device) -> dict[str, float]:
 
 
 def _fmt(m: dict[str, float]) -> str:
-    # Format the metrics as a string.
+    # Format evaluation metrics as a single log line.
     return f"loss={m['loss']:.4f}  " + "  ".join(
         f"{col}: MAE={m[f'mae_{col}']:.3f} R2={m[f'r2_{col}']:.3f}"
         for col in TARGET_COLS
     )
 
 
-def train() -> MetricPredictor:
+def train(run_dir: Path | None = None) -> tuple[MetricPredictor, Path]:
     # Set the random seed for reproducibility.
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
-    # Load the data and split it into train/val/test sets.
+    # Load grid-ablation cells and split by sample_id (full grids stay intact).
     df = load_data()
-    train_df, val_df, test_df = split_data(df, seed=SEED)
+    train_df, val_df, test_df = split_data_by_sample(
+        df, seed=SEED, train_frac=TRAIN_FRAC, val_frac=VAL_FRAC
+    )
 
-    # Create a timestamped run directory and save the splits.
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = OUTPUTS_DIR / timestamp
+    # Create a timestamped run directory and persist splits for t_train.py.
+    if run_dir is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = OUTPUTS_DIR / timestamp
+    run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     save_splits({"train": train_df, "val": val_df, "test": test_df}, run_dir)
 
-    # Get the device and print the dataset summary.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(
         f"Dataset: {len(df)} cells from {df['sample_id'].nunique()} samples "
@@ -185,21 +152,26 @@ def train() -> MetricPredictor:
         f"val={len(val_df)} / test={len(test_df)}  device={device}"
     )
 
-    # Create the model and move it to the device.
+    # Create the model; only the regressor MLP is trainable.
     model = MetricPredictor(freeze_encoders=FREEZE_ENCODERS, device=device)
     model.regressor.to(device)
 
-    # Precompute the embeddings for all samples.
+    # Encode each (image, prompt pair) once; grid rows reuse cached embeddings.
     emb = precompute_embeddings(df, model, device)
-    # Build the tensors for the train/val/test sets.
     train_t = build_tensors(train_df, emb)
     val_t = build_tensors(val_df, emb)
     test_t = build_tensors(test_df, emb)
 
-    # Standardize the targets with train-split statistics.
+    # Standardize targets with train-split stats; also save scalar stats for T.
+    y_train = train_t[4]
     if NORMALIZE_TARGETS:
-        y_train = train_t[-1]
         model.regressor.set_target_stats(y_train.mean(0), y_train.std(0))
+    scalar_stats = (
+        float(y_train[:, 0].mean()),
+        float(y_train[:, 0].std().clamp(min=1e-8)),
+        float(y_train[:, 1].mean()),
+        float(y_train[:, 1].std().clamp(min=1e-8)),
+    )
     print(
         "Target stats (train):  "
         + "  ".join(
@@ -209,37 +181,36 @@ def train() -> MetricPredictor:
         )
     )
 
-    # Create the data loaders.
     train_loader = _loader(train_t, shuffle=True)
     val_loader = _loader(val_t, shuffle=False)
     test_loader = _loader(test_t, shuffle=False)
 
-    # Create the optimizer.
     optimizer = torch.optim.AdamW(model.regressor.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     mean, std = model.regressor.target_mean, model.regressor.target_std
 
-    # Create the output file and train the model.
     weights_out = run_dir / "regressor_weights.pt"
     best_val = float("inf")
     for epoch in range(1, EPOCHS + 1):
-        # Train the regressor.
+        # Train the regressor on labeled grid cells.
         model.regressor.train()
-        for img, src, tar, t, y in train_loader:
-            # Move the data to the device.
-            img, src, tar, t, y = (x.to(device) for x in (img, src, tar, t, y))
-            # Compute the predictions and loss.
+        for batch in train_loader:
+            img, src, tar, t, y, sample_idx = (x.to(device) for x in batch)
             out = model.regressor(img, src, tar, t)
-            loss = torch.nn.functional.mse_loss(out, (y - mean) / std)
-            # Zero the gradients and step the optimizer.
+            y_std = (y - mean) / std
+            loss = torch.nn.functional.mse_loss(out, y_std)
+            # Optional ranking loss aligns M with T's argmax objective.
+            if RANKING_LOSS_WEIGHT > 0:
+                loss = loss + RANKING_LOSS_WEIGHT * _ranking_loss(
+                    out, y_std, sample_idx, mean, std, scalar_stats
+                )
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-        # Evaluate the model on the train/val sets.
         train_m = evaluate(model, train_loader, device)
         val_m = evaluate(model, val_loader, device)
         improved = val_m["loss"] < best_val
-        # Save the best model weights so far.
+        # Save the best checkpoint by validation loss.
         if improved:
             best_val = val_m["loss"]
             torch.save(
@@ -250,6 +221,7 @@ def train() -> MetricPredictor:
                     "target_cols": list(TARGET_COLS),
                     "img_dim": model.image_encoder.hidden_dim,
                     "text_dim": model.text_encoder.hidden_dim,
+                    "scalar_stats": scalar_stats,
                     "config": {
                         k: (str(v) if isinstance(v, Path) else v)
                         for k, v in vars(settings).items()
@@ -258,18 +230,23 @@ def train() -> MetricPredictor:
                 },
                 weights_out,
             )
+        rank_note = f"  rank_w={RANKING_LOSS_WEIGHT}" if RANKING_LOSS_WEIGHT > 0 else ""
         print(
             f"Epoch {epoch:03d}  train: {_fmt(train_m)}  | val: {_fmt(val_m)}"
             + ("  *" if improved else "")
+            + rank_note
         )
 
-    # Load the best model weights and evaluate on the test set.
+    # Reload best weights and report held-out test metrics.
     print(f"\nSaved {weights_out}  (best val loss={best_val:.4f})")
     ckpt = torch.load(weights_out, map_location=device, weights_only=False)
     model.regressor.load_state_dict(ckpt["regressor_state_dict"])
     test_m = evaluate(model, test_loader, device)
-    print(f"Test on *: {_fmt(test_m)}")
-    return model
+    print(f"Test: {_fmt(test_m)}")
+
+    with open(run_dir / "m_train_metrics.json", "w") as f:
+        json.dump({"val_best_loss": best_val, "test": test_m}, f, indent=2)
+    return model, run_dir
 
 
 if __name__ == "__main__":

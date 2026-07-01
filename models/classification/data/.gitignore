@@ -1,2 +1,0 @@
-# Ignore all cached splits in this dir
-*.parquet.gz
