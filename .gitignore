@@ -6,3 +6,16 @@ __pycache__/
 datasets/
 checkpoints/
 ablation_outputs/
+# Python-generated files
+*.py[cod]
+__pycache__/
+
+# Logs and archives
+*.log
+*.tar
+*.zip
+
+# Local/generated ImgEdit artifacts
+imgedit_inspect/
+imgedit_qwen_export/
+imgedit_export/
