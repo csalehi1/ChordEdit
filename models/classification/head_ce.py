@@ -63,7 +63,7 @@ def cost_sensitive_ce_loss(
     predictions are not penalized.
 
     class_weights is a length-K vector indexed by the true label (same effect as
-    passing class_weights[y] into ordinal_loss / regression_loss in classify.py).
+    passing class_weights[y] into ordinal_loss / regression_loss in train.py).
     sample_weights is an optional length-N vector for extra per-example scaling
     applied after class reweighting.
     """

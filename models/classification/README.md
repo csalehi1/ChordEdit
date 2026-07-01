@@ -85,7 +85,7 @@ If wanted, further edit [settings.py](settings.py) to adjust training behavior b
 From the repo root:
 
 ```bash
-python -m models.classification.classify
+python -m models.classification.train
 ```
 
 This loads the CSVs, (re)computes the computed metric column, trains the model, and saves checkpoints and metric plots to `OUTPUTS_DIR`.
@@ -108,8 +108,8 @@ Open [eval_model.ipynb](eval_model.ipynb) to inspect model performance after tra
 | `head_ce.py` | CE multiclass head (default) |
 | `head_coral.py` | CORAL ordinal head |
 | `head_mse.py` | MSE regression head |
-| `utils.py` | Scoring functions and data helpers |
-| `classify.py` | Training entry point |
+| `scores.py` | Scoring functions and data helpers |
+| `train.py` | Training entry point |
 | `eval_model.ipynb` | Post-training evaluation notebook |
 | `eval_data.ipynb` | Dataset exploration notebook |
 | `DESIGN.md` | Detailed architecture and design notes |

@@ -3,7 +3,7 @@ from functools import partial
 from pathlib import Path
 from typing import Callable
 
-from models.classification.utils import (
+from models.classification.scores import (
     compute_weighted_combined_score,
     compute_agreement_score,
     compute_naive_pareto_score,
