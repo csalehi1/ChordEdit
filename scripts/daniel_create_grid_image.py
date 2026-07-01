@@ -347,7 +347,10 @@ def _save_grid_figure(
 
     # Save the figure.
     ensure_dir(destination.parent)
-    figure.savefig(destination, dpi=FIG_DPI, bbox_inches="tight", facecolor="white")
+    save_kwargs = {"dpi": FIG_DPI, "bbox_inches": "tight", "facecolor": "white"}
+    if destination.suffix.lower() in {".jpg", ".jpeg"}:
+        save_kwargs["pil_kwargs"] = {"quality": 75}
+    figure.savefig(destination, **save_kwargs)
     plt.close(figure)
 
 

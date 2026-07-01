@@ -1,8 +1,8 @@
 """
-Optimized alternative to run_grid_ablation.py.
+Factorized ChordEdit t_start x t_end grid ablation.
 
-See section comments below for how this differs and what work is reused per image.
-Pass --full-pipeline to match run_grid_ablation.py exactly.
+Reuses shared encode/transport work across cells (requires n_steps=1).
+See section comments below for the cost model vs run_grid_ablation.py.
 """
 
 from __future__ import annotations
@@ -15,17 +15,16 @@ sys.path.insert(0, str(Path(__file__).parent))        # scripts/
 sys.path.insert(0, str(Path(__file__).parent.parent))  # project root
 
 import logging
+from datetime import datetime
 from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 
 # Grid layout helpers, sweep constants, and shared CLI live in run_grid_ablation.py.
-# I/O, pipeline wiring, and run_single_edit (full-pipeline fallback) live in
-# run_local_ablation.py. Symmetric defaults come from run_pie_bench.py.
+# I/O and pipeline wiring live in run_local_ablation.py. Symmetric defaults from run_pie_bench.py.
 from daniel_create_grid_image import _build_base_grid, _save_grid_figure
 from run_grid_ablation import (
     GRID_VALUES,
     GRID_VALUES_SYM,
     build_argument_parser,
-    save_source_copy,
     value_slug,
 )
 from run_local_ablation import (
@@ -35,7 +34,6 @@ from run_local_ablation import (
     load_local_records,
     param_slug,
     resolve_component_paths,
-    run_single_edit,
     write_json,
 )
 from run_pie_bench import DEFAULT_EDIT_CONFIG_SYM
@@ -59,8 +57,9 @@ DEFAULT_EDIT_CONFIG: Dict[str, Any] = {
 }
 
 DEFAULT_OUTPUT_ROOT = "ablation_outputs/daniel_grid_t_start_t_end"
-CELL_EXTENSION = ".jpg"
+JPEG_EXTENSION = ".jpg"
 JPEG_QUALITY = 75
+GRID_BASENAME = "grid_clean"  # grid type 1 from daniel_create_grid_image.py
 
 
 def _save_jpeg(image: Image.Image, destination: Path) -> None:
@@ -69,32 +68,17 @@ def _save_jpeg(image: Image.Image, destination: Path) -> None:
 
 
 def _cell_filename(t_start: float, t_end: float) -> str:
-    return f"{param_slug('t_start', t_start)}__{param_slug('t_end', t_end)}{CELL_EXTENSION}"
+    return f"{param_slug('t_start', t_start)}__{param_slug('t_end', t_end)}{JPEG_EXTENSION}"
 
 
-def t_delta_conditions(_base_config: Dict[str, Any]) -> List[float]:
-    return [0.0]
-
-
-# Shared flags come from run_grid_ablation.build_argument_parser; but add
-# --full-pipeline here. Pass --full-pipeline to match run_grid_ablation.py exactly.
 def parse_args():
-    parser = build_argument_parser(
+    return build_argument_parser(
         description=(
             "Factorized ChordEdit t_start x t_end grid ablation. "
             "Reuses shared encode/transport work across cells when n_steps=1."
         ),
         output_root_default=DEFAULT_OUTPUT_ROOT,
-    )
-    parser.add_argument(
-        "--full-pipeline",
-        action="store_true",
-        help=(
-            "Disable factorization: run each cell via pipeline(...) like "
-            "run_grid_ablation.py (slower, useful for parity checks)."
-        ),
-    )
-    return parser.parse_args()
+    ).parse_args()
 
 
 # run_grid_ablation.py always uses DEFAULT_EDIT_CONFIG and GRID_VALUES even when
@@ -112,11 +96,10 @@ def grid_values(chord_edit_mode: str) -> List[float]:
     return list(GRID_VALUES)
 
 
-# Factorization is only valid when the edit is a single transport step (n_steps=1).
-# With n_steps>1, t_start and t_end jointly define a linspace of transport steps,
-# so there is no clean split between "transport per t_start" and "cleanup per t_end".
-def can_factorize(base_config: Dict[str, Any], *, force_full_pipeline: bool) -> bool:
-    return not force_full_pipeline and int(base_config.get("n_steps", 1)) == 1
+def require_factorizable_config(base_config: Dict[str, Any]) -> None:
+    n_steps = int(base_config.get("n_steps", 1))
+    if n_steps != 1:
+        raise ValueError(f"Factorized grid requires n_steps=1, got n_steps={n_steps}")
 
 
 # run_grid_ablation.py calls pipeline.__call__ for every (t_start, t_end) cell.
@@ -223,40 +206,33 @@ def main() -> None:
 
     from pipeline_chord import ChordEditPipeline
 
-    # Resolve paths, pick sym vs default grid/config, decide factorized vs full path.
     data_root = Path(args.data_root).expanduser().resolve()
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_root = Path(args.output_root).expanduser().resolve()
+    output_root = output_root.with_name(f"{output_root.name}_{run_timestamp}")
     component_paths = resolve_component_paths(args.model_root, args.model_type)
     base_config = base_edit_config(args.chord_edit_mode)
+    require_factorizable_config(base_config)
     records = load_local_records(data_root, args.max_records)
     values = grid_values(args.chord_edit_mode)
-    delta_values = t_delta_conditions(base_config)
-    use_factorized = can_factorize(base_config, force_full_pipeline=args.full_pipeline)
+    delta_values = [0.0]
     grid_size = len(values)
     cells_per_image = grid_size * grid_size
 
-    # Log the cost model so it is obvious how this run differs from run_grid_ablation.py.
     LOGGER.info("Loaded %d record(s) from %s", len(records), data_root)
     LOGGER.info("Base edit config: %s", base_config)
     LOGGER.info("Grid values: %s (%dx%d = %d cells/image/t_delta)", values, grid_size, grid_size, cells_per_image)
     LOGGER.info("t_delta conditions: %s", delta_values)
     LOGGER.info("Chord edit mode: %s", args.chord_edit_mode)
-    if use_factorized:
-        LOGGER.info(
-            "Execution mode: factorized (n_steps=1) — per image/t_delta: "
-            "1 encode, 1 prompt encode, 1 noise setup, "
-            "%d transports, %d cleanups, %d decodes "
-            "(run_grid_ablation.py would run %d full pipelines)",
-            grid_size,
-            cells_per_image,
-            cells_per_image,
-            cells_per_image,
-        )
-    else:
-        LOGGER.info(
-            "Execution mode: full pipeline per cell (%d calls/image/t_delta, same as run_grid_ablation.py)",
-            cells_per_image,
-        )
+    LOGGER.info(
+        "Per image/t_delta: 1 encode, 1 prompt encode, 1 noise setup, "
+        "%d transports, %d cleanups, %d decodes "
+        "(run_grid_ablation.py would run %d full pipelines)",
+        grid_size,
+        cells_per_image,
+        cells_per_image,
+        cells_per_image,
+    )
     LOGGER.info("Output root: %s", output_root)
 
     # Load the pipeline once; all cells for all records reuse this instance.
@@ -275,14 +251,14 @@ def main() -> None:
         chord_edit_mode=args.chord_edit_mode,
     )
 
-    # Output layout matches run_grid_ablation.py; execution_mode records which path ran.
     manifest: Dict[str, Any] = {
         "data_root": str(data_root),
         "model_root": str(Path(args.model_root).expanduser().resolve()),
+        "run_timestamp": run_timestamp,
         "base_edit_config": base_config,
         "seed": args.seed,
         "chord_edit_mode": args.chord_edit_mode,
-        "execution_mode": "factorized" if use_factorized else "full_pipeline",
+        "execution_mode": "factorized",
         "x_axis": {"name": "t_start", "values": values},
         "y_axis": {"name": "t_end", "values": values},
         "t_delta_values": delta_values,
@@ -298,7 +274,9 @@ def main() -> None:
         LOGGER.info("Processing %d/%d: %s", record_index, len(records), record_key)
         with Image.open(record.image_path) as img:
             source_image = img.convert("RGB")
-        save_source_copy(source_image, sample_dir / f"source{CELL_EXTENSION}", args.overwrite)
+        source_path = sample_dir / f"source{JPEG_EXTENSION}"
+        if not source_path.exists() or args.overwrite:
+            _save_jpeg(source_image, source_path)
 
         record_payload = {
             "sample": record.sample_name,
@@ -317,59 +295,41 @@ def main() -> None:
             cells_dir = condition_dir / "cells"
             ensure_dir(cells_dir)
 
-            # Factorized path: generate all missing cells for this t_delta in one shot.
-            # If every cell PNG already exists (and --overwrite is off), skip inference
-            # entirely for this condition, same resume behavior as run_grid_ablation.py.
+            # Generate all missing cells for this t_delta in one shot.
+            # If every cell JPEG already exists (and --overwrite is off), skip inference.
             factorized_images: Dict[Tuple[float, float], Image.Image] | None = None
-            if use_factorized:
-                missing_cells = False
-                for t_start in values:
-                    for t_end in values:
-                        filename = _cell_filename(t_start, t_end)
-                        if not (cells_dir / filename).exists() or args.overwrite:
-                            missing_cells = True
-                            break
-                    if missing_cells:
+            missing_cells = False
+            for t_start in values:
+                for t_end in values:
+                    filename = _cell_filename(t_start, t_end)
+                    if not (cells_dir / filename).exists() or args.overwrite:
+                        missing_cells = True
                         break
                 if missing_cells:
-                    factorized_images = run_factorized_grid(
-                        pipeline=pipeline,
-                        source_image=source_image,
-                        record=record,
-                        base_config=base_config,
-                        t_start_values=values,
-                        t_end_values=values,
-                        t_delta=t_delta,
-                        seed=args.seed,
-                    )
+                    break
+            if missing_cells:
+                factorized_images = run_factorized_grid(
+                    pipeline=pipeline,
+                    source_image=source_image,
+                    record=record,
+                    base_config=base_config,
+                    t_start_values=values,
+                    t_end_values=values,
+                    t_delta=t_delta,
+                    seed=args.seed,
+                )
 
-            # Save or load each cell PNG (cache, factorized batch, or full pipeline).
             cell_outputs: List[Dict[str, Any]] = []
             for t_end in values:
                 for t_start in values:
                     filename = _cell_filename(t_start, t_end)
                     out_path = cells_dir / filename
                     if out_path.exists() and not args.overwrite:
-                        # Load the cached PNG
                         with Image.open(out_path) as cached:
                             generated = cached.convert("RGB")
-                    elif factorized_images is not None:
-                        # Use the factorized images
-                        generated = factorized_images[(t_start, t_end)]
-                        _save_jpeg(generated, out_path)
                     else:
-                        # Run the full pipeline for this cell
-                        edit_config = dict(base_config)
-                        edit_config["t_start"] = t_start
-                        edit_config["t_end"] = t_end
-                        edit_config["t_delta"] = t_delta
-                        generated = run_single_edit(
-                            pipeline=pipeline,
-                            source_image=source_image,
-                            record=record,
-                            edit_config=edit_config,
-                            seed=args.seed,
-                        )
+                        assert factorized_images is not None
+                        generated = factorized_images[(t_start, t_end)]
                         _save_jpeg(generated, out_path)
                     
                     # Append the cell output for record payload.
@@ -382,9 +342,9 @@ def main() -> None:
                         }
                     )
                 
-            # Build the grid with shared helper from daniel_create_grid_image.py.
-            grid_path = condition_dir / f"grid_t_start_x_t_end{CELL_EXTENSION}"
-            built = _build_base_grid(cells_dir, values, values, cell_extension=CELL_EXTENSION)
+            # grid_clean: labeled composite, no metric overlay (daniel_create_grid_image type 1).
+            grid_path = condition_dir / f"{GRID_BASENAME}{JPEG_EXTENSION}"
+            built = _build_base_grid(cells_dir, values, values, cell_extension=JPEG_EXTENSION)
             if built is not None:
                 base_canvas, _ = built
                 _save_grid_figure(
@@ -400,7 +360,7 @@ def main() -> None:
                     t_delta=t_delta,
                 )
             else:
-                LOGGER.warning("No cell images found for %s; skipping grid PNG", condition_dir)
+                LOGGER.warning("No cell images found for %s; skipping %s", condition_dir, GRID_BASENAME)
 
             # Append the results to the record payload
             record_payload["t_delta_results"].append(
