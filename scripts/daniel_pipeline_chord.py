@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, List, Union
 import torch
 
 if TYPE_CHECKING:
+    from PIL import Image
     from pipeline_chord import ChordEditPipeline, _PromptCondition
     _Embed = Union[torch.Tensor, _PromptCondition]
 
@@ -105,3 +106,66 @@ def _u_estimate_delta0(
     dv_s = (x_tar_p_s - x_src_p_s).sum(dim=0) / float(num_noises)
 
     return dv_s
+
+
+def _cleanup_decode_row(
+    pipeline: ChordEditPipeline,
+    x_transport: torch.Tensor,
+    edit_embed: _Embed,
+    noise: torch.Tensor,
+    t_end_values: List[float],
+    cleanup: bool,
+) -> List["Image.Image"]:
+    """Batched cleanup + decode for one ``t_start`` row of the grid.
+
+    ``run_factorized_grid`` runs one transport per ``t_start`` but a cleanup +
+    decode per ``(t_start, t_end)`` cell. The per-cell path issues ``grid``
+    single-item ``_pred_x0`` forwards and ``grid`` single-item VAE decodes for a
+    fixed ``t_start``; only the cleanup timestep (``t_end``) differs while the
+    latent (``x_transport``), conditioning (``edit_embed``) and noise are shared.
+
+    What is / isn't batched here is driven by measured throughput on this VAE
+    (see daniel_sweep_decode.py / daniel_verify_cleanup_decode.py):
+
+    * ``_pred_x0`` (cleanup): batched into one UNet forward of batch
+      ``len(t_end_values)`` -- ~1.4x faster than the per-cell forwards.
+    * VAE ``_decode_latent_to_image``: kept per-cell. The SD VAE decode already
+      saturates the GPU at batch 1 (~168 ms/img); batching *regresses* it
+      (~195-220 ms/img), so a batched decode would erase the cleanup win.
+    * ``_tensor_to_pil``: done once on the concatenated batch so the
+      device->CPU transfer happens a single time instead of per cell (~2.8x).
+
+    Output matches the reference per-cell loop (fp16 decode differs by <=2/255).
+    Assumes a single source image (``x_transport.shape[0] == 1``), mirroring the
+    ``[0]`` indexing in the reference per-cell loop.
+    """
+    n = len(t_end_values)
+    batch = x_transport.shape[0]
+    device = x_transport.device
+
+    # Repeat the shared latent / noise across the n t_end variants. Row i lives
+    # at slice [i * batch : (i + 1) * batch], matching _repeat_condition ordering.
+    x_rep = x_transport.repeat(n, *([1] * (x_transport.dim() - 1)))
+
+    if cleanup:
+        timesteps = torch.cat(
+            [pipeline._time_to_index(batch, float(t_end), device=device) for t_end in t_end_values],
+            dim=0,
+        )
+        cond = pipeline._repeat_condition(edit_embed, n)
+        noise_rep = noise.repeat(n, *([1] * (noise.dim() - 1)))
+        x0 = pipeline._pred_x0(x_rep, timesteps, cond, noise_rep)
+    else:
+        x0 = x_rep
+
+    # Decode per cell (batch=1 is fastest for this VAE), then do a single
+    # concatenated device->CPU transfer / PIL conversion for the whole row.
+    decoded = torch.cat(
+        [pipeline._decode_latent_to_image(x0[i * batch : (i + 1) * batch]) for i in range(n)],
+        dim=0,
+    )
+    decoded, _ = pipeline._apply_safety_checker(decoded)
+    pil_images = pipeline._tensor_to_pil(decoded)
+
+    # One PIL per t_end; take the first image of each t_end group (batch == 1).
+    return [pil_images[i * batch] for i in range(n)]

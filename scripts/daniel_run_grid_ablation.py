@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 # Grid layout helpers, sweep constants, and shared CLI live in run_grid_ablation.py.
 # I/O and pipeline wiring live in run_local_ablation.py. Symmetric defaults from run_pie_bench.py.
 from daniel_create_grid_image import _build_base_grid, _save_grid_figure
+from daniel_pipeline_chord import _cleanup_decode_row, _u_estimate
 from run_grid_ablation import (
     GRID_VALUES,
     GRID_VALUES_SYM,
@@ -164,7 +165,10 @@ def run_factorized_grid(
             cell_cfg["t_start"] = t_start
             cell_cfg["t_delta"] = t_delta
             params = pipeline._prepare_edit_params(cell_cfg)
-            u_hat = pipeline._u_estimate(
+            # _u_estimate picks the exact delta=0 fast path when applicable
+            # (see daniel_pipeline_chord._u_estimate / _u_estimate_delta0).
+            u_hat = _u_estimate(
+                pipeline,
                 latents,
                 src_embed,
                 tgt_embed,
@@ -174,22 +178,22 @@ def run_factorized_grid(
             )
             transport[t_start] = (latents + params["step_scale"] * u_hat).detach()
 
-        # Cleanup + decode per (t_start, t_end) cell
-        # Decode one cell at a time to keep peak GPU memory low.
+        # Cleanup + decode per (t_start, t_end) cell.
+        # For a fixed t_start only t_end (the cleanup timestep) changes, so we
+        # batch the whole row into one _pred_x0 forward and one VAE decode
+        # instead of grid single-item calls (see _cleanup_decode_row).
         results: Dict[Tuple[float, float], "Image.Image"] = {}
         for t_start in t_start_values:
-            for t_end in t_end_values:
-                x_curr = transport[t_start]
-                if shared_params["cleanup"]:
-                    t_end_idx = pipeline._time_to_index(
-                        latents.shape[0],
-                        float(t_end),
-                        device=x_curr.device,
-                    )
-                    x_curr = pipeline._pred_x0(x_curr, t_end_idx, tgt_embed, noise_list[0])
-                decoded = pipeline._decode_latent_to_image(x_curr)
-                decoded, _ = pipeline._apply_safety_checker(decoded)
-                results[(t_start, t_end)] = pipeline._tensor_to_pil(decoded)[0]
+            row_images = _cleanup_decode_row(
+                pipeline,
+                transport[t_start],
+                tgt_embed,
+                noise_list[0],
+                t_end_values,
+                bool(shared_params["cleanup"]),
+            )
+            for t_end, image in zip(t_end_values, row_images):
+                results[(t_start, t_end)] = image
 
     return results
 
@@ -209,7 +213,6 @@ def main() -> None:
     data_root = Path(args.data_root).expanduser().resolve()
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_root = Path(args.output_root).expanduser().resolve()
-    output_root = output_root.with_name(f"{output_root.name}_{run_timestamp}")
     component_paths = resolve_component_paths(args.model_root, args.model_type)
     base_config = base_edit_config(args.chord_edit_mode)
     require_factorizable_config(base_config)
