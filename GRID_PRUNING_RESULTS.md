@@ -2,8 +2,7 @@
 
 Investigates whether the full 11×11 (121-cell) `t_start`×`t_end` grid search
 needed per image can be replaced with a cheaper search that still finds a
-near-optimal cell, to speed up scaling the oracle-labeling pipeline from
-~1,000 to ~10,000 images.
+near-optimal cell, to speed up scaling the oracle-labeling pipeline.
 
 Script: [scripts/grid_pruning_comparison.py](scripts/grid_pruning_comparison.py)
 
@@ -11,13 +10,12 @@ Script: [scripts/grid_pruning_comparison.py](scripts/grid_pruning_comparison.py)
 
 - Real 700-image dense grid data (11×11 `t_start`×`t_end`, `t_delta=0.0`):
   `/shared/ssd_30T/salehi/id_to_metrics_sdturbo_fullgrid_unclamped_tdelta0_TRUE_paper_matching_format.csv`
-- Scoring: the real `compute_softplus_score` function from this branch
-  (`models/classification/utils.py`), imported directly (not reimplemented),
-  using this branch's active settings: baseline `t_start=0.9, t_end=0.3`,
+- Scoring: `compute_softplus_score` function from this branch
+  (`models/classification/utils.py`), using baseline `t_start=0.9, t_end=0.3`,
   `alpha=1.0`, `beta=2.0`, per-image normalization.
 - Per-cell cost basis for time projections: 197.1ms GPU generation (using
-  Daniel's factorized/optimized pipeline) + 177.0ms CLIP+PSNR scoring + 2.0ms
-  JPEG save = 376.1ms/cell, measured directly on this machine's GPU.
+  Daniel's optimized pipeline) + 177.0ms CLIP+PSNR scoring + 2.0ms
+  JPEG save = 376.1ms/cell, as measured.
 
 ## Strategies tested
 
@@ -29,7 +27,7 @@ Script: [scripts/grid_pruning_comparison.py](scripts/grid_pruning_comparison.py)
   best cell, refine it into its 4 neighboring sub-cells at ±0.1, take the best
   of those.
 
-## Headline results (n=700 images)
+## Results (n=700 images)
 
 | Strategy | Cells used | % of full grid | Exact match | Avg. score percentile | Avg. score gap | Time @ 10,000 images | Time saved vs. full grid |
 |---|---|---|---|---|---|---|---|
@@ -38,11 +36,7 @@ Script: [scripts/grid_pruning_comparison.py](scripts/grid_pruning_comparison.py)
 | Coarse-to-fine | 40 | 33% | 56.4% | 99.2 | 0.0142 | 1.74 days | 3.53 days (67%) |
 | Coordinate descent | 21 | 17% | 42.1% | 98.6 | 0.0174 | 0.91 days | 4.35 days (83%) |
 
-Score gaps are small relative to the typical per-image score spread
-(mean ≈0.632 across the 121 cells): even coordinate descent's mean gap is
-only ≈2.8% of that range.
-
-## How bad are the misses, specifically?
+## Severity of misses
 
 Stats computed only over images each strategy got wrong (excludes exact
 matches, which trivially contribute zero):
@@ -61,12 +55,12 @@ Miss severity distribution (score percentile of the chosen cell, when wrong):
 | Coarse-to-fine | 46.9% | 48.5% | 3.9% | 0.7% (2 images) |
 | Coordinate descent | 39.8% | 51.6% | 7.9% | 0.7% (3 images) |
 
-Diagonal restriction never produces a genuinely bad choice across all 700
+Diagonal restriction never produces a real miss across all 700
 images. Coordinate descent and coarse-to-fine each have a small number of
 real failures (2-3 images out of 700), and even their worst case is
 22-40% of a typical score range — noticeable but not severe.
 
-## What a "miss" looks like in real metric terms
+## CLIP-Edit and PSNR impacts of misses
 
 | Strategy | Mean PSNR — true best | Mean PSNR — found | PSNR diff (best − found) | Mean CLIP-Edit — true best | Mean CLIP-Edit — found | CLIP diff (best − found) |
 |---|---|---|---|---|---|---|
@@ -79,28 +73,7 @@ best; positive CLIP diff means the found cell has *lower* CLIP-Edit. This
 pattern (majority but not universal — see below) is consistent across all
 three strategies.
 
-Restricted to misses only, and checking per-image direction rather than
-just the aggregate mean:
-
-| Strategy | % of misses with found-PSNR higher | % of misses with found-CLIP lower |
-|---|---|---|
-| Coordinate descent | 57.0% | 81.5% |
-| Diagonal restriction | 57.2% | 80.9% |
-| Coarse-to-fine | 70.8% | 85.6% |
-
-Not universal — 30-43% of misses go the opposite direction — but a real
-majority tendency, especially on the CLIP side.
-
 ### Why this happens
-
-`t_start` and `t_end` each independently trade PSNR for CLIP-Edit:
-
-- corr(`t_start`, PSNR) = -0.53, corr(`t_start`, CLIP) = +0.15
-- corr(`t_end`, PSNR) = -0.52, corr(`t_end`, CLIP) = +0.13
-
-Turning either parameter up means more edit strength: lower PSNR (further
-from source), higher CLIP (better target alignment). Each strategy's miss
-mechanism nudges one of these two parameters toward "weaker than optimal":
 
 - **Coordinate descent / coarse-to-fine**: when they miss, the found cell's
   `t_start` is on average lower than the true best's (-0.093 / -0.135),
@@ -113,22 +86,10 @@ mechanism nudges one of these two parameters toward "weaker than optimal":
   reduction correlates just as strongly with the same PSNR/CLIP pattern
   (r≈0.66, r≈-0.64) — same effect, different parameter.
 
-## Conclusion
+Lower `t_start` or `t_end` lead to higher PSNR but lower CLIP-Edit
 
-**Diagonal restriction is the strongest candidate**: 45% fewer cells than
-the full grid, 69.3% exact match, and its failure mode is fully understood,
-bounded (only ever misses when the true optimum requires `t_end > t_start`),
-and never produces a genuinely bad cell (0% of misses fall below the 90th
-percentile). Coarse-to-fine is a reasonable cheaper alternative (67% fewer
-cells) with weaker guarantees. Coordinate descent, despite being cheapest,
-relies on an independence assumption between `t_start` and `t_end` that does
-not hold in this data and has the least explainable failure pattern.
-
-## Caveats
+## Notes
 
 - All numbers here use this branch's *current* `compute_softplus_score`
   settings (`alpha=1.0`, `beta=2.0`, baseline `t_start=0.9`/`t_end=0.3`).
   Results would need to be recomputed if those settings change.
-- Based on 700 images from one dataset run; worth re-validating on the next
-  batch of newly-labeled images once available, rather than assuming these
-  exact percentages transfer unchanged.
