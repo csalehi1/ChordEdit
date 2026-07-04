@@ -1,5 +1,5 @@
 """
-Generate a t_start x t_end x t_delta grid of edits for the first image in each
+Generate a t_start by t_end x t_delta grid of edits for the first image in each
 PIE-Bench category folder (1_... to 9_...), score every generated image with a
 whole-image PSNR (vs. the source) and a mask-restricted CLIP-edited score, and
 dump everything to id_to_metrics_sdturbo_top.csv.
@@ -74,7 +74,7 @@ def cell_filename(t_start: float, t_end: float) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate t_start x t_end x t_delta grids over PIE-Bench images and score "
+            "Generate t_start by t_end x t_delta grids over PIE-Bench images and score "
             "each with whole-image PSNR + mask-restricted CLIP-edited similarity."
         )
     )

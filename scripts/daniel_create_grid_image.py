@@ -1,5 +1,5 @@
 """
-Build labeled t_start x t_end image grids for every source image produced by
+Build labeled t_start by t_end image grids for every source image produced by
 scripts/daniel_run_grid_metrics_pie.py and save three plots per source image
 (per t_delta condition):
 

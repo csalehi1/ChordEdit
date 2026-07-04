@@ -1,5 +1,5 @@
 """
-Factorized ChordEdit t_start x t_end grid ablation.
+Factorized ChordEdit t_start by t_end grid ablation.
 
 Reuses shared encode/transport work across cells (requires n_steps=1).
 See section comments below for the cost model vs run_grid_ablation.py.
@@ -75,7 +75,7 @@ def _cell_filename(t_start: float, t_end: float) -> str:
 def parse_args():
     return build_argument_parser(
         description=(
-            "Factorized ChordEdit t_start x t_end grid ablation. "
+            "Factorized ChordEdit t_start by t_end grid ablation. "
             "Reuses shared encode/transport work across cells when n_steps=1."
         ),
         output_root_default=DEFAULT_OUTPUT_ROOT,
