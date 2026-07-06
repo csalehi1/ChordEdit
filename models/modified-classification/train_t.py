@@ -31,6 +31,7 @@ import torch
 from scipy.stats import spearmanr
 
 from data_io import df_to_metric_grids, precompute_embeddings
+from _helpers import resolve_device
 from model_m import MetricPredictor
 from settings import DEFAULT_T_END, DEFAULT_T_START, NOISE_FLOOR_M, OUTPUTS_DIR
 from model_t import ScalarStats, TimestepPredictor, scalarize
@@ -98,7 +99,11 @@ def _gate_metrics(true_m: np.ndarray, pred_m: np.ndarray, default_i: int, defaul
     }
 
 
-def train(run_dir: Path | None = None, noise_floor: float | None = None) -> dict:
+def train(
+    run_dir: Path | None = None,
+    noise_floor: float | None = None,
+    gpu: int | str | None = None,
+) -> dict:
     # Locate the M checkpoint and matching test split from m_train.py.
     run_dir = _resolve_run_dir(run_dir)
     weights_path = run_dir / "regressor_weights.pt"
@@ -120,7 +125,8 @@ def train(run_dir: Path | None = None, noise_floor: float | None = None) -> dict
         if n != n1 * n2:
             raise ValueError(f"sample {sid} has {n} cells, expected {n1 * n2}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(gpu)
+    print(f"device: {device}")
     ckpt = torch.load(weights_path, map_location=device, weights_only=False)
     model = MetricPredictor(freeze_encoders=True, device=device)
     model.regressor.load_state_dict(ckpt["regressor_state_dict"])
@@ -210,8 +216,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate timestep selector T on test split")
     parser.add_argument("--run-dir", type=Path, default=None, help="M training run directory")
     parser.add_argument("--noise-floor", type=float, default=None, help="Deviate gate noise floor")
+    parser.add_argument(
+        "--gpu",
+        default=None,
+        help='CUDA device index (e.g. 0, 1) or "cpu"; default cuda:0 if available',
+    )
     args = parser.parse_args()
-    train(run_dir=args.run_dir, noise_floor=args.noise_floor)
+    gpu = args.gpu
+    if gpu is not None and str(gpu).lower() != "cpu":
+        gpu = int(gpu)
+    train(run_dir=args.run_dir, noise_floor=args.noise_floor, gpu=gpu)
 
 
 if __name__ == "__main__":

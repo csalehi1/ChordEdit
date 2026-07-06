@@ -11,27 +11,36 @@ from PIL import Image
 
 from model_m import MetricPredictor
 from settings import (
+    CELL_PATH_ROOT,
     CLIP_COL,
     IMAGE_PATH_COL,
     METRICS_CSV,
     PSNR_COL,
-    SOURCE_IMAGE_NAME,
-    SOURCE_IMAGE_PARENT_LEVEL,
+    SOURCE_IMAGE_PATH_COL,
+    SOURCE_IMAGE_ROOT,
     STRINGS_CSV,
+    STRINGS_ID_COL,
     TARGET_COLS,
     TARGET_T_DELTA,
 )
 
 
-def source_path(image_path: str) -> str:
-    # Map a cell-image path to its sample's source.png.
-    return str(Path(image_path).parents[SOURCE_IMAGE_PARENT_LEVEL] / SOURCE_IMAGE_NAME)
+def _normalize_sample_id(value) -> str:
+    return f"{int(value):08d}"
 
 
-def id_from_image_path(image_path: str) -> str:
-    # Extract the 12-digit string-pair id from the sample folder name.
-    sample_folder = Path(image_path).parents[SOURCE_IMAGE_PARENT_LEVEL].name
-    return sample_folder.split("_")[-1]
+def resolve_cell_path(cell_path: str) -> str:
+    path = Path(cell_path)
+    if path.is_absolute():
+        return str(path)
+    return str(CELL_PATH_ROOT / cell_path.lstrip("/"))
+
+
+def resolve_source_path(image_path: str) -> str:
+    path = Path(image_path)
+    if path.is_absolute():
+        return str(path)
+    return str(SOURCE_IMAGE_ROOT / image_path)
 
 
 def load_data(metrics_csv: Path | None = None) -> pd.DataFrame:
@@ -39,6 +48,8 @@ def load_data(metrics_csv: Path | None = None) -> pd.DataFrame:
     metrics_csv = metrics_csv or METRICS_CSV
     metrics = pd.read_csv(metrics_csv)
     metrics = metrics.rename(columns={PSNR_COL: "psnr", CLIP_COL: "clip"})
+    metrics["sample_id"] = metrics["sample_id"].map(_normalize_sample_id)
+    metrics[IMAGE_PATH_COL] = metrics[IMAGE_PATH_COL].map(resolve_cell_path)
 
     # Select a single t_delta slice if specified.
     if TARGET_T_DELTA is not None:
@@ -49,15 +60,17 @@ def load_data(metrics_csv: Path | None = None) -> pd.DataFrame:
             )
         metrics = metrics[metrics["t_delta"] == TARGET_T_DELTA].copy()
 
-    metrics["source_path"] = metrics[IMAGE_PATH_COL].map(source_path)
-    metrics["id"] = metrics[IMAGE_PATH_COL].map(id_from_image_path)
-
-    # Merge prompt strings keyed by sample id.
-    strings = pd.read_csv(STRINGS_CSV, dtype={"id": str})
-    df = pd.merge(metrics, strings, on="id", how="left")
+    # Merge prompt strings and source-image paths keyed by sample id.
+    strings = pd.read_csv(STRINGS_CSV)
+    strings[STRINGS_ID_COL] = strings[STRINGS_ID_COL].map(_normalize_sample_id)
+    strings["source_path"] = strings[SOURCE_IMAGE_PATH_COL].map(resolve_source_path)
+    merge_cols = [STRINGS_ID_COL, "source_prompt", "target_prompt", "source_path"]
+    df = pd.merge(metrics, strings[merge_cols], left_on="sample_id", right_on=STRINGS_ID_COL, how="left")
     if df["source_prompt"].isna().any():
-        missing = df.loc[df["source_prompt"].isna(), "id"].unique()
-        raise ValueError(f"No prompt strings found for ids: {missing.tolist()}")
+        missing = df.loc[df["source_prompt"].isna(), "sample_id"].unique()
+        raise ValueError(f"No prompt strings found for sample_ids: {missing.tolist()}")
+
+    df["id"] = df["sample_id"]
 
     # Partial-grid training: only rows with labeled=True are kept.
     if "labeled" not in df.columns:

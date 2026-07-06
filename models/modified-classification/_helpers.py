@@ -18,6 +18,18 @@ def combine_text_embeddings(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.cat([a, b, a - b, a * b], dim=-1)
 
 
+def resolve_device(gpu: int | str | None = None) -> torch.device:
+    """Pick torch device for inference.
+
+    gpu: None -> cuda:0 if available else cpu; int -> cuda:N; "cpu" -> cpu.
+    """
+    if gpu is None:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if isinstance(gpu, str) and gpu.lower() == "cpu":
+        return torch.device("cpu")
+    return torch.device(f"cuda:{int(gpu)}")
+
+
 def split_data(
     df: pd.DataFrame, seed: int = 42
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:

@@ -14,14 +14,15 @@ import numpy as np
 _PARENT_DIR = Path(__file__).resolve().parent
 DATA_DIR = _PARENT_DIR / "data"
 
-# Grid-ablation metrics for the 10-sample SD-Turbo subset. Each row is one
-# (sample_id, t_delta, t_start, t_end) cell with its measured psnr/clip and a
-# path to the rendered cell image (whose folder also holds the source image).
-METRICS_CSV = DATA_DIR / "id_to_metrics_sdturbo_random10.csv"
-STRINGS_CSV = DATA_DIR / "id_to_string_pair.csv"
+# UltraEdit Region 1000 grid ablation. Each row is one (sample_id, t_start,
+# t_end) cell with measured psnr/clip and a path to the rendered cell image.
+ULTRA_EDIT_DATA_ROOT = Path("/shared/ssd_30T/mirick/datasets/ultra_edit/UltraEdit_Region_1000")
+ULTRA_EDIT_GENERATED_ROOT = Path("/shared/ssd_30T/mirick/generated/ultra_edit/UltraEdit_Region_1000")
+METRICS_CSV = ULTRA_EDIT_GENERATED_ROOT / "id_to_metrics_ultraeditregion1000.csv"
+STRINGS_CSV = ULTRA_EDIT_GENERATED_ROOT / "id_to_inputs_ultraeditregion1000.csv"
 
-_OUTPUTS_SUBDIR = METRICS_CSV.stem.removeprefix("id_to_metrics_")
-OUTPUTS_DIR = _PARENT_DIR / "outputs" / _OUTPUTS_SUBDIR
+OUTPUTS_SUBDIR = "ultra_edit_region_1000"
+OUTPUTS_DIR = _PARENT_DIR / "outputs" / OUTPUTS_SUBDIR
 if not OUTPUTS_DIR.exists():
     OUTPUTS_DIR.mkdir(parents=True)
 
@@ -31,19 +32,22 @@ Data columns. These are the computed metric columns in the METRICS_CSV file,
 as well as the shared image path column.
 """
 
-PSNR_COL = "whole_psnr"
-CLIP_COL = "clip_edited"
-IMAGE_PATH_COL = "image_path"
+PSNR_COL = "psnr"
+CLIP_COL = "clip_similarity_target_image_edit_part"
+IMAGE_PATH_COL = "cell_path"
 
 # Targets the model regresses, in order. Output tensor columns follow this list.
 TARGET_COLS = ("psnr", "clip")
 TARGET_LABELS = {"psnr": "Whole PSNR", "clip": "CLIP-Edited"}
 TARGET_METRIC_COL = "-".join(c for c in TARGET_COLS)
 
-# The source image lives this many parent directories above each cell image:
-# <sample_dir>/t_delta_<x>/cells/<cell>.png  ->  <sample_dir>/source.png
-SOURCE_IMAGE_NAME = "source.png"
-SOURCE_IMAGE_PARENT_LEVEL = 2
+# Source images: id_to_inputs.image_path relative to ULTRA_EDIT_DATA_ROOT.
+SOURCE_IMAGE_ROOT = ULTRA_EDIT_DATA_ROOT
+SOURCE_IMAGE_PATH_COL = "image_path"
+CELL_PATH_ROOT = ULTRA_EDIT_GENERATED_ROOT
+
+# Merge key in STRINGS_CSV (sample_id for UltraEdit, id for PIE-Bench exports).
+STRINGS_ID_COL = "sample_id"
 
 
 """
@@ -103,7 +107,7 @@ MSE objective; predictions are de-standardized before metrics are reported.
 """
 
 SEED = 42
-EPOCHS = 50
+EPOCHS = 10
 BATCH_SIZE = 64
 LR = 1e-3
 WEIGHT_DECAY = 0.01

@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from model_m import MetricPredictor
+from _helpers import resolve_device
 from settings import (
     DEFAULT_T_END,
     DEFAULT_T_START,
@@ -182,11 +183,12 @@ def load_timestep_predictor(
     weights_path: Path | str,
     device: torch.device | str | None = None,
     scalar_stats: ScalarStats | None = None,
+    gpu: int | str | None = None,
 ) -> TimestepPredictor:
     """Load M checkpoint and wrap with T."""
     weights_path = Path(weights_path)
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = resolve_device(gpu)
     ckpt = torch.load(weights_path, map_location=device, weights_only=False)
     model = MetricPredictor(freeze_encoders=True, device=device)
     model.regressor.load_state_dict(ckpt["regressor_state_dict"])
