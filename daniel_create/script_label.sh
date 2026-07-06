@@ -68,5 +68,15 @@ if [[ "${NUM_SHARDS}" -gt 1 ]]; then
   echo "[label] merged shard CSVs -> ${merged}"
 fi
 
+"${PY}" -c "
+import sys
+from pathlib import Path
+sys.path.insert(0, '${HERE}')
+from common import write_id_to_metrics
+dest = write_id_to_metrics(Path('${OUTPUT_ROOT}'))
+if dest is not None:
+    print(f'[label] wrote {dest}')
+"
+
 echo "[label] done (rc=${rc}) -> ${OUTPUT_ROOT}"
 exit "${rc}"

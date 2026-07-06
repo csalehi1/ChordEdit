@@ -27,6 +27,7 @@ from common import (
     load_samples,
     strip_brackets,
     resolve_under,
+    write_id_to_inputs,
     write_id_to_prompts,
 )
 from grid_render import save_clean_grid
@@ -81,6 +82,8 @@ def main() -> None:
     # writes it (all shards would otherwise race on the same full-dataset file).
     if args.shard == 0:
         dest = write_id_to_prompts(output_root, data_root, mapping_path)
+        LOGGER.info("Wrote %s", dest)
+        dest = write_id_to_inputs(output_root, data_root, mapping_path)
         LOGGER.info("Wrote %s", dest)
 
     values = settings.grid_values(args.chord_edit_mode)

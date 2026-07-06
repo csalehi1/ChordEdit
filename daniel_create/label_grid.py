@@ -31,6 +31,7 @@ from common import (
     load_samples,
     resolve_under,
     strip_brackets,
+    write_id_to_metrics,
 )
 from grid_render import save_metric_grids
 
@@ -249,6 +250,12 @@ def main() -> None:
 
     # Close the CSV file.
     csv_file.close()
+
+    if args.num_shards == 1:
+        dest = write_id_to_metrics(output_root)
+        if dest is not None:
+            LOGGER.info("Wrote %s", dest)
+
     LOGGER.info("Done. Results in %s", csv_path)
 
 

@@ -35,14 +35,25 @@ FIELD_EDIT_INSTRUCTION = "editing_instruction"
 FIELD_MASK_IMAGE_PATH = "mask_image_path"
 FIELD_MASK = "mask"
 
-# Per-output prompt lookup table written whenever the output folder is created.
-ID_TO_PROMPTS_NAME = "id_to_prompts.csv"
+# Per-output lookup tables written whenever the output folder is created.
+SAMPLE_ID_WIDTH = 8
+_ID_TO_SUFFIX = Path(DEFAULT_OUTPUT_ROOT).name.lower().replace("_", "")
+ID_TO_PROMPTS_NAME = f"id_to_prompts_{_ID_TO_SUFFIX}.csv"
 ID_TO_PROMPTS_FIELDS: List[str] = [
     "sample_id",
     "source_image_path",
     "source_prompt",
     "target_prompt",
 ]
+ID_TO_INPUTS_NAME = f"id_to_inputs_{_ID_TO_SUFFIX}.csv"
+ID_TO_INPUTS_FIELDS: List[str] = [
+    "sample_id",
+    "source_prompt",
+    "target_prompt",
+    "image_path",
+    "mask_path",
+]
+ID_TO_METRICS_NAME = f"id_to_metrics_{_ID_TO_SUFFIX}.csv"
 
 
 """

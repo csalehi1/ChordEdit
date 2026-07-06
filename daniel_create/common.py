@@ -53,6 +53,15 @@ def cell_filename(t_start: float, t_end: float) -> str:
     return f"{param_slug('t_start', t_start)}__{param_slug('t_end', t_end)}{settings.CELL_EXTENSION}"
 
 
+def format_sample_id(sample_id: str, width: int = settings.SAMPLE_ID_WIDTH) -> str:
+    return str(sample_id).zfill(width)
+
+
+def relative_cell_path(sample_id: str, t_start: float, t_end: float) -> str:
+    sid = format_sample_id(sample_id)
+    return f"/{sid}/cells/{cell_filename(t_start, t_end)}"
+
+
 def dtype_from_precision(value: Optional[str]) -> "torch.dtype":
     import torch
 
@@ -100,6 +109,10 @@ def load_samples(
     return [(sid, mapping[sid]) for sid in sample_ids]
 
 
+def _id_to_csv_name(kind: str, output_root: Path) -> str:
+    return f"id_to_{kind}_{settings.output_root_suffix(output_root)}.csv"
+
+
 def write_id_to_prompts(output_root: Path, data_root: Path, mapping_path: Path) -> Path:
     """
     Write the sample_id -> prompts lookup table for the whole dataset.
@@ -113,7 +126,7 @@ def write_id_to_prompts(output_root: Path, data_root: Path, mapping_path: Path) 
     with mapping_path.open("r", encoding="utf-8") as handle:
         mapping = json.load(handle)
 
-    dest = output_root / settings.ID_TO_PROMPTS_NAME
+    dest = output_root / _id_to_csv_name("prompts", output_root)
     with dest.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=settings.ID_TO_PROMPTS_FIELDS)
         writer.writeheader()
@@ -124,12 +137,95 @@ def write_id_to_prompts(output_root: Path, data_root: Path, mapping_path: Path) 
                 continue
             writer.writerow(
                 {
-                    "sample_id": sample_id,
+                    "sample_id": format_sample_id(sample_id),
                     "source_image_path": str(resolve_under(data_root, image_rel)),
                     "source_prompt": strip_brackets(meta.get(settings.FIELD_SOURCE_PROMPT, "")),
                     "target_prompt": strip_brackets(meta.get(settings.FIELD_TARGET_PROMPT, "")),
                 }
             )
+    return dest
+
+
+def write_id_to_inputs(output_root: Path, data_root: Path, mapping_path: Path) -> Path:
+    """Write sample_id -> prompts + dataset image/mask paths (under data_root)."""
+    import csv
+
+    with mapping_path.open("r", encoding="utf-8") as handle:
+        mapping = json.load(handle)
+
+    dest = output_root / _id_to_csv_name("inputs", output_root)
+    with dest.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=settings.ID_TO_INPUTS_FIELDS)
+        writer.writeheader()
+        for sample_id in sorted(mapping):
+            meta = mapping[sample_id]
+            image_rel = meta.get(settings.FIELD_IMAGE_PATH)
+            if not image_rel:
+                continue
+            mask_rel = meta.get(settings.FIELD_MASK_IMAGE_PATH, "")
+            writer.writerow(
+                {
+                    "sample_id": format_sample_id(sample_id),
+                    "source_prompt": strip_brackets(meta.get(settings.FIELD_SOURCE_PROMPT, "")),
+                    "target_prompt": strip_brackets(meta.get(settings.FIELD_TARGET_PROMPT, "")),
+                    "image_path": str(resolve_under(data_root, image_rel)),
+                    "mask_path": str(resolve_under(data_root, mask_rel)) if mask_rel else "",
+                }
+            )
+    return dest
+
+
+def _read_result_rows(output_root: Path) -> List[dict]:
+    """Load metric rows from result.csv or, if absent, all result_shard*.csv files."""
+    import csv
+
+    merged = output_root / settings.CSV_NAME
+    sources = [merged] if merged.exists() else sorted(output_root.glob("result_shard*.csv"))
+    rows: List[dict] = []
+    for path in sources:
+        with path.open("r", encoding="utf-8") as handle:
+            rows.extend(csv.DictReader(handle))
+    return rows
+
+
+def write_id_to_metrics(output_root: Path) -> Optional[Path]:
+    """
+    Write id_to_metrics.csv from result.csv (or shard CSVs).
+
+    Same columns as result.csv, sorted by sample_id, t_start, t_end, with
+    zero-padded sample_id and cell_path as /{sample_id}/cells/<cell>.jpg.
+    """
+    import csv
+
+    rows = _read_result_rows(output_root)
+    if not rows:
+        return None
+
+    out_rows = []
+    for row in rows:
+        sample_id = format_sample_id(row["sample_id"])
+        t_start = float(row["t_start"])
+        t_end = float(row["t_end"])
+        out_rows.append(
+            {
+                "sample_id": sample_id,
+                "category": row["category"],
+                "t_start": t_start,
+                "t_end": t_end,
+                "t_delta": row["t_delta"],
+                "psnr": row["psnr"],
+                "clip_similarity_target_image_edit_part": row["clip_similarity_target_image_edit_part"],
+                "cell_path": relative_cell_path(sample_id, t_start, t_end),
+            }
+        )
+
+    out_rows.sort(key=lambda row: (row["sample_id"], float(row["t_start"]), float(row["t_end"])))
+
+    dest = output_root / _id_to_csv_name("metrics", output_root)
+    with dest.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=settings.CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(out_rows)
     return dest
 
 
