@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Download the first N rows from UltraEdit Region-Based 100k and write a
 PIE-Bench_v1-style folder (annotation_images/, annotation_masks/, mapping_file.json).
@@ -9,13 +8,14 @@ Dataset: https://huggingface.co/datasets/BleachNick/UltraEdit_Region_Based_100k
 from __future__ import annotations
 
 import argparse
-import difflib
 import json
 import os
-import re
 import sys
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from utils import bracket_diff
 
 DATASET = "BleachNick/UltraEdit_Region_Based_100k"
 SPLIT = "RegionBase"
@@ -31,35 +31,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-samples", type=int, required=True)
     return parser.parse_args()
-
-
-def bracket_diff(source: str, target: str) -> tuple[str, str]:
-    """Wrap differing word spans in [brackets] for PIE-Bench-style prompts."""
-
-    def wrap(words: list[str]) -> str:
-        span = " ".join(words)
-        # Split the span into leading/trailing non-word characters and the core content.
-        match = re.match(r"^(\W*)(.*?)(\W*)$", span, flags=re.DOTALL)
-        if not match or not match.group(2):
-            return span
-        lead, core, trail = match.groups()
-        # Wrap only the core content in [brackets].
-        return f"{lead}[{core}]{trail}"
-
-    source_words, target_words = source.split(), target.split()
-    # Use Python's built-in difflib to find the longest common subsequence.
-    matcher = difflib.SequenceMatcher(a=source_words, b=target_words, autojunk=False)
-    source_out, target_out = [], []
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal":
-            source_out.extend(source_words[i1:i2])
-            target_out.extend(target_words[j1:j2])
-        else:
-            if i2 > i1:
-                source_out.append(wrap(source_words[i1:i2]))
-            if j2 > j1:
-                target_out.append(wrap(target_words[j1:j2]))
-    return " ".join(source_out), " ".join(target_out)
 
 
 def save_image(image: Any, path: Path) -> None:

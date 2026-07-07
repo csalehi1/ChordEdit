@@ -2,12 +2,6 @@
 
 Downloads the first N samples from the [UltraEdit Region-Based 100k](https://huggingface.co/datasets/BleachNick/UltraEdit_Region_Based_100k) dataset in the PIE-Bench_v1 style.
 
-## Setup
-
-```bash
-pip install datasets pillow
-```
-
 ## Usage
 
 Download the first N samples:
