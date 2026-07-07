@@ -408,6 +408,7 @@ def main() -> None:
         LOGGER.warning(
             "FLUX requested with fp32; this may OOM. Prefer --precision bf16 or --precision fp16."
         )
+        precision_choice = "bf16"
     torch_dtype = dtype_from_precision(precision_choice)
     compute_dtype = torch_dtype if args.model_type == "flux" else torch.float32
 
@@ -449,6 +450,8 @@ def main() -> None:
     if args.no_cleanup:
         dir_name += "_no_cleanup"
     output_dir = export_root / "output" / args.method_name / args.output_subdir / dir_name
+    print("output_dir: ", output_dir)
+
     source_dir = export_root / "data" / args.source_subdir
     ensure_dir(output_dir)
     if args.copy_source:

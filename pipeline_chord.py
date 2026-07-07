@@ -114,6 +114,7 @@ class ChordEditPipeline(DiffusionPipeline):
         self._is_sdxl = (not self._is_flux) and tokenizer_2 is not None and text_encoder_2 is not None
         self._model_family = "flux" if self._is_flux else ("sdxl" if self._is_sdxl else "sd")
         self._flux_pipe = flux_pipe
+
         self.to(self._device)
         self._set_compute_precision()
 
@@ -131,7 +132,7 @@ class ChordEditPipeline(DiffusionPipeline):
         if getattr(self, "transformer", None) is not None:
             self.transformer.eval()
         if self._model_family == "flux":
-            self._max_unet_timestep = 1000
+            self._max_unet_timestep = 1000 # TODO: self.scheduler.config.num_inference_steps
         else:
             self._max_unet_timestep = self.scheduler.config.num_train_timesteps - 1
         self._use_safety_checker = bool(use_safety_checker)
@@ -206,7 +207,7 @@ class ChordEditPipeline(DiffusionPipeline):
         if resolved_model_type == "flux":
             return cls.from_local_flux_weights(
                 component_paths=component_paths,
-                image_size=512 if image_size is None else image_size,
+                image_size=1024 if image_size is None else image_size,
                 **common_kwargs,
             )
         if resolved_model_type == "sdxl":
@@ -646,12 +647,11 @@ class ChordEditPipeline(DiffusionPipeline):
         if self._flux_pipe is None:
             raise ValueError("FLUX prompt encoding requires a FluxPipeline instance.")
         prompt_embeds, pooled_prompt_embeds, txt_ids = self._flux_pipe.encode_prompt(
-            prompt=list(prompts),
-            prompt_2=list(prompts),
+            prompt=prompts,
+            prompt_2=None, # list(prompts),
             device=self._device,
-            num_images_per_prompt=1,
-            max_sequence_length=512,
         )
+
         return _PromptCondition(
             hidden_states=prompt_embeds.to(device=self._device, dtype=self._compute_dtype),
             pooled_embeds=pooled_prompt_embeds.to(device=self._device, dtype=self._compute_dtype),
@@ -844,6 +844,17 @@ class ChordEditPipeline(DiffusionPipeline):
         x0_pred = (z_t - sigma_t * noise_pred) / alpha_t
         return x0_pred
 
+    def _pred_x0_flux(self, x_anchor, timesteps, cond, noise):
+        sigma = self._flux_timestep_to_sigma(timesteps, x_anchor)
+        z_t = (1.0 - sigma) * x_anchor + sigma * noise
+        velocity_pred = self._predict_flux_velocity(
+            sample=z_t,
+            timesteps=timesteps,
+            cond=cond,
+        )
+        
+        return z_t - sigma * velocity_pred
+
     def _flux_timestep_to_sigma(self, timesteps: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
         # ChordEdit's scalar t maps to integer 0..1000. FLUX uses a flow sigma in [0,1].
         sigma = timesteps.to(device=tensor.device, dtype=tensor.dtype) / 1000.0
@@ -875,8 +886,8 @@ class ChordEditPipeline(DiffusionPipeline):
         packed = self._pack_flux_latents(sample)
         img_ids = self._flux_pipe._prepare_latent_image_ids(
             b,
-            h // 2,
-            w // 2,
+            h,
+            w,
             self._device,
             self._compute_dtype,
         )
@@ -894,28 +905,21 @@ class ChordEditPipeline(DiffusionPipeline):
                 device=self._device,
                 dtype=torch.float32,
             )
+       
+        with torch.no_grad():
+            pred = self.transformer(
+                hidden_states=packed,
+                timestep=timestep,  
+                guidance=guidance,
+                encoder_hidden_states=cond.hidden_states,
+                txt_ids=cond.txt_ids,
+                img_ids=img_ids,
+                pooled_projections=cond.pooled_embeds,
+                joint_attention_kwargs=None,
+                return_dict=False,
+            )[0]
 
-        pred = self.transformer(
-            hidden_states=packed,
-            timestep=timestep,
-            guidance=guidance,
-            pooled_projections=cond.pooled_embeds,
-            encoder_hidden_states=cond.hidden_states,
-            txt_ids=cond.txt_ids,
-            img_ids=img_ids,
-            return_dict=False,
-        )[0]
         return self._unpack_flux_latents(pred, self.image_size, self.image_size)
-
-    def _pred_x0_flux(self, x_anchor, timesteps, cond, noise):
-        sigma = self._flux_timestep_to_sigma(timesteps, x_anchor)
-        z_t = (1.0 - sigma) * x_anchor + sigma * noise
-        velocity_pred = self._predict_flux_velocity(
-            sample=z_t,
-            timesteps=timesteps,
-            cond=cond,
-        )
-        return z_t - sigma * velocity_pred
 
     def _predict_x0_from_noised_samples(
         self,
@@ -963,25 +967,12 @@ class ChordEditPipeline(DiffusionPipeline):
     
     def _u_estimate_flux(self, x_anchor, src_embed, edit_embed, noise, t_s: float, delta: float):
         """FLUX ChordEdit residual.
-
-        FLUX_CHORDEDIT_RESIDUAL=velocity:
         R = v_tgt - v_src.
         This is the paper-literal flow-model residual with B_t = I.
-
-        FLUX_CHORDEDIT_RESIDUAL=clean_disp:
-        R = x0_tgt - x0_src = -sigma * (v_tgt - v_src).
-        This maps the FLUX velocity difference into clean-latent displacement
-        space, matching the residual domain used by the SD/SDXL implementation.
-        This is the main FLUX variant used for diagnostics.
-
-        FLUX_CHORDEDIT_RESIDUAL=neg_velocity:
-        R = -(v_tgt - v_src).
-        This is only a sign-convention sanity check.
         """
         batch, device = x_anchor.shape[0], x_anchor.device
         batch_size = batch
         noises = noise if isinstance(noise, (list, tuple)) else [noise]
-        mode = os.environ.get("FLUX_CHORDEDIT_RESIDUAL", "velocity").lower()
 
         def query_residual(t_query: float, eps: torch.Tensor):
             t_query = float(max(0.0, min(1.0, t_query)))
@@ -998,38 +989,16 @@ class ChordEditPipeline(DiffusionPipeline):
                 t_idx,
                 src_embed,
             )
+
             v_tgt = self._predict_flux_velocity(
                 z_t,
                 t_idx,
                 edit_embed,
             )
 
-            dv = v_tgt - v_src
+            dv = - (v_tgt - v_src)  # eps - x_tgt - (eps - x_src) = x_src - x_tgt
 
-            if mode in {"velocity", "paper", "paper_velocity"}:
-                residual = dv
-            elif mode in {"neg_velocity", "minus_velocity"}:
-                # Sign sanity check: test whether the FLUX/Diffusers velocity convention
-                # is opposite of the assumed paper direction.
-                residual = -dv
-            else:
-                # Diffusers FLUX clean extrapolation:
-                # x0 = z_t - sigma * v.
-                # Therefore x0_tgt - x0_src = -sigma * (v_tgt - v_src).
-                residual = -sigma * dv
-
-            if os.environ.get("FLUX_CHORDEDIT_DEBUG", "0") == "1" and not getattr(self, "_flux_chord_debug_printed", False):
-                self._flux_chord_debug_printed = True
-                print("FLUX_CHORDEDIT_RESIDUAL", mode)
-                print("t_query", t_query)
-                print("sigma mean", float(sigma.float().mean()))
-                print("z_t absmean", float(z_t.float().abs().mean()))
-                print("v_src absmean", float(v_src.float().abs().mean()))
-                print("v_tgt absmean", float(v_tgt.float().abs().mean()))
-                print("dv absmean", float(dv.float().abs().mean()))
-                print("residual absmean", float(residual.float().abs().mean()))
-
-            return residual
+            return dv
 
         residual_t_all = []
         residual_prev_all = []
@@ -1050,7 +1019,7 @@ class ChordEditPipeline(DiffusionPipeline):
         denom = float(t_s) + float(delta)
         if denom <= 1e-8:
             return residual_t
-
+        
         return (float(t_s) * residual_prev + float(delta) * residual_t) / denom
 
     def _u_estimate(self, x_anchor, src_embed, edit_embed, noise, t_s: float, delta: float):
@@ -1058,14 +1027,7 @@ class ChordEditPipeline(DiffusionPipeline):
         #   SD/SDXL: convert noise/x0 outputs into the comparison domain.
         #   FLUX: velocity model, so B_t = I and the residual is v_tgt - v_src.
         if self._model_family == "flux":
-            return self._u_estimate_flux(
-                x_anchor,
-                src_embed,
-                edit_embed,
-                noise,
-                t_s,
-                delta,
-            )
+            return self._u_estimate_flux(x_anchor, src_embed, edit_embed, noise, t_s, delta)
 
         if self._chord_edit_mode == "sym":
             print("Using symmetric edit mode ...")
@@ -1080,14 +1042,8 @@ class ChordEditPipeline(DiffusionPipeline):
 
         noises = noise if isinstance(noise, (list, tuple)) else [noise]
 
-        if self._model_family == "flux":
-            sigma_s = self._flux_timestep_to_sigma(t_idx_s, x_anchor)
-            sigma_prev = self._flux_timestep_to_sigma(t_idx_s0, x_anchor)
-            alpha_s = 1.0 - sigma_s
-            alpha_prev = 1.0 - sigma_prev
-        else:
-            alpha_s, sigma_s = self._get_alpha_sigma(x_anchor, t_idx_s)
-            alpha_prev, sigma_prev = self._get_alpha_sigma(x_anchor, t_idx_s0)
+        alpha_s, sigma_s = self._get_alpha_sigma(x_anchor, t_idx_s)
+        alpha_prev, sigma_prev = self._get_alpha_sigma(x_anchor, t_idx_s0)
 
         num_noises = len(noises)
         noise_stack = torch.stack(noises, dim=0)
@@ -1144,14 +1100,8 @@ class ChordEditPipeline(DiffusionPipeline):
 
         noises = noise if isinstance(noise, (list, tuple)) else [noise]
 
-        if self._model_family == "flux":
-            sigma_s = self._flux_timestep_to_sigma(t_idx_s, x_anchor)
-            sigma_prev = self._flux_timestep_to_sigma(t_idx_s0, x_anchor)
-            alpha_s = 1.0 - sigma_s
-            alpha_prev = 1.0 - sigma_prev
-        else:
-            alpha_s, sigma_s = self._get_alpha_sigma(x_anchor, t_idx_s)
-            alpha_prev, sigma_prev = self._get_alpha_sigma(x_anchor, t_idx_s0)
+        alpha_s, sigma_s = self._get_alpha_sigma(x_anchor, t_idx_s)
+        alpha_prev, sigma_prev = self._get_alpha_sigma(x_anchor, t_idx_s0)
 
         num_noises = len(noises)
         noise_stack = torch.stack(noises, dim=0)
@@ -1239,9 +1189,6 @@ class ChordEditPipeline(DiffusionPipeline):
 
         if params["cleanup"]:
             t_end_idx = self._time_to_index(x_src.shape[0], params["t_end"], device=device)
-            if self._model_family == "flux":
-                x_curr = self._pred_x0_flux(x_curr, t_end_idx, edit_embed, noise[0])
-            else:
-                x_curr = self._pred_x0(x_curr, t_end_idx, edit_embed, noise[0])
+            x_curr = self._pred_x0(x_curr, t_end_idx, edit_embed, noise[0])
 
         return x_curr
