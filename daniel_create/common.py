@@ -58,8 +58,9 @@ def format_sample_id(sample_id: str, width: int = settings.SAMPLE_ID_WIDTH) -> s
 
 
 def relative_cell_path(sample_id: str, t_start: float, t_end: float) -> str:
+    """Cell path relative to the metrics CSV (same directory as sample folders)."""
     sid = format_sample_id(sample_id)
-    return f"/{sid}/cells/{cell_filename(t_start, t_end)}"
+    return f"{sid}/cells/{cell_filename(t_start, t_end)}"
 
 
 def dtype_from_precision(value: Optional[str]) -> "torch.dtype":
@@ -113,39 +114,6 @@ def _id_to_csv_name(kind: str, output_root: Path) -> str:
     return f"id_to_{kind}_{settings.output_root_suffix(output_root)}.csv"
 
 
-def write_id_to_prompts(output_root: Path, data_root: Path, mapping_path: Path) -> Path:
-    """
-    Write the sample_id -> prompts lookup table for the whole dataset.
-
-    Columns: sample_id, source_image_path, source_prompt, target_prompt. Written
-    whenever the output folder is (re)created so every save folder ships with a
-    prompt reference. Covers every sample in mapping_file.json (not just a shard).
-    """
-    import csv
-
-    with mapping_path.open("r", encoding="utf-8") as handle:
-        mapping = json.load(handle)
-
-    dest = output_root / _id_to_csv_name("prompts", output_root)
-    with dest.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=settings.ID_TO_PROMPTS_FIELDS)
-        writer.writeheader()
-        for sample_id in sorted(mapping):
-            meta = mapping[sample_id]
-            image_rel = meta.get(settings.FIELD_IMAGE_PATH)
-            if not image_rel:
-                continue
-            writer.writerow(
-                {
-                    "sample_id": format_sample_id(sample_id),
-                    "source_image_path": str(resolve_under(data_root, image_rel)),
-                    "source_prompt": strip_brackets(meta.get(settings.FIELD_SOURCE_PROMPT, "")),
-                    "target_prompt": strip_brackets(meta.get(settings.FIELD_TARGET_PROMPT, "")),
-                }
-            )
-    return dest
-
-
 def write_id_to_inputs(output_root: Path, data_root: Path, mapping_path: Path) -> Path:
     """Write sample_id -> prompts + dataset image/mask paths (under data_root)."""
     import csv
@@ -169,7 +137,7 @@ def write_id_to_inputs(output_root: Path, data_root: Path, mapping_path: Path) -
                     "source_prompt": strip_brackets(meta.get(settings.FIELD_SOURCE_PROMPT, "")),
                     "target_prompt": strip_brackets(meta.get(settings.FIELD_TARGET_PROMPT, "")),
                     "image_path": str(resolve_under(data_root, image_rel)),
-                    "mask_path": str(resolve_under(data_root, mask_rel)) if mask_rel else "",
+                    "mask_image_path": str(resolve_under(data_root, mask_rel)) if mask_rel else "",
                 }
             )
     return dest
@@ -190,10 +158,10 @@ def _read_result_rows(output_root: Path) -> List[dict]:
 
 def write_id_to_metrics(output_root: Path) -> Optional[Path]:
     """
-    Write id_to_metrics.csv from result.csv (or shard CSVs).
+    Write id_to_metrics_<suffix>.csv from result.csv (or shard CSVs).
 
-    Same columns as result.csv, sorted by sample_id, t_start, t_end, with
-    zero-padded sample_id and cell_path as /{sample_id}/cells/<cell>.jpg.
+    Columns: sample_id, t_start, t_end, t_delta, whole_psnr, clip_edited, cell_path.
+    Sorted by sample_id, t_start, t_end; cell_path is relative to the CSV.
     """
     import csv
 
@@ -206,15 +174,17 @@ def write_id_to_metrics(output_root: Path) -> Optional[Path]:
         sample_id = format_sample_id(row["sample_id"])
         t_start = float(row["t_start"])
         t_end = float(row["t_end"])
+        # Accept either the published column names or legacy result.csv names.
+        whole_psnr = row.get("whole_psnr", row.get("psnr"))
+        clip_edited = row.get("clip_edited", row.get("clip_similarity_target_image_edit_part"))
         out_rows.append(
             {
                 "sample_id": sample_id,
-                "category": row["category"],
                 "t_start": t_start,
                 "t_end": t_end,
                 "t_delta": row["t_delta"],
-                "psnr": row["psnr"],
-                "clip_similarity_target_image_edit_part": row["clip_similarity_target_image_edit_part"],
+                "whole_psnr": whole_psnr,
+                "clip_edited": clip_edited,
                 "cell_path": relative_cell_path(sample_id, t_start, t_end),
             }
         )
@@ -223,7 +193,7 @@ def write_id_to_metrics(output_root: Path) -> Optional[Path]:
 
     dest = output_root / _id_to_csv_name("metrics", output_root)
     with dest.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=settings.CSV_FIELDS)
+        writer = csv.DictWriter(handle, fieldnames=settings.ID_TO_METRICS_FIELDS)
         writer.writeheader()
         writer.writerows(out_rows)
     return dest

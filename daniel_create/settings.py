@@ -36,24 +36,30 @@ FIELD_MASK_IMAGE_PATH = "mask_image_path"
 FIELD_MASK = "mask"
 
 # Per-output lookup tables written whenever the output folder is created.
+# Filename suffix is derived from the output directory stem, e.g.
+# UltraEdit_Region_1000 -> ultraeditregion1000.
 SAMPLE_ID_WIDTH = 8
-_ID_TO_SUFFIX = Path(DEFAULT_OUTPUT_ROOT).name.lower().replace("_", "")
-ID_TO_PROMPTS_NAME = f"id_to_prompts_{_ID_TO_SUFFIX}.csv"
-ID_TO_PROMPTS_FIELDS: List[str] = [
-    "sample_id",
-    "source_image_path",
-    "source_prompt",
-    "target_prompt",
-]
-ID_TO_INPUTS_NAME = f"id_to_inputs_{_ID_TO_SUFFIX}.csv"
 ID_TO_INPUTS_FIELDS: List[str] = [
     "sample_id",
     "source_prompt",
     "target_prompt",
     "image_path",
-    "mask_path",
+    "mask_image_path",
 ]
-ID_TO_METRICS_NAME = f"id_to_metrics_{_ID_TO_SUFFIX}.csv"
+ID_TO_METRICS_FIELDS: List[str] = [
+    "sample_id",
+    "t_start",
+    "t_end",
+    "t_delta",
+    "whole_psnr",
+    "clip_edited",
+    "cell_path",
+]
+
+
+def output_root_suffix(output_root: str | Path) -> str:
+    """Lowercase output-dir stem with underscores removed (for id_to_*.csv names)."""
+    return Path(output_root).name.lower().replace("_", "")
 
 
 """
@@ -120,17 +126,10 @@ Metrics used for labeling.
 """
 
 CLIP_MODEL_ID = "openai/clip-vit-large-patch14"
+# Intermediate per-shard / resume CSV written during labeling; the published
+# artifact is id_to_metrics_<suffix>.csv (same columns as ID_TO_METRICS_FIELDS).
 CSV_NAME = "result.csv"
-CSV_FIELDS: List[str] = [
-    "sample_id",
-    "category",
-    "t_start",
-    "t_end",
-    "t_delta",
-    "psnr",
-    "clip_similarity_target_image_edit_part",
-    "cell_path",
-]
+CSV_FIELDS: List[str] = list(ID_TO_METRICS_FIELDS)
 
 
 """

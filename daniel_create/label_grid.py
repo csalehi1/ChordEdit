@@ -3,14 +3,15 @@
 Reads the cells written by generate_grid.py, scores every cell with two metrics
 copied from /data/home/mirick/PnPInversion, and writes:
 
-    <output-root>/result.csv                 (or result_shard<NN>.csv when sharded)
-    <output-root>/<sample_id>/grid_psnr.png  whole-image PSNR overlay
-    <output-root>/<sample_id>/grid_clip.png  mask-restricted CLIP-edited overlay
+    <output-root>/id_to_metrics_<suffix>.csv
+    <output-root>/result.csv                 (or result_shard<NN>.csv when sharded; intermediate)
+    <output-root>/<sample_id>/grid_psnr.png  (only with --overview-grids)
+    <output-root>/<sample_id>/grid_clip.png  (only with --overview-grids)
 
 Metrics (inlined so everything runs in the chordedit env):
-  psnr                                    whole-image PSNR, source vs. edited.
-  clip_similarity_target_image_edit_part  CLIP similarity (100 * cosine) of the
-                                          masked edit region to the target prompt.
+  whole_psnr   whole-image PSNR, source vs. edited.
+  clip_edited  CLIP similarity (100 * cosine) of the masked edit region to the
+               target prompt.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from common import (
     ensure_dir,
     load_mask,
     load_samples,
+    relative_cell_path,
     resolve_under,
     strip_brackets,
     write_id_to_metrics,
@@ -95,12 +97,13 @@ class InlineMetrics:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", default=settings.DEFAULT_DATA_ROOT, help="Dataset root (for source images + masks).")
-    parser.add_argument("--output-root", default=settings.DEFAULT_OUTPUT_ROOT, help="Where generated cells live and result.csv goes.")
+    parser.add_argument("--output-root", default=settings.DEFAULT_OUTPUT_ROOT, help="Where generated cells live and metrics CSV goes.")
     parser.add_argument("--chord-edit-mode", choices=["default", "sym"], default=settings.CHORD_EDIT_MODE)
     parser.add_argument("--clip-model", default=settings.CLIP_MODEL_ID, help="CLIP model id for the edit-part metric.")
     parser.add_argument("--device", default=None, help="Torch device, e.g. cuda:0 or cpu.")
     parser.add_argument("--max-samples", type=int, default=None, help="Only score the first N samples (per shard).")
     parser.add_argument("--overwrite", action="store_true", help="Re-score samples already present in a result CSV.")
+    parser.add_argument("--overview-grids", action="store_true", help="Also write grid_psnr.png / grid_clip.png overlays.")
     parser.add_argument("--num-shards", type=int, default=1, help="Split samples across this many GPU workers.")
     parser.add_argument("--shard", type=int, default=0, help="Which shard this process handles (0-based).")
     args = parser.parse_args()
@@ -227,25 +230,25 @@ def main() -> None:
         rows = [
             {
                 "sample_id": sample_id,
-                "category": category,
                 "t_start": t_start,
                 "t_end": t_end,
                 "t_delta": t_delta,
                 "psnr": psnr,
                 "clip_similarity_target_image_edit_part": clip_edit,
-                "cell_path": str(cell_path),
+                "cell_path": relative_cell_path(sample_id, t_start, t_end),
             }
-            for (t_start, t_end, cell_path), psnr, clip_edit in zip(cell_specs, psnr_list, clip_list)
+            for (t_start, t_end, _cell_path), psnr, clip_edit in zip(cell_specs, psnr_list, clip_list)
         ]
         writer.writerows(rows)
         csv_file.flush()
 
-        title = f'{sample_id} ({category})\nSource: "{source_prompt}"\nTarget: "{target_prompt}"'
-        scores_by_metric = {
-            "grid_psnr.png": ("Whole PSNR", "psnr", _finite_scores(rows, "psnr")),
-            "grid_clip.png": ("CLIP-Edited", "clip", _finite_scores(rows, "clip_similarity_target_image_edit_part")),
-        }
-        save_metric_grids(cells_dir, output_root / sample_id, values, t_delta, title, scores_by_metric)
+        if args.overview_grids:
+            title = f'{sample_id} ({category})\nSource: "{source_prompt}"\nTarget: "{target_prompt}"'
+            scores_by_metric = {
+                "grid_psnr.png": ("Whole PSNR", "psnr", _finite_scores(rows, "whole_psnr")),
+                "grid_clip.png": ("CLIP-Edited", "clip", _finite_scores(rows, "clip_edited")),
+            }
+            save_metric_grids(cells_dir, output_root / sample_id, values, t_delta, title, scores_by_metric)
         LOGGER.info("[%d/%d] Scored %s (%d cells)", index, len(samples), sample_id, len(rows))
 
     # Close the CSV file.

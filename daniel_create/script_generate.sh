@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Generate the entire t_start by t_end image set for every source image in the
 # dataset. Shards the sample list across GPUs (one process per GPU, disjoint
-# round-robin slices); each shard writes cells + grid_clean under OUTPUT_ROOT.
+# round-robin slices); each shard writes cells under OUTPUT_ROOT.
+# Pass OVERVIEW_GRIDS=1 to also write grid_clean.png overviews.
 #
 # GPUS is required and must be set explicitly. Usage:
 #   GPUS="0 1 2 3" bash daniel_create/script_generate.sh
 #   GPUS="0 1 2 3 4 5 6 7" bash daniel_create/script_generate.sh
 #   MAX_SAMPLES=10 GPUS="0" bash daniel_create/script_generate.sh
+#   OVERVIEW_GRIDS=1 GPUS="0" bash daniel_create/script_generate.sh
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,6 +27,7 @@ PY="${PY:-/data/home/mirick/miniconda3/envs/chordedit/bin/python}"
 
 EXTRA_ARGS=()
 [[ -n "${MAX_SAMPLES:-}" ]] && EXTRA_ARGS+=(--max-samples "${MAX_SAMPLES}")
+[[ -n "${OVERVIEW_GRIDS:-}" ]] && EXTRA_ARGS+=(--overview-grids)
 
 read -ra GPU_ARR <<< "${GPUS}"
 NUM_SHARDS="${#GPU_ARR[@]}"

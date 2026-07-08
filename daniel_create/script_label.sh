@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Label (score) an entire already-generated image set with PSNR + CLIP metrics.
-# Shards the sample list across GPUs; each shard writes result_shard<NN>.csv plus
-# grid_psnr/grid_clip overlays, then the shard CSVs are merged into result.csv.
+# Shards the sample list across GPUs; each shard writes result_shard<NN>.csv, then
+# the shard CSVs are merged and published as id_to_metrics_<suffix>.csv.
+# Pass OVERVIEW_GRIDS=1 to also write grid_psnr/grid_clip overlays.
 #
 # Run script_generate.sh first. GPUS is required and must be set explicitly. Usage:
 #   GPUS="0 1 2 3" bash daniel_create/script_label.sh
 #   GPUS="0 1 2 3 4 5 6 7" bash daniel_create/script_label.sh
 #   MAX_SAMPLES=10 GPUS="0" bash daniel_create/script_label.sh
+#   OVERVIEW_GRIDS=1 GPUS="0" bash daniel_create/script_label.sh
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,6 +26,7 @@ PY="${PY:-/data/home/mirick/miniconda3/envs/chordedit/bin/python}"
 
 EXTRA_ARGS=()
 [[ -n "${MAX_SAMPLES:-}" ]] && EXTRA_ARGS+=(--max-samples "${MAX_SAMPLES}")
+[[ -n "${OVERVIEW_GRIDS:-}" ]] && EXTRA_ARGS+=(--overview-grids)
 
 read -ra GPU_ARR <<< "${GPUS}"
 NUM_SHARDS="${#GPU_ARR[@]}"

@@ -3,8 +3,9 @@
 For each sample in <data-root>/mapping_file.json this generates the full
 GRID_VALUES x GRID_VALUES set of cells (factorized fast path) and writes:
 
+    <output-root>/id_to_inputs_<suffix>.csv
     <output-root>/<sample_id>/cells/t_start_<..>__t_end_<..>.jpg
-    <output-root>/<sample_id>/grid_clean.png
+    <output-root>/<sample_id>/grid_clean.png   (only with --overview-grids)
 
 No metrics are computed here (that is label_grid.py's job). Samples whose cells
 already exist are skipped unless --overwrite is given, so runs are resumable and
@@ -28,7 +29,6 @@ from common import (
     strip_brackets,
     resolve_under,
     write_id_to_inputs,
-    write_id_to_prompts,
 )
 from grid_render import save_clean_grid
 from pipeline_ops import run_factorized_grid
@@ -40,12 +40,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", default=settings.DEFAULT_DATA_ROOT, help="Dataset root (PIE-Bench / UltraEdit style).")
     parser.add_argument("--model-root", default=settings.DEFAULT_MODEL_ROOT, help="SD component root.")
-    parser.add_argument("--output-root", default=settings.DEFAULT_OUTPUT_ROOT, help="Where cells + grid_clean go.")
+    parser.add_argument("--output-root", default=settings.DEFAULT_OUTPUT_ROOT, help="Where cells go.")
     parser.add_argument("--chord-edit-mode", choices=["default", "sym"], default=settings.CHORD_EDIT_MODE)
     parser.add_argument("--device", default=None, help="Torch device, e.g. cuda:0 or cpu.")
     parser.add_argument("--seed", type=int, default=settings.SEED)
     parser.add_argument("--max-samples", type=int, default=None, help="Only process the first N samples (per shard).")
     parser.add_argument("--overwrite", action="store_true", help="Regenerate cells even if they already exist.")
+    parser.add_argument("--overview-grids", action="store_true", help="Also write grid_clean.png overview images.")
     parser.add_argument("--num-shards", type=int, default=1, help="Split samples across this many GPU workers.")
     parser.add_argument("--shard", type=int, default=0, help="Which shard this process handles (0-based).")
     args = parser.parse_args()
@@ -78,11 +79,9 @@ def main() -> None:
     output_root = Path(args.output_root).expanduser().resolve()
     ensure_dir(output_root)
 
-    # Ship every save folder with a sample_id -> prompts lookup table. Only shard 0
-    # writes it (all shards would otherwise race on the same full-dataset file).
+    # Ship every save folder with sample_id -> inputs. Only shard 0 writes it
+    # (all shards would otherwise race on the same full-dataset file).
     if args.shard == 0:
-        dest = write_id_to_prompts(output_root, data_root, mapping_path)
-        LOGGER.info("Wrote %s", dest)
         dest = write_id_to_inputs(output_root, data_root, mapping_path)
         LOGGER.info("Wrote %s", dest)
 
@@ -146,9 +145,9 @@ def main() -> None:
                 cell = cells[(t_start, t_end)].convert("RGB").resize((settings.IMAGE_SIZE, settings.IMAGE_SIZE))
                 cell.save(cells_dir / cell_filename(t_start, t_end), quality=settings.JPEG_QUALITY)
 
-        # Save the clean grid.
-        title = (f"{sample_id} ({category})\n" f'Source: "{source_prompt}"\n' f'Target: "{target_prompt}"')
-        save_clean_grid(cells_dir, output_root / sample_id / "grid_clean.png", values, t_delta, title)
+        if args.overview_grids:
+            title = (f"{sample_id} ({category})\n" f'Source: "{source_prompt}"\n' f'Target: "{target_prompt}"')
+            save_clean_grid(cells_dir, output_root / sample_id / "grid_clean.png", values, t_delta, title)
         LOGGER.info("[%d/%d] Generated %s (%d cells)", index, len(samples), sample_id, len(values) ** 2)
 
     LOGGER.info("Done. Images in %s", output_root)

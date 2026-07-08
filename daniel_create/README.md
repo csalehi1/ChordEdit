@@ -1,33 +1,26 @@
 # daniel_create
 
-Self-contained tools to generate and label ChordEdit `t_start` by `t_end` image grids over a PIE-Bench style dataset. Generation and labeling are split into two independent stages that share cell images on disk.
-
-## Layout
-
-| File | Purpose |
-| --- | --- |
-| `settings.py` | All config: paths, grid values, edit configs, CLIP model, plot constants. |
-| `common.py` | Shared helpers: paths, dataset/mask loading, pipeline loader. |
-| `pipeline_ops.py` | Factorized grid generation (optimized `u_estimate` + batched cleanup/decode). |
-| `grid_render.py` | Builds `grid_clean` / `grid_psnr` / `grid_clip` composites. |
-| `generate_grid.py` | Entry point: generate the entire image set. |
-| `label_grid.py` | Entry point: score + label an entire generated image set. |
-| `script_generate.sh` | Generate the entire image set (multi-GPU sharded). |
-| `script_label.sh` | Label a generated image set with PSNR + CLIP (sharded, merges CSVs). |
-| `script_both.sh` | Run both stages end to end. |
-| `DESIGN.md` | Optimizations behind generation and labeling. |
+Tools to generate and label ChordEdit `t_start` by `t_end` image grids over a PIE-Bench style dataset. Generation and labeling are split into two independent stages that share cell images on disk.
 
 ## Output layout
 
 ```
 <output-root>/
-  id_to_prompts.csv                   # sample_id -> source image path + prompts
-  result.csv                          # merged PSNR + CLIP scores
+  id_to_inputs_<suffix>.csv
+  id_to_metrics_<suffix>.csv
   <sample_id>/
-    grid_clean.png                    # labeled images
-    grid_psnr.png  grid_clip.png      # metric overlays
+    grid_clean.png             # only with --overview-grids
+    grid_psnr.png  grid_clip.png  # only with --overview-grids
     cells/t_start_<..>__t_end_<..>.jpg
 ```
+
+`<suffix>` is the output directory stem in lowercase with underscores removed
+(e.g. `UltraEdit_Region_1000` → `ultraeditregion1000`).
+
+`id_to_inputs_*.csv` columns: `sample_id,source_prompt,target_prompt,image_path,mask_image_path`
+
+`id_to_metrics_*.csv` columns: `sample_id,t_start,t_end,t_delta,whole_psnr,clip_edited,cell_path`
+(`cell_path` is relative to the CSV, e.g. `00000000/cells/t_start_0p9__t_end_0p3.jpg`)
 
 ## Usage
 
@@ -43,6 +36,9 @@ GPUS="0 1 2 3" bash daniel_create/script_both.sh
 GPUS="0 1 2 3" bash daniel_create/script_generate.sh
 GPUS="0 1 2 3" bash daniel_create/script_label.sh
 
+# Also write overview images (grid_clean / grid_psnr / grid_clip).
+OVERVIEW_GRIDS=1 GPUS="0 1 2 3" bash daniel_create/script_both.sh
+
 # Run scripts on more GPUs.
 GPUS="0 1 2 3 4 5 6 7" bash daniel_create/script_both.sh
 # Smoke test with 10 image samples on one GPU.
@@ -54,6 +50,9 @@ The Python entry points can also be called directly (see `--help`):
 ```bash
 python daniel_create/generate_grid.py --data-root ... --output-root ... --device cuda:0
 python daniel_create/label_grid.py  --data-root ... --output-root ... --device cuda:0
+# Optional overview images:
+python daniel_create/generate_grid.py ... --overview-grids
+python daniel_create/label_grid.py  ... --overview-grids
 ```
 
 ## Datasets
@@ -68,6 +67,6 @@ another dataset's naming.
 `label_grid.py` inlines two PnPInversion metrics so everything runs in the
 `chordedit` env:
 
-- `psnr` — whole-image PSNR (source vs. edited, `data_range=1.0`).
-- `clip_similarity_target_image_edit_part` — CLIP similarity (`100 × cosine`) of
-  the masked edit region to the target prompt.
+- `whole_psnr` — whole-image PSNR (source vs. edited, `data_range=1.0`).
+- `clip_edited` — CLIP similarity (`100 × cosine`) of the masked edit region to
+  the target prompt.
