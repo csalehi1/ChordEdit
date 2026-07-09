@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 import settings
 from data_io import build_tensors, load_data, precompute_embeddings
-from _helpers import split_data_by_sample
+from _helpers import combined_score_bounds_from_df, split_data_by_sample, target_metric_torch
 from model_m import MetricPredictor
 from settings import *
 
@@ -48,28 +48,22 @@ def _loader(tensors: tuple[torch.Tensor, ...], shuffle: bool) -> DataLoader:
     return DataLoader(TensorDataset(*tensors), batch_size=BATCH_SIZE, shuffle=shuffle)
 
 
-def _scalarize_raw(pred: torch.Tensor, stats: tuple[float, float, float, float]) -> torch.Tensor:
-    # Collapse denormalized (psnr, clip) into scalar m for ranking loss.
-    pm, ps, cm, cs = stats
-    zp = (pred[:, 0] - pm) / ps
-    zc = (pred[:, 1] - cm) / cs
-    return W_PSNR * zp + W_CLIP * zc
-
-
 def _ranking_loss(
     out_std: torch.Tensor,
     y_std: torch.Tensor,
     sample_idx: torch.Tensor,
     mean: torch.Tensor,
     std: torch.Tensor,
-    scalar_stats: tuple[float, float, float, float],
+    bounds: tuple[float, float, float, float],
 ) -> torch.Tensor:
     """Pairwise hinge loss: predicted m order should match true m within each sample."""
-    # De-standardize so scalarization uses raw metric units.
+    from _helpers import CombinedScoreBounds
+
+    b = CombinedScoreBounds(*bounds)
     pred = out_std * std + mean
     true = y_std * std + mean
-    m_pred = _scalarize_raw(pred, scalar_stats)
-    m_true = _scalarize_raw(true, scalar_stats)
+    m_pred = target_metric_torch(pred, b)
+    m_true = target_metric_torch(true, b)
     losses = []
     # Group batch rows by sample_id for within-grid pairwise comparisons.
     for sid in sample_idx.unique():
@@ -108,7 +102,7 @@ def evaluate(model, loader, device) -> dict[str, float]:
     true = torch.cat(trues)
     err = pred - true
     metrics: dict[str, float] = {"loss": loss_sum / n}
-    for i, col in enumerate(TARGET_COLS):
+    for i, col in enumerate(M_TARGET_COLS):
         e = err[:, i]
         ss_res = (e ** 2).sum()
         ss_tot = ((true[:, i] - true[:, i].mean()) ** 2).sum().clamp(min=1e-12)
@@ -122,7 +116,7 @@ def _fmt(m: dict[str, float]) -> str:
     # Format evaluation metrics as a single log line.
     return f"loss={m['loss']:.4f}  " + "  ".join(
         f"{col}: MAE={m[f'mae_{col}']:.3f} R2={m[f'r2_{col}']:.3f}"
-        for col in TARGET_COLS
+        for col in M_TARGET_COLS
     )
 
 
@@ -166,18 +160,19 @@ def train(run_dir: Path | None = None) -> tuple[MetricPredictor, Path]:
     y_train = train_t[4]
     if NORMALIZE_TARGETS:
         model.regressor.set_target_stats(y_train.mean(0), y_train.std(0))
-    scalar_stats = (
-        float(y_train[:, 0].mean()),
-        float(y_train[:, 0].std().clamp(min=1e-8)),
-        float(y_train[:, 1].mean()),
-        float(y_train[:, 1].std().clamp(min=1e-8)),
+    combined_score_bounds = combined_score_bounds_from_df(train_df)
+    bounds_tuple = (
+        combined_score_bounds.psnr_min,
+        combined_score_bounds.psnr_max,
+        combined_score_bounds.clip_min,
+        combined_score_bounds.clip_max,
     )
     print(
         "Target stats (train):  "
         + "  ".join(
-            f"{TARGET_LABELS[c]}: mean={model.regressor.target_mean[i]:.3f} "
+            f"{M_TARGET_LABELS[c]}: mean={model.regressor.target_mean[i]:.3f} "
             f"std={model.regressor.target_std[i]:.3f}"
-            for i, c in enumerate(TARGET_COLS)
+            for i, c in enumerate(M_TARGET_COLS)
         )
     )
 
@@ -201,7 +196,7 @@ def train(run_dir: Path | None = None) -> tuple[MetricPredictor, Path]:
             # Optional ranking loss aligns M with T's argmax objective.
             if RANKING_LOSS_WEIGHT > 0:
                 loss = loss + RANKING_LOSS_WEIGHT * _ranking_loss(
-                    out, y_std, sample_idx, mean, std, scalar_stats
+                    out, y_std, sample_idx, mean, std, bounds_tuple
                 )
             optimizer.zero_grad()
             loss.backward()
@@ -218,10 +213,10 @@ def train(run_dir: Path | None = None) -> tuple[MetricPredictor, Path]:
                     "regressor_state_dict": model.regressor.state_dict(),
                     "target_mean": model.regressor.target_mean.cpu(),
                     "target_std": model.regressor.target_std.cpu(),
-                    "target_cols": list(TARGET_COLS),
+                    "target_cols": list(M_TARGET_COLS),
                     "img_dim": model.image_encoder.hidden_dim,
                     "text_dim": model.text_encoder.hidden_dim,
-                    "scalar_stats": scalar_stats,
+                    "combined_score_bounds": bounds_tuple,
                     "config": {
                         k: (str(v) if isinstance(v, Path) else v)
                         for k, v in vars(settings).items()

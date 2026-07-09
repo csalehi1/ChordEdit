@@ -31,10 +31,17 @@ import torch
 from scipy.stats import spearmanr
 
 from data_io import df_to_metric_grids, precompute_embeddings
-from _helpers import resolve_device
+from _helpers import CombinedScoreBounds, combined_score_bounds_from_df, resolve_device
 from model_m import MetricPredictor
-from settings import DEFAULT_T_END, DEFAULT_T_START, NOISE_FLOOR_M, OUTPUTS_DIR
-from model_t import ScalarStats, TimestepPredictor, scalarize
+from settings import (
+    CLIP_COL,
+    DEFAULT_T_END,
+    DEFAULT_T_START,
+    NOISE_FLOOR_M,
+    OUTPUTS_DIR,
+    PSNR_COL,
+)
+from model_t import TimestepPredictor, scalarize
 
 
 def _resolve_run_dir(run_dir: Path | None) -> Path:
@@ -50,17 +57,11 @@ def _resolve_run_dir(run_dir: Path | None) -> Path:
     return candidates[-1]
 
 
-def _scalar_stats_from_ckpt(ckpt: dict, test_df: pd.DataFrame) -> ScalarStats:
-    # Prefer stats saved during m_train; fall back to test-split moments.
-    if "scalar_stats" in ckpt:
-        pm, ps, cm, cs = ckpt["scalar_stats"]
-        return ScalarStats(float(pm), float(ps), float(cm), float(cs))
-    return ScalarStats(
-        float(test_df["psnr"].mean()),
-        float(test_df["psnr"].std() or 1e-8),
-        float(test_df["clip"].mean()),
-        float(test_df["clip"].std() or 1e-8),
-    )
+def _bounds_from_ckpt(ckpt: dict, test_df: pd.DataFrame) -> CombinedScoreBounds:
+    if "combined_score_bounds" in ckpt:
+        pmn, pmx, cmn, cmx = ckpt["combined_score_bounds"]
+        return CombinedScoreBounds(float(pmn), float(pmx), float(cmn), float(cmx))
+    return combined_score_bounds_from_df(test_df)
 
 
 def _per_image_spearman(true_grid: np.ndarray, pred_grid: np.ndarray) -> np.ndarray:
@@ -134,21 +135,21 @@ def train(
     model.regressor.to(device).eval()
 
     # Build T wrapper around the loaded M checkpoint.
-    stats = _scalar_stats_from_ckpt(ckpt, test_df)
+    bounds = _bounds_from_ckpt(ckpt, test_df)
     t_predictor = TimestepPredictor(
         model,
         t_start_values=t_start_values,
         t_end_values=t_end_values,
-        scalar_stats=stats,
+        scalar_stats=bounds,
     )
     default_i = t_predictor._default_i
     default_j = t_predictor._default_j
     nf = NOISE_FLOOR_M if noise_floor is None else noise_floor
 
     emb = precompute_embeddings(test_df.drop_duplicates("sample_id"), model, device)
-    true_psnr, _ = df_to_metric_grids(test_df, sample_ids, t_start_values, t_end_values, "psnr")
-    true_clip, _ = df_to_metric_grids(test_df, sample_ids, t_start_values, t_end_values, "clip")
-    true_m = scalarize(true_psnr, true_clip, stats)
+    true_psnr, _ = df_to_metric_grids(test_df, sample_ids, t_start_values, t_end_values, PSNR_COL)
+    true_clip, _ = df_to_metric_grids(test_df, sample_ids, t_start_values, t_end_values, CLIP_COL)
+    true_m = scalarize(true_psnr, true_clip, bounds)
 
     # Batched grid forward + gated selection per test image.
     pred_psnr = np.zeros_like(true_psnr)
@@ -183,11 +184,11 @@ def train(
         "regret_p90": float(np.percentile(reg, 90)),
         "spearman_m_median": float(np.nanmedian(rho_m)),
         "gate": gate,
-        "scalar_stats": {
-            "psnr_mean": stats.psnr_mean,
-            "psnr_std": stats.psnr_std,
-            "clip_mean": stats.clip_mean,
-            "clip_std": stats.clip_std,
+        "combined_score_bounds": {
+            "psnr_min": bounds.psnr_min,
+            "psnr_max": bounds.psnr_max,
+            "clip_min": bounds.clip_min,
+            "clip_max": bounds.clip_max,
         },
         "default_t_start": DEFAULT_T_START,
         "default_t_end": DEFAULT_T_END,

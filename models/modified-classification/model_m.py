@@ -156,7 +156,7 @@ class MetricRegressor(nn.Module):
         self,
         img_dim: int,
         text_dim: int,
-        n_targets: int = len(TARGET_COLS),
+        n_targets: int = len(M_TARGET_COLS),
         img_proj_dim: int = IMG_PROJ_DIM,
         text_proj_dim: int = TEXT_PROJ_DIM,
         t_proj_dim: int = T_PROJ_DIM,

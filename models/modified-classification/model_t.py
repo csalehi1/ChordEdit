@@ -15,24 +15,14 @@ import numpy as np
 import torch
 
 from model_m import MetricPredictor
-from _helpers import resolve_device
+from _helpers import CombinedScoreBounds, resolve_device, target_metric_arrays
 from settings import (
     DEFAULT_T_END,
     DEFAULT_T_START,
     GRID_T_END,
     GRID_T_START,
     NOISE_FLOOR_M,
-    W_CLIP,
-    W_PSNR,
 )
-
-
-@dataclass(frozen=True)
-class ScalarStats:
-    psnr_mean: float
-    psnr_std: float
-    clip_mean: float
-    clip_std: float
 
 
 @dataclass
@@ -58,18 +48,10 @@ class TimestepSelection:
 def scalarize(
     psnr: np.ndarray,
     clip: np.ndarray,
-    stats: ScalarStats | None = None,
-    w_psnr: float = W_PSNR,
-    w_clip: float = W_CLIP,
+    stats: CombinedScoreBounds | None = None,
 ) -> np.ndarray:
-    """Combine PSNR and CLIP into scalar m (z-scored, weighted sum)."""
-    if stats is None:
-        zp = (psnr - psnr.mean()) / psnr.std()
-        zc = (clip - clip.mean()) / clip.std()
-    else:
-        zp = (psnr - stats.psnr_mean) / stats.psnr_std
-        zc = (clip - stats.clip_mean) / stats.clip_std
-    return w_psnr * zp + w_clip * zc
+    """Combine PSNR and CLIP via settings.T_TARGET_FUNC (min-max weighted score)."""
+    return target_metric_arrays(psnr, clip, bounds=stats)
 
 
 def _nearest_index(values: np.ndarray, target: float) -> int:
@@ -84,7 +66,7 @@ class TimestepPredictor:
         metric_predictor: MetricPredictor,
         t_start_values: tuple[float, ...] | list[float] | np.ndarray = GRID_T_START,
         t_end_values: tuple[float, ...] | list[float] | np.ndarray = GRID_T_END,
-        scalar_stats: ScalarStats | None = None,
+        scalar_stats: CombinedScoreBounds | None = None,
         default_t_start: float = DEFAULT_T_START,
         default_t_end: float = DEFAULT_T_END,
     ):
@@ -182,7 +164,7 @@ class TimestepPredictor:
 def load_timestep_predictor(
     weights_path: Path | str,
     device: torch.device | str | None = None,
-    scalar_stats: ScalarStats | None = None,
+    scalar_stats: CombinedScoreBounds | None = None,
     gpu: int | str | None = None,
 ) -> TimestepPredictor:
     """Load M checkpoint and wrap with T."""
@@ -195,7 +177,10 @@ def load_timestep_predictor(
     model.regressor.set_target_stats(ckpt["target_mean"], ckpt["target_std"])
     model.regressor.to(device).eval()
     # Restore scalarization stats saved during m_train.py when available.
-    if scalar_stats is None and "scalar_stats" in ckpt:
-        pm, ps, cm, cs = ckpt["scalar_stats"]
-        scalar_stats = ScalarStats(float(pm), float(ps), float(cm), float(cs))
+    if scalar_stats is None and "combined_score_bounds" in ckpt:
+        pmn, pmx, cmn, cmx = ckpt["combined_score_bounds"]
+        scalar_stats = CombinedScoreBounds(float(pmn), float(pmx), float(cmn), float(cmx))
+    elif scalar_stats is None and "scalar_stats" in ckpt:
+        # Legacy checkpoints stored z-score stats; fall back to per-grid bounds.
+        scalar_stats = None
     return TimestepPredictor(model, scalar_stats=scalar_stats)

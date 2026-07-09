@@ -2,9 +2,83 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
 import torch
+
+from settings import CLIP_COL, PSNR_COL, T_TARGET_FUNC
+
+
+@dataclass(frozen=True)
+class CombinedScoreBounds:
+    psnr_min: float
+    psnr_max: float
+    clip_min: float
+    clip_max: float
+
+
+def combined_score_bounds_from_df(
+    df: pd.DataFrame,
+    psnr_col: str = PSNR_COL,
+    clip_col: str = CLIP_COL,
+) -> CombinedScoreBounds:
+    return CombinedScoreBounds(
+        float(df[psnr_col].min()),
+        float(df[psnr_col].max()),
+        float(df[clip_col].min()),
+        float(df[clip_col].max()),
+    )
+
+
+def combined_score_bounds_from_arrays(
+    psnr: np.ndarray,
+    clip: np.ndarray,
+) -> CombinedScoreBounds:
+    return CombinedScoreBounds(
+        float(np.nanmin(psnr)),
+        float(np.nanmax(psnr)),
+        float(np.nanmin(clip)),
+        float(np.nanmax(clip)),
+    )
+
+
+def _scalarize_with_bounds(
+    psnr: np.ndarray,
+    clip: np.ndarray,
+    bounds: CombinedScoreBounds,
+) -> np.ndarray:
+    """Fixed-bounds scalarization matching T_TARGET_FUNC default weights (0.5/0.5)."""
+    eps = 1e-8
+    psnr_n = (psnr - bounds.psnr_min) / (bounds.psnr_max - bounds.psnr_min + eps)
+    clip_n = (clip - bounds.clip_min) / (bounds.clip_max - bounds.clip_min + eps)
+    return (psnr_n + clip_n) / 2.0
+
+
+def target_metric_arrays(
+    psnr: np.ndarray,
+    clip: np.ndarray,
+    bounds: CombinedScoreBounds | None = None,
+) -> np.ndarray:
+    """Apply settings.T_TARGET_FUNC to numpy PSNR/CLIP grids."""
+    if bounds is not None:
+        return _scalarize_with_bounds(psnr, clip, bounds)
+    shape = psnr.shape
+    df = pd.DataFrame({PSNR_COL: psnr.ravel(), CLIP_COL: clip.ravel()})
+    return T_TARGET_FUNC(df).to_numpy().reshape(shape)
+
+
+def target_metric_torch(
+    pred: torch.Tensor,
+    bounds: CombinedScoreBounds,
+) -> torch.Tensor:
+    """Combined score for (N, 2) PSNR/CLIP predictions using fixed train bounds."""
+    psnr = pred[:, 0].detach()
+    clip = pred[:, 1].detach()
+    psnr_n = (psnr - bounds.psnr_min) / (bounds.psnr_max - bounds.psnr_min + 1e-8)
+    clip_n = (clip - bounds.clip_min) / (bounds.clip_max - bounds.clip_min + 1e-8)
+    return (psnr_n + clip_n) / 2.0
 
 
 def mean_pool(last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
