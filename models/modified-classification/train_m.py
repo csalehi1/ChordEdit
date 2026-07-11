@@ -1,7 +1,7 @@
 """
 Train the metric surrogate M:
 
-    M(img_emb, src_emb, tar_emb, t_start, t_end) -> (psnr, clip)
+    M(img_emb, mask_emb, src_emb, tar_emb, t_start, t_end) -> (psnr, clip)
 
 Run from this directory:
 
@@ -29,10 +29,26 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 import settings
-from data_io import build_tensors, load_data, precompute_embeddings
+from data_io import build_tensors, load_metrics, precompute_embeddings
 from _helpers import combined_score_bounds_from_df, split_data_by_sample, target_metric_torch
 from model_m import MetricPredictor
+from run_config import save_run_config
 from settings import *
+
+
+def _settings_snapshot() -> dict:
+    """Serialize upper-case settings for checkpoint metadata (skip unpicklable callables)."""
+    out: dict = {}
+    for k, v in vars(settings).items():
+        if not k.isupper() or k.startswith("_"):
+            continue
+        if callable(v):
+            out[k] = getattr(v, "__name__", repr(v))
+        elif isinstance(v, Path):
+            out[k] = str(v)
+        else:
+            out[k] = v
+    return out
 
 
 def save_splits(splits: dict[str, pd.DataFrame], run_dir: Path) -> None:
@@ -91,8 +107,8 @@ def evaluate(model, loader, device) -> dict[str, float]:
     loss_sum, n = 0.0, 0
     mean, std = model.regressor.target_mean, model.regressor.target_std
     for batch in loader:
-        img, src, tar, t, y = (x.to(device) for x in batch[:5])
-        out = model.regressor(img, src, tar, t)
+        img, mask, src, tar, t, y = (x.to(device) for x in batch[:6])
+        out = model.regressor(img, mask, src, tar, t)
         y_std = (y - mean) / std
         loss_sum += torch.nn.functional.mse_loss(out, y_std, reduction="sum").item()
         n += y.numel()
@@ -126,7 +142,7 @@ def train(run_dir: Path | None = None) -> tuple[MetricPredictor, Path]:
     np.random.seed(SEED)
 
     # Load grid-ablation cells and split by sample_id (full grids stay intact).
-    df = load_data()
+    df = load_metrics()
     train_df, val_df, test_df = split_data_by_sample(
         df, seed=SEED, train_frac=TRAIN_FRAC, val_frac=VAL_FRAC
     )
@@ -137,6 +153,8 @@ def train(run_dir: Path | None = None) -> tuple[MetricPredictor, Path]:
         run_dir = OUTPUTS_DIR / timestamp
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+    config_out = save_run_config(run_dir)
+    print(f"Saved {config_out} ({config_out.stat().st_size / 1024:.1f} KB)")
     save_splits({"train": train_df, "val": val_df, "test": test_df}, run_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -157,7 +175,7 @@ def train(run_dir: Path | None = None) -> tuple[MetricPredictor, Path]:
     test_t = build_tensors(test_df, emb)
 
     # Standardize targets with train-split stats; also save scalar stats for T.
-    y_train = train_t[4]
+    y_train = train_t[5]
     if NORMALIZE_TARGETS:
         model.regressor.set_target_stats(y_train.mean(0), y_train.std(0))
     combined_score_bounds = combined_score_bounds_from_df(train_df)
@@ -189,8 +207,8 @@ def train(run_dir: Path | None = None) -> tuple[MetricPredictor, Path]:
         # Train the regressor on labeled grid cells.
         model.regressor.train()
         for batch in train_loader:
-            img, src, tar, t, y, sample_idx = (x.to(device) for x in batch)
-            out = model.regressor(img, src, tar, t)
+            img, mask, src, tar, t, y, sample_idx = (x.to(device) for x in batch)
+            out = model.regressor(img, mask, src, tar, t)
             y_std = (y - mean) / std
             loss = torch.nn.functional.mse_loss(out, y_std)
             # Optional ranking loss aligns M with T's argmax objective.
@@ -217,11 +235,7 @@ def train(run_dir: Path | None = None) -> tuple[MetricPredictor, Path]:
                     "img_dim": model.image_encoder.hidden_dim,
                     "text_dim": model.text_encoder.hidden_dim,
                     "combined_score_bounds": bounds_tuple,
-                    "config": {
-                        k: (str(v) if isinstance(v, Path) else v)
-                        for k, v in vars(settings).items()
-                        if k.isupper() and not k.startswith("_")
-                    },
+                    "config": _settings_snapshot(),
                 },
                 weights_out,
             )

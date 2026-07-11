@@ -12,20 +12,21 @@ from PIL import Image
 from model_m import MetricPredictor
 from settings import (
     CELL_PATH_COL,
+    IMAGE_PATH_COL,
+    MASK_PATH_COL,
     METRICS_CSV,
     M_TARGET_COLS,
     PSNR_COL,
     SAMPLE_ID_COL,
-    SOURCE_IMAGE_PATH_COL,
     SOURCE_PROMPT_COL,
-    STRINGS_CSV,
+    INPUTS_CSV,
     T_DELTA_COL,
     T_TARGET_COL,
     T_TARGET_FUNC,
     TARGET_PROMPT_COL,
     TARGET_T_DELTA,
-    _DATASET_DIR,
-    _GENERATED_DIR,
+    DATASET_DIR,
+    GENERATED_DIR,
 )
 
 
@@ -37,17 +38,24 @@ def resolve_cell_path(cell_path: str) -> str:
     path = Path(cell_path)
     if path.is_absolute():
         return str(path)
-    return str(_GENERATED_DIR / cell_path.lstrip("/"))
+    return str(GENERATED_DIR / cell_path.lstrip("/"))
 
 
-def resolve_source_path(image_path: str) -> str:
+def resolve_image_path(image_path: str) -> str:
     path = Path(image_path)
     if path.is_absolute():
         return str(path)
-    return str(_DATASET_DIR / image_path)
+    return str(DATASET_DIR / image_path)
 
 
-def load_data(metrics_csv: Path | None = None) -> pd.DataFrame:
+def resolve_mask_path(mask_path: str) -> str:
+    path = Path(mask_path)
+    if path.is_absolute():
+        return str(path)
+    return str(DATASET_DIR / mask_path)
+
+
+def load_metrics(metrics_csv: Path | None = None) -> pd.DataFrame:
     """Load metrics, attach source-image paths and prompts, one row per cell."""
     metrics_csv = metrics_csv or METRICS_CSV
     metrics = pd.read_csv(metrics_csv)
@@ -64,10 +72,17 @@ def load_data(metrics_csv: Path | None = None) -> pd.DataFrame:
         metrics = metrics[metrics[T_DELTA_COL] == TARGET_T_DELTA].copy()
 
     # Merge prompt strings and source-image paths keyed by sample id.
-    strings = pd.read_csv(STRINGS_CSV)
+    strings = pd.read_csv(INPUTS_CSV)
     strings[SAMPLE_ID_COL] = strings[SAMPLE_ID_COL].map(_normalize_sample_id)
-    strings["source_path"] = strings[SOURCE_IMAGE_PATH_COL].map(resolve_source_path)
-    merge_cols = [SAMPLE_ID_COL, SOURCE_PROMPT_COL, TARGET_PROMPT_COL, "source_path"]
+    strings["source_path"] = strings[IMAGE_PATH_COL].map(resolve_image_path)
+    strings["mask_path"] = strings[MASK_PATH_COL].map(resolve_mask_path)
+    merge_cols = [
+        SAMPLE_ID_COL,
+        SOURCE_PROMPT_COL,
+        TARGET_PROMPT_COL,
+        "source_path",
+        "mask_path",
+    ]
     df = pd.merge(
         metrics,
         strings[merge_cols],
@@ -77,6 +92,9 @@ def load_data(metrics_csv: Path | None = None) -> pd.DataFrame:
     if df[SOURCE_PROMPT_COL].isna().any():
         missing = df.loc[df[SOURCE_PROMPT_COL].isna(), SAMPLE_ID_COL].unique()
         raise ValueError(f"No prompt strings found for sample_ids: {missing.tolist()}")
+    if df["mask_path"].isna().any():
+        missing = df.loc[df["mask_path"].isna(), SAMPLE_ID_COL].unique()
+        raise ValueError(f"No mask paths found for sample_ids: {missing.tolist()}")
 
     df["id"] = df[SAMPLE_ID_COL]
 
@@ -96,6 +114,7 @@ def load_data(metrics_csv: Path | None = None) -> pd.DataFrame:
         *M_TARGET_COLS,
         T_TARGET_COL,
         "source_path",
+        "mask_path",
         SOURCE_PROMPT_COL,
         TARGET_PROMPT_COL,
         "labeled",
@@ -106,18 +125,25 @@ def load_data(metrics_csv: Path | None = None) -> pd.DataFrame:
 def precompute_embeddings(
     df: pd.DataFrame, predictor: MetricPredictor, device: torch.device
 ) -> dict[str, dict[str, torch.Tensor]]:
-    """Encode the source image and prompt pair once per sample_id."""
+    """Encode the source image, mask, and prompt pair once per sample_id."""
     samples = df.drop_duplicates(subset=SAMPLE_ID_COL).sort_values(SAMPLE_ID_COL)
     images = [Image.open(p).convert("RGB") for p in samples["source_path"]]
+    masks = [Image.open(p).convert("RGB") for p in samples["mask_path"]]
     src_prompts = samples[SOURCE_PROMPT_COL].tolist()
     tar_prompts = samples[TARGET_PROMPT_COL].tolist()
 
     img_emb = predictor.image_encoder(images).to(device)
+    mask_emb = predictor.image_encoder(masks).to(device)
     src_emb = predictor.text_encoder(src_prompts).to(device)
     tar_emb = predictor.text_encoder(tar_prompts).to(device)
 
     return {
-        sid: {"img": img_emb[i], "src": src_emb[i], "tar": tar_emb[i]}
+        sid: {
+            "img": img_emb[i],
+            "mask": mask_emb[i],
+            "src": src_emb[i],
+            "tar": tar_emb[i],
+        }
         for i, sid in enumerate(samples[SAMPLE_ID_COL].tolist())
     }
 
@@ -125,17 +151,18 @@ def precompute_embeddings(
 def build_tensors(
     df: pd.DataFrame, emb: dict[str, dict[str, torch.Tensor]]
 ) -> tuple[torch.Tensor, ...]:
-    """Assemble per-row (img, src, tar, t, y, sample_idx) tensors."""
+    """Assemble per-row (img, mask, src, tar, t, y, sample_idx) tensors."""
     sample_ids = sorted(df[SAMPLE_ID_COL].unique())
     sid_to_idx = {sid: i for i, sid in enumerate(sample_ids)}
     img = torch.stack([emb[s]["img"] for s in df[SAMPLE_ID_COL]])
+    mask = torch.stack([emb[s]["mask"] for s in df[SAMPLE_ID_COL]])
     src = torch.stack([emb[s]["src"] for s in df[SAMPLE_ID_COL]])
     tar = torch.stack([emb[s]["tar"] for s in df[SAMPLE_ID_COL]])
     t = torch.tensor(df[["t_start", "t_end"]].values, dtype=torch.float)
     y = torch.tensor(df[list(M_TARGET_COLS)].values, dtype=torch.float)
     # sample_idx groups grid rows for within-sample ranking loss.
     sample_idx = torch.tensor([sid_to_idx[s] for s in df[SAMPLE_ID_COL]], dtype=torch.long)
-    return img, src, tar, t, y, sample_idx
+    return img, mask, src, tar, t, y, sample_idx
 
 
 def df_to_metric_grids(

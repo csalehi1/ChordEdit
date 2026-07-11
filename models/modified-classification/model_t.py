@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from model_m import MetricPredictor
+from model_m import MetricPredictor, upgrade_regressor_state_dict
 from _helpers import CombinedScoreBounds, resolve_device, target_metric_arrays
 from settings import (
     DEFAULT_T_END,
@@ -91,6 +91,7 @@ class TimestepPredictor:
     def predict_grid_from_emb(
         self,
         img_emb: torch.Tensor,
+        mask_emb: torch.Tensor,
         src_emb: torch.Tensor,
         tar_emb: torch.Tensor,
     ) -> TimestepGridResult:
@@ -98,6 +99,8 @@ class TimestepPredictor:
         device = self.m.regressor.target_mean.device
         if img_emb.dim() == 1:
             img_emb = img_emb.unsqueeze(0)
+        if mask_emb.dim() == 1:
+            mask_emb = mask_emb.unsqueeze(0)
         if src_emb.dim() == 1:
             src_emb = src_emb.unsqueeze(0)
         if tar_emb.dim() == 1:
@@ -108,10 +111,11 @@ class TimestepPredictor:
         t1, t2 = tt1.reshape(-1), tt2.reshape(-1)
         n_cells = len(t1)
         img = img_emb.expand(n_cells, -1)
+        mask = mask_emb.expand(n_cells, -1)
         src = src_emb.expand(n_cells, -1)
         tar = tar_emb.expand(n_cells, -1)
         t = torch.tensor(np.stack([t1, t2], axis=1), dtype=torch.float, device=device)
-        pred = self.m.predict_metrics_from_emb(img, src, tar, t).cpu().numpy()
+        pred = self.m.predict_metrics_from_emb(img, mask, src, tar, t).cpu().numpy()
         n1, n2 = self.n_start, self.n_end
         psnr = pred[:, 0].reshape(n1, n2)
         clip = pred[:, 1].reshape(n1, n2)
@@ -119,9 +123,9 @@ class TimestepPredictor:
         return TimestepGridResult(psnr, clip, m, self.t_start_values, self.t_end_values)
 
     @torch.no_grad()
-    def predict_grid(self, image, src_prompt: str, tar_prompt: str) -> TimestepGridResult:
-        img_emb, src_emb, tar_emb = self.m.encode(image, src_prompt, tar_prompt)
-        return self.predict_grid_from_emb(img_emb, src_emb, tar_emb)
+    def predict_grid(self, image, mask, src_prompt: str, tar_prompt: str) -> TimestepGridResult:
+        img_emb, mask_emb, src_emb, tar_emb = self.m.encode(image, mask, src_prompt, tar_prompt)
+        return self.predict_grid_from_emb(img_emb, mask_emb, src_emb, tar_emb)
 
     def select_from_grid(self, grid: TimestepGridResult, noise_floor: float = NOISE_FLOOR_M) -> TimestepSelection:
         """Argmax m_grid with deviate-or-default gate."""
@@ -153,12 +157,24 @@ class TimestepPredictor:
     def predict(
         self,
         image,
+        mask,
         src_prompt: str,
         tar_prompt: str,
         noise_floor: float = NOISE_FLOOR_M,
     ) -> TimestepSelection:
-        grid = self.predict_grid(image, src_prompt, tar_prompt)
+        grid = self.predict_grid(image, mask, src_prompt, tar_prompt)
         return self.select_from_grid(grid, noise_floor=noise_floor)
+
+
+def load_model_m(weights_path: Path | str, device: torch.device | str | None = None, gpu: int | str | None = None) -> MetricPredictor:
+    weights_path = Path(weights_path)
+    if device is None:
+        device = resolve_device(gpu)
+    ckpt = torch.load(weights_path, map_location=device, weights_only=False)
+    model = MetricPredictor(freeze_encoders=True, device=device)
+    model.regressor.load_state_dict(upgrade_regressor_state_dict(ckpt["regressor_state_dict"]))
+    model.regressor.set_target_stats(ckpt["target_mean"], ckpt["target_std"])
+    return model
 
 
 def load_timestep_predictor(
@@ -173,7 +189,7 @@ def load_timestep_predictor(
         device = resolve_device(gpu)
     ckpt = torch.load(weights_path, map_location=device, weights_only=False)
     model = MetricPredictor(freeze_encoders=True, device=device)
-    model.regressor.load_state_dict(ckpt["regressor_state_dict"])
+    model.regressor.load_state_dict(upgrade_regressor_state_dict(ckpt["regressor_state_dict"]))
     model.regressor.set_target_stats(ckpt["target_mean"], ckpt["target_std"])
     model.regressor.to(device).eval()
     # Restore scalarization stats saved during m_train.py when available.

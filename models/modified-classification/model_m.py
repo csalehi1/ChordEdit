@@ -1,12 +1,13 @@
 """
 Metric surrogate M.
 
-    M(img_emb, src_emb, tar_emb, t_start, t_end) -> (psnr, clip)
+    M(img_emb, mask_emb, src_emb, tar_emb, t_start, t_end) -> (psnr, clip)
 
 Frozen ChordEdit encoders produce embeddings; a trainable regressor with
 separate PSNR and CLIP towers maps embeddings plus projected timesteps to
-the two metric values. Image/text bottlenecks balance the input; timesteps
-use Fourier features; the CLIP tower is FiLM-conditioned on timestep embeddings.
+the two metric values. Image/mask/text bottlenecks balance the input;
+timesteps use Fourier features; the CLIP tower is FiLM-conditioned on
+timestep embeddings.
 """
 
 from __future__ import annotations
@@ -176,6 +177,11 @@ class MetricRegressor(nn.Module):
             nn.LayerNorm(img_proj_dim),
             nn.ReLU(),
         )
+        self.mask_proj = nn.Sequential(
+            nn.Linear(img_dim, img_proj_dim),
+            nn.LayerNorm(img_proj_dim),
+            nn.ReLU(),
+        )
         self.text_proj = nn.Sequential(
             nn.Linear(text_dim * 4, text_proj_dim),
             nn.LayerNorm(text_proj_dim),
@@ -189,7 +195,7 @@ class MetricRegressor(nn.Module):
             nn.ReLU(),
         )
 
-        context_dim = img_proj_dim + text_proj_dim
+        context_dim = img_proj_dim * 2 + text_proj_dim
         psnr_in = context_dim + t_proj_dim
         self.psnr_body = self._make_body(psnr_in, n_wide, n_hidden, n_inner, dropout_rate)
         self.psnr_head = nn.Linear(n_inner, 1)
@@ -224,12 +230,16 @@ class MetricRegressor(nn.Module):
     def _context_and_t(
         self,
         img_emb: torch.Tensor,
+        mask_emb: torch.Tensor,
         src_emb: torch.Tensor,
         tar_emb: torch.Tensor,
         t: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         text = combine_text_embeddings(src_emb, tar_emb)
-        context = torch.cat([self.img_proj(img_emb), self.text_proj(text)], dim=-1)
+        context = torch.cat(
+            [self.img_proj(img_emb), self.mask_proj(mask_emb), self.text_proj(text)],
+            dim=-1,
+        )
         t_feat = self.t_encoder(fourier_timestep_features(t))
         return context, t_feat
 
@@ -240,12 +250,13 @@ class MetricRegressor(nn.Module):
     def forward(
         self,
         img_emb: torch.Tensor,
+        mask_emb: torch.Tensor,
         src_emb: torch.Tensor,
         tar_emb: torch.Tensor,
         t: torch.Tensor,
     ) -> torch.Tensor:
         """Return standardized metric predictions, shape (N, 2) — [psnr, clip]."""
-        context, t_feat = self._context_and_t(img_emb, src_emb, tar_emb, t)
+        context, t_feat = self._context_and_t(img_emb, mask_emb, src_emb, tar_emb, t)
         psnr = self.psnr_head(self.psnr_body(torch.cat([context, t_feat], dim=-1)))
         clip = self.clip_head(self.clip_body(context, t_feat))
         return torch.cat([psnr, clip], dim=-1)
@@ -253,6 +264,39 @@ class MetricRegressor(nn.Module):
     def denormalize(self, standardized: torch.Tensor) -> torch.Tensor:
         """Map standardized predictions back to raw metric units."""
         return standardized * self.target_std + self.target_mean
+
+
+def upgrade_regressor_state_dict(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Expand pre-mask checkpoints to the current img+mask+text context layout."""
+    if any(k.startswith("mask_proj.") for k in state_dict):
+        return state_dict
+
+    img_d, text_d, t_d = IMG_PROJ_DIM, TEXT_PROJ_DIM, T_PROJ_DIM
+    old_ctx, new_ctx = img_d + text_d, img_d * 2 + text_d
+    sd = dict(state_dict)
+
+    for key, value in list(sd.items()):
+        if key.startswith("img_proj."):
+            sd[key.replace("img_proj.", "mask_proj.", 1)] = value.clone()
+
+    w = sd["psnr_body.0.weight"]
+    nw = w.new_zeros(w.shape[0], new_ctx + t_d)
+    nw[:, :img_d] = w[:, :img_d]
+    nw[:, img_d : 2 * img_d] = w[:, :img_d]
+    nw[:, 2 * img_d : 2 * img_d + text_d] = w[:, img_d : img_d + text_d]
+    nw[:, new_ctx:] = w[:, old_ctx:]
+    sd["psnr_body.0.weight"] = nw
+
+    w = sd["clip_body.blocks.0.linear.weight"]
+    nw = w.new_zeros(w.shape[0], new_ctx)
+    nw[:, :img_d] = w[:, :img_d]
+    nw[:, img_d : 2 * img_d] = w[:, :img_d]
+    nw[:, 2 * img_d :] = w[:, img_d:]
+    sd["clip_body.blocks.0.linear.weight"] = nw
+
+    return sd
 
 
 class MetricPredictor(nn.Module):
@@ -288,30 +332,33 @@ class MetricPredictor(nn.Module):
 
     @torch.no_grad()
     def encode(
-        self, image, src_prompt: str, tar_prompt: str
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return (img_emb, src_emb, tar_emb) each shape (1, D) on regressor device."""
+        self, image, mask, src_prompt: str, tar_prompt: str
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return (img_emb, mask_emb, src_emb, tar_emb) each shape (1, D) on regressor device."""
         device = self.regressor.target_mean.device
         img_emb = self.image_encoder([image]).to(device)
+        mask_emb = self.image_encoder([mask]).to(device)
         src_emb = self.text_encoder([src_prompt]).to(device)
         tar_emb = self.text_encoder([tar_prompt]).to(device)
-        return img_emb, src_emb, tar_emb
+        return img_emb, mask_emb, src_emb, tar_emb
 
     def predict_metrics_from_emb(
         self,
         img_emb: torch.Tensor,
+        mask_emb: torch.Tensor,
         src_emb: torch.Tensor,
         tar_emb: torch.Tensor,
         t: torch.Tensor,
     ) -> torch.Tensor:
         """Predict (psnr, clip) in raw units from precomputed embeddings."""
-        out = self.regressor(img_emb, src_emb, tar_emb, t)
+        out = self.regressor(img_emb, mask_emb, src_emb, tar_emb, t)
         return self.regressor.denormalize(out)
 
     @torch.no_grad()
     def predict(
         self,
         images: list,
+        masks: list,
         src_prompts: list[str],
         tar_prompts: list[str],
         t_start: list[float],
@@ -322,10 +369,11 @@ class MetricPredictor(nn.Module):
         self.eval()
         device = self.regressor.target_mean.device
         img_emb = self.image_encoder(images).to(device)
+        mask_emb = self.image_encoder(masks).to(device)
         src_emb = self.text_encoder(src_prompts).to(device)
         tar_emb = self.text_encoder(tar_prompts).to(device)
         # Combine the two timestep scalars into a single tensor.
         t = torch.tensor(list(zip(t_start, t_end)), dtype=torch.float, device=device)
-        out = self.predict_metrics_from_emb(img_emb, src_emb, tar_emb, t)
+        out = self.predict_metrics_from_emb(img_emb, mask_emb, src_emb, tar_emb, t)
         self.train(training)
         return out

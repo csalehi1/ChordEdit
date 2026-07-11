@@ -159,7 +159,7 @@ def train(
     for sid in sample_ids:
         k = sample_ids.index(sid)
         e = emb[sid]
-        grid = t_predictor.predict_grid_from_emb(e["img"], e["src"], e["tar"])
+        grid = t_predictor.predict_grid_from_emb(e["img"], e["mask"], e["src"], e["tar"])
         pred_psnr[k], pred_clip[k], pred_m[k] = grid.psnr_grid, grid.clip_grid, grid.m_grid
         sel = t_predictor.select_from_grid(grid, noise_floor=nf)
         selections.append(

@@ -10,11 +10,11 @@ Dataset settings.
 """
 
 # NOTE: Set this to the directory containing the generated metrics and strings CSV files.
-_GENERATED_DIR = Path("/shared/ssd_30T/mirick/generated/ultra_edit/UltraEdit_Region_100")
-_DATASET_DIR = Path("/shared/ssd_30T/mirick/datasets/ultra_edit/UltraEdit_Region_100")
+GENERATED_DIR = Path("/shared/ssd_30T/mirick/generated/ultra_edit/UltraEdit_Region_100")
+DATASET_DIR = Path("/shared/ssd_30T/mirick/datasets/ultra_edit/UltraEdit_Region_100")
 
-METRICS_CSV = _GENERATED_DIR / "id_to_metrics_ultraeditregion1000.csv"
-STRINGS_CSV = _GENERATED_DIR / "id_to_inputs_ultraeditregion1000.csv"
+INPUTS_CSV = GENERATED_DIR / "id_to_inputs_ultraeditregion100.csv"
+METRICS_CSV = GENERATED_DIR / "id_to_metrics_ultraeditregion100.csv"
 
 # NOTE: Set this to the directory where the model outputs will be saved.
 OUTPUTS_DIR = Path(__file__).resolve().parent / "outputs/UltraEdit_Region_100"
@@ -25,7 +25,7 @@ if not OUTPUTS_DIR.exists():
 SAMPLE_ID_COL = "sample_id"
 SOURCE_PROMPT_COL = "source_prompt"
 TARGET_PROMPT_COL = "target_prompt"
-SOURCE_IMAGE_PATH_COL = "image_path"
+IMAGE_PATH_COL = "image_path"
 MASK_PATH_COL = "mask_image_path"
 
 # Column names in the id_to_metrics_*.csv file.
@@ -58,7 +58,7 @@ SEED = 42
 M model settings.
 
     Model architecture:
-    M(img_emb, src_emb, tar_emb, t_start, t_end) -> (psnr, clip)
+    M(img_emb, mask_emb, src_emb, tar_emb, t_start, t_end) -> (psnr, clip)
 """
 
 # Regression targets in the loaded dataframe (after PSNR_COL/CLIP_COL rename).
