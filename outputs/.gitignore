@@ -1,6 +1,0 @@
-# Do not track PNGs in outputs/
-*/*
-*.png
-*.jpg
-*.csv
-*

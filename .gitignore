@@ -1,2 +1,4 @@
-*
-!.gitignore
+.gitignore
+scripts/
+outputs/
+*__pycache__*

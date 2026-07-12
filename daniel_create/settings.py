@@ -3,11 +3,8 @@ Shared settings for daniel_create.
 """
 
 from __future__ import annotations
-
 from typing import List
 
-# Dataset default. Output always goes to daniel_create/generated/<Path(data_root).name>/.
-DEFAULT_DATA_ROOT = "/shared/ssd_30T/mirick/datasets/ultra_edit/UltraEdit_Region_1000"
 
 # mapping_file.json field names.
 FIELD_IMAGE_PATH = "image_path"
