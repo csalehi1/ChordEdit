@@ -1,0 +1,2 @@
+# Test script for grid_generate.py: run two GPU shards to generate <--max-samples> samples.
+# python grid_generate.py --data-root /shared/ssd_30T/mirick/datasets/ultra_edit/UltraEdit_Region_100 --output-root /shared/ssd_30T/mirick/generated/ultra_edit --model-root /shared/ssd_30T/mirick/models/sd-turbo --gpus 0 1  --max-samples 4
