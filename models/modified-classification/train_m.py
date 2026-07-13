@@ -5,16 +5,16 @@ Train the metric surrogate M:
 
 Run from this directory:
 
-    python m_train.py
+    python train_m.py
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
 
-# Add the repo root and this package to the Python path.
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_DIR, "..", ".."))
 sys.path.insert(0, _ROOT)
@@ -26,88 +26,44 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, TensorDataset
 
-import settings
-from data_io import build_tensors, load_metrics, precompute_embeddings
-from _helpers import combined_score_bounds_from_df, split_data_by_sample, target_metric_torch
+from _data import (
+    IX_Y,
+    create_dataloaders,
+    load_df,
+    model_inputs,
+    prepare_df,
+    save_splits_df,
+    split_df,
+)
+from _helpers import format_results, save_settings_hash
 from model_m import MetricPredictor
-from run_config import save_run_config
 from settings import *
 
 
-def _settings_snapshot() -> dict:
-    """Serialize upper-case settings for checkpoint metadata (skip unpicklable callables)."""
-    out: dict = {}
-    for k, v in vars(settings).items():
-        if not k.isupper() or k.startswith("_"):
-            continue
-        if callable(v):
-            out[k] = getattr(v, "__name__", repr(v))
-        elif isinstance(v, Path):
-            out[k] = str(v)
-        else:
-            out[k] = v
-    return out
-
-
-def save_splits(splits: dict[str, pd.DataFrame], run_dir: Path) -> None:
-    """Save train/val/test splits to parquet for t_train.py to reuse."""
-    for name, df in splits.items():
-        out = run_dir / f"{name}.parquet.gz"
-        df.to_parquet(out, compression="gzip", index=False)
-        print(f"Saved {out} ({out.stat().st_size / 1024:.1f} KB)")
-
-
-def _loader(tensors: tuple[torch.Tensor, ...], shuffle: bool) -> DataLoader:
-    # Wrap prebuilt tensors in a batched DataLoader.
-    return DataLoader(TensorDataset(*tensors), batch_size=BATCH_SIZE, shuffle=shuffle)
-
-
-def _ranking_loss(
-    out_std: torch.Tensor,
-    y_std: torch.Tensor,
-    sample_idx: torch.Tensor,
-    mean: torch.Tensor,
-    std: torch.Tensor,
-    bounds: tuple[float, float, float, float],
-) -> torch.Tensor:
-    """Pairwise hinge loss: predicted m order should match true m within each sample."""
-    from _helpers import CombinedScoreBounds
-
-    b = CombinedScoreBounds(*bounds)
-    pred = out_std * std + mean
-    true = y_std * std + mean
-    m_pred = target_metric_torch(pred, b)
-    m_true = target_metric_torch(true, b)
-    losses = []
-    # Group batch rows by sample_id for within-grid pairwise comparisons.
-    for sid in sample_idx.unique():
-        mask = sample_idx == sid
-        if mask.sum() < 2:
-            continue
-        mp = m_pred[mask]
-        mt = m_true[mask]
-        for i in range(len(mp)):
-            for j in range(i + 1, len(mp)):
-                if mt[i] == mt[j]:
-                    continue
-                sign = 1.0 if mt[i] > mt[j] else -1.0
-                losses.append(torch.relu(sign * (mp[j] - mp[i])))
-    if not losses:
-        return out_std.new_zeros(())
-    return torch.stack(losses).mean()
+def parse_args() -> argparse.Namespace:
+    # Argument parser for the command line.
+    parser = argparse.ArgumentParser(description="Train metric surrogate M")
+    return parser.parse_args()
 
 
 @torch.no_grad()
-def evaluate(model, loader, device) -> dict[str, float]:
-    """Per-target MAE/RMSE/R² in raw metric units, plus standardized loss."""
+def evaluate(
+    model: MetricPredictor,
+    loader,
+    device: torch.device | None = None,
+) -> dict[str, float]:
+    """Per-target MAE/RMSE/R² in normalized metric units, plus standardized loss."""
+    if device is None:
+        device = next(model.parameters()).device
     model.regressor.eval()
     preds, trues = [], []
     loss_sum, n = 0.0, 0
     mean, std = model.regressor.target_mean, model.regressor.target_std
+
+    # Evaluate the model on the given loader.
     for batch in loader:
-        img, mask, src, tar, t, y = (x.to(device) for x in batch[:6])
+        img, mask, src, tar, t, y = model_inputs(batch, device)
         out = model.regressor(img, mask, src, tar, t)
         y_std = (y - mean) / std
         loss_sum += torch.nn.functional.mse_loss(out, y_std, reduction="sum").item()
@@ -128,63 +84,32 @@ def evaluate(model, loader, device) -> dict[str, float]:
     return metrics
 
 
-def _fmt(m: dict[str, float]) -> str:
-    # Format evaluation metrics as a single log line.
-    return f"loss={m['loss']:.4f}  " + "  ".join(
-        f"{col}: MAE={m[f'mae_{col}']:.3f} R2={m[f'r2_{col}']:.3f}"
-        for col in M_TARGET_COLS
-    )
-
-
-def train(run_dir: Path | None = None) -> tuple[MetricPredictor, Path]:
-    # Set the random seed for reproducibility.
-    torch.manual_seed(SEED)
-    np.random.seed(SEED)
-
-    # Load grid-ablation cells and split by sample_id (full grids stay intact).
-    df = load_metrics()
-    train_df, val_df, test_df = split_data_by_sample(
-        df, seed=SEED, train_frac=TRAIN_FRAC, val_frac=VAL_FRAC
-    )
-
-    # Create a timestamped run directory and persist splits for t_train.py.
-    if run_dir is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = OUTPUTS_DIR / timestamp
-    run_dir = Path(run_dir)
+def train(
+    model: MetricPredictor,
+    train_X: pd.DataFrame,
+    train_y: pd.DataFrame,
+    val_X: pd.DataFrame,
+    val_y: pd.DataFrame,
+    test_X: pd.DataFrame,
+    test_y: pd.DataFrame,
+) -> Path:
+    """Train the metric surrogate model and save run artifacts."""
+    
+    # Create run directory to save information to.
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = OUTPUTS_DIR / timestamp
     run_dir.mkdir(parents=True, exist_ok=True)
-    config_out = save_run_config(run_dir)
-    print(f"Saved {config_out} ({config_out.stat().st_size / 1024:.1f} KB)")
-    save_splits({"train": train_df, "val": val_df, "test": test_df}, run_dir)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(
-        f"Dataset: {len(df)} cells from {df['sample_id'].nunique()} samples "
-        f"(t_delta={TARGET_T_DELTA})  split: train={len(train_df)} / "
-        f"val={len(val_df)} / test={len(test_df)}  device={device}"
+    # Create dataloaders for the train, val, and test sets.
+    train_loader, val_loader, test_loader = create_dataloaders(
+        model, train_X, train_y, val_X, val_y, test_X, test_y
     )
+    y_train = train_loader.dataset.tensors[IX_Y]
+    print(f"Dataset: train={len(train_loader.dataset)} cells val={len(val_loader.dataset)} cells")
 
-    # Create the model; only the regressor MLP is trainable.
-    model = MetricPredictor(freeze_encoders=FREEZE_ENCODERS, device=device)
-    model.regressor.to(device)
-
-    # Encode each (image, prompt pair) once; grid rows reuse cached embeddings.
-    emb = precompute_embeddings(df, model, device)
-    train_t = build_tensors(train_df, emb)
-    val_t = build_tensors(val_df, emb)
-    test_t = build_tensors(test_df, emb)
-
-    # Standardize targets with train-split stats; also save scalar stats for T.
-    y_train = train_t[5]
+    # Normalize the targets if specified.
     if NORMALIZE_TARGETS:
         model.regressor.set_target_stats(y_train.mean(0), y_train.std(0))
-    combined_score_bounds = combined_score_bounds_from_df(train_df)
-    bounds_tuple = (
-        combined_score_bounds.psnr_min,
-        combined_score_bounds.psnr_max,
-        combined_score_bounds.clip_min,
-        combined_score_bounds.clip_max,
-    )
     print(
         "Target stats (train):  "
         + "  ".join(
@@ -194,38 +119,31 @@ def train(run_dir: Path | None = None) -> tuple[MetricPredictor, Path]:
         )
     )
 
-    train_loader = _loader(train_t, shuffle=True)
-    val_loader = _loader(val_t, shuffle=False)
-    test_loader = _loader(test_t, shuffle=False)
-
+    # Initialize the optimizer.
     optimizer = torch.optim.AdamW(model.regressor.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     mean, std = model.regressor.target_mean, model.regressor.target_std
 
+    # Train the model.
     weights_out = run_dir / "regressor_weights.pt"
     best_val = float("inf")
+    device = next(model.parameters()).device
+    print(f"\nTraining for {EPOCHS} epochs...")
     for epoch in range(1, EPOCHS + 1):
-        # Train the regressor on labeled grid cells.
         model.regressor.train()
         for batch in train_loader:
-            img, mask, src, tar, t, y, sample_idx = (x.to(device) for x in batch)
+            img, mask, src, tar, t, y = model_inputs(batch, device)
             out = model.regressor(img, mask, src, tar, t)
             y_std = (y - mean) / std
             loss = torch.nn.functional.mse_loss(out, y_std)
-            # Optional ranking loss aligns M with T's argmax objective.
-            if RANKING_LOSS_WEIGHT > 0:
-                loss = loss + RANKING_LOSS_WEIGHT * _ranking_loss(
-                    out, y_std, sample_idx, mean, std, bounds_tuple
-                )
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
-        train_m = evaluate(model, train_loader, device)
-        val_m = evaluate(model, val_loader, device)
-        improved = val_m["loss"] < best_val
-        # Save the best checkpoint by validation loss.
+        # Evaluate the model on the train and val sets, save the best weights.
+        train_results = evaluate(model, train_loader, device)
+        val_results = evaluate(model, val_loader, device)
+        improved = val_results["loss"] < best_val
         if improved:
-            best_val = val_m["loss"]
+            best_val = val_results["loss"]
             torch.save(
                 {
                     "regressor_state_dict": model.regressor.state_dict(),
@@ -234,29 +152,53 @@ def train(run_dir: Path | None = None) -> tuple[MetricPredictor, Path]:
                     "target_cols": list(M_TARGET_COLS),
                     "img_dim": model.image_encoder.hidden_dim,
                     "text_dim": model.text_encoder.hidden_dim,
-                    "combined_score_bounds": bounds_tuple,
-                    "config": _settings_snapshot(),
                 },
                 weights_out,
             )
-        rank_note = f"  rank_w={RANKING_LOSS_WEIGHT}" if RANKING_LOSS_WEIGHT > 0 else ""
         print(
-            f"Epoch {epoch:03d}  train: {_fmt(train_m)}  | val: {_fmt(val_m)}"
+            f"Epoch {epoch:03d}  train: {format_results(train_results)}  | val: {format_results(val_results)}"
             + ("  *" if improved else "")
-            + rank_note
         )
 
-    # Reload best weights and report held-out test metrics.
-    print(f"\nSaved {weights_out}  (best val loss={best_val:.4f})")
+    # Load the best weights and evaluate the model on the test set.
     ckpt = torch.load(weights_out, map_location=device, weights_only=False)
     model.regressor.load_state_dict(ckpt["regressor_state_dict"])
-    test_m = evaluate(model, test_loader, device)
-    print(f"Test: {_fmt(test_m)}")
+    results = evaluate(model, test_loader, device)
+    print(f"Test: {format_results(results)}")
 
-    with open(run_dir / "m_train_metrics.json", "w") as f:
-        json.dump({"val_best_loss": best_val, "test": test_m}, f, indent=2)
-    return model, run_dir
+    # Save the run directory, splits, and metrics.
+    save_settings_hash(run_dir)
+    save_splits_df(train_X, val_X, test_X, run_dir)
+    metrics_out = run_dir / "m_train_metrics.json"
+    with open(metrics_out, "w") as f:
+        json.dump({"val_best_loss": best_val, "test": results}, f, indent=4)
+    return run_dir
+
+
+def main() -> None:
+
+    # Parse arguments. NOTE: Currently unused.
+    args = parse_args()
+    
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+
+    # For data: load, prepare, and split into train/val/test sets.
+    data_df = load_df()
+    X, y = prepare_df(data_df)
+    train_X, val_X, test_X, train_y, val_y, test_y = split_df(X, y)
+    print(
+        f"Splits: train={len(train_X)} cells ({train_X[SAMPLE_ID_COL].nunique()} samples)  "
+        f"val={len(val_X)} cells ({val_X[SAMPLE_ID_COL].nunique()} samples)  "
+        f"test={len(test_X)} cells ({test_X[SAMPLE_ID_COL].nunique()} samples)"
+    )
+
+    # Initialize and train the model.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = MetricPredictor(device=device).to(device)
+    run_dir = train(model, train_X, train_y, val_X, val_y, test_X, test_y)
+    print(f"\nSaved to {run_dir.resolve()}")
 
 
 if __name__ == "__main__":
-    train()
+    main()

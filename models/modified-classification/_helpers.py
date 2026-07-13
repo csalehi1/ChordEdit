@@ -1,84 +1,57 @@
-"""Shared helpers for the metric-predictor model."""
+"""Shared helpers for model M training and inference."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
 
-from settings import CLIP_COL, PSNR_COL, T_TARGET_FUNC
+from settings import *
+
+_EPS = 1e-8
 
 
-@dataclass(frozen=True)
-class CombinedScoreBounds:
-    psnr_min: float
-    psnr_max: float
-    clip_min: float
-    clip_max: float
+def settings_hash(path: Path | None = None) -> str:
+    path = path or Path(__file__).resolve().parent / "settings.py"
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def combined_score_bounds_from_df(
-    df: pd.DataFrame,
-    psnr_col: str = PSNR_COL,
-    clip_col: str = CLIP_COL,
-) -> CombinedScoreBounds:
-    return CombinedScoreBounds(
-        float(df[psnr_col].min()),
-        float(df[psnr_col].max()),
-        float(df[clip_col].min()),
-        float(df[clip_col].max()),
-    )
+def save_settings_hash(run_dir: Path) -> Path:
+    run_dir = Path(run_dir)
+    out = run_dir / "settings_hash.txt"
+    out.write_text(settings_hash() + "\n", encoding="utf-8")
+    return out
 
 
-def combined_score_bounds_from_arrays(
-    psnr: np.ndarray,
-    clip: np.ndarray,
-) -> CombinedScoreBounds:
-    return CombinedScoreBounds(
-        float(np.nanmin(psnr)),
-        float(np.nanmax(psnr)),
-        float(np.nanmin(clip)),
-        float(np.nanmax(clip)),
-    )
+def check_settings_hash(run_dir: Path) -> None:
+    run_dir = Path(run_dir)
+    path = run_dir / "settings_hash.txt"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Missing {path}. Re-run train_m.py to record settings hash for this run."
+        )
+    saved = path.read_text(encoding="utf-8").strip()
+    live = settings_hash()
+    if saved != live:
+        raise RuntimeError(
+            f"settings.py changed since this run (saved {saved[:12]}…, live {live[:12]}…). "
+            "Re-run train_m.py or revert settings.py."
+        )
 
 
-def _scalarize_with_bounds(
-    psnr: np.ndarray,
-    clip: np.ndarray,
-    bounds: CombinedScoreBounds,
-) -> np.ndarray:
-    """Fixed-bounds scalarization matching T_TARGET_FUNC default weights (0.5/0.5)."""
-    eps = 1e-8
-    psnr_n = (psnr - bounds.psnr_min) / (bounds.psnr_max - bounds.psnr_min + eps)
-    clip_n = (clip - bounds.clip_min) / (bounds.clip_max - bounds.clip_min + eps)
-    return (psnr_n + clip_n) / 2.0
-
-
-def target_metric_arrays(
-    psnr: np.ndarray,
-    clip: np.ndarray,
-    bounds: CombinedScoreBounds | None = None,
-) -> np.ndarray:
-    """Apply settings.T_TARGET_FUNC to numpy PSNR/CLIP grids."""
-    if bounds is not None:
-        return _scalarize_with_bounds(psnr, clip, bounds)
-    shape = psnr.shape
-    df = pd.DataFrame({PSNR_COL: psnr.ravel(), CLIP_COL: clip.ravel()})
-    return T_TARGET_FUNC(df).to_numpy().reshape(shape)
-
-
-def target_metric_torch(
-    pred: torch.Tensor,
-    bounds: CombinedScoreBounds,
-) -> torch.Tensor:
-    """Combined score for (N, 2) PSNR/CLIP predictions using fixed train bounds."""
-    psnr = pred[:, 0].detach()
-    clip = pred[:, 1].detach()
-    psnr_n = (psnr - bounds.psnr_min) / (bounds.psnr_max - bounds.psnr_min + 1e-8)
-    clip_n = (clip - bounds.clip_min) / (bounds.clip_max - bounds.clip_min + 1e-8)
-    return (psnr_n + clip_n) / 2.0
+def resolve_run_dir(outputs_dir: Path, run_dir: Path | None = None) -> Path:
+    if run_dir is not None:
+        run_dir = Path(run_dir)
+        if not run_dir.is_dir():
+            raise FileNotFoundError(f"Run directory not found: {run_dir}")
+        return run_dir
+    candidates = sorted(p for p in Path(outputs_dir).iterdir() if p.is_dir())
+    if not candidates:
+        raise FileNotFoundError(f"No run directories in {outputs_dir}")
+    return candidates[-1]
 
 
 def mean_pool(last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -104,43 +77,95 @@ def resolve_device(gpu: int | str | None = None) -> torch.device:
     return torch.device(f"cuda:{int(gpu)}")
 
 
-def split_data(
-    df: pd.DataFrame, seed: int = 42
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Split df into train/val/test with an 80/10/10 ratio (row-level)."""
-    train = df.sample(frac=0.8, random_state=seed)
-    remaining = df.drop(train.index)
-    val = remaining.sample(frac=0.5, random_state=seed)
-    test = remaining.drop(val.index)
-    return train.reset_index(drop=True), val.reset_index(drop=True), test.reset_index(drop=True)
+def format_results(m: dict[str, float]) -> str:
+    return f"loss={m['loss']:.4f}  " + "  ".join(
+        f"{col}: MAE={m[f'mae_{col}']:.3f} R2={m[f'r2_{col}']:.3f}"
+        for col in M_TARGET_COLS
+    )
 
 
-def split_data_by_sample(
+def normalize_target_columns(
+    y: pd.DataFrame,
+    bounds: dict[str, tuple[float, float]] | None = None,
+) -> pd.DataFrame:
+    y = y.copy()
+    for col in M_TARGET_COLS:
+        if bounds is None:
+            col_min, col_max = np.nanmin(y[col]), np.nanmax(y[col])
+        else:
+            col_min, col_max = bounds[col]
+        y[col] = (y[col] - col_min) / (col_max - col_min + _EPS)
+    return y
+
+
+def unnormalize_target_columns(
+    y: pd.DataFrame,
+    bounds: dict[str, tuple[float, float]],
+) -> pd.DataFrame:
+    y = y.copy()
+    for col in M_TARGET_COLS:
+        col_min, col_max = bounds[col]
+        y[col] = y[col] * (col_max - col_min + _EPS) + col_min
+    return y
+
+
+def scalarize(
+    psnr: np.ndarray,
+    clip: np.ndarray,
+    bounds: dict[str, tuple[float, float]],
+    *,
+    already_normalized: bool = False,
+) -> np.ndarray:
+    """Combine PSNR and CLIP into scalar m using dataset min-max bounds."""
+    if already_normalized:
+        return (np.asarray(psnr, dtype=float) + np.asarray(clip, dtype=float)) / 2.0
+    psnr_n = (np.asarray(psnr, dtype=float) - bounds[PSNR_COL][0]) / (
+        bounds[PSNR_COL][1] - bounds[PSNR_COL][0] + _EPS
+    )
+    clip_n = (np.asarray(clip, dtype=float) - bounds[CLIP_COL][0]) / (
+        bounds[CLIP_COL][1] - bounds[CLIP_COL][0] + _EPS
+    )
+    return (psnr_n + clip_n) / 2.0
+
+
+def add_combined_score(
     df: pd.DataFrame,
-    seed: int = 42,
-    train_frac: float = 0.8,
-    val_frac: float = 0.1,
-    sample_col: str = "sample_id",
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Split by sample_id so each edit triple stays wholly in one split."""
-    if "labeled" in df.columns:
-        df = df[df["labeled"]].copy()
-    sample_ids = sorted(df[sample_col].unique())
-    n = len(sample_ids)
-    rng = np.random.default_rng(seed)
-    perm = list(rng.permutation(sample_ids))
-    n_train = max(1, round(train_frac * n))
-    n_val = max(0, round(val_frac * n))
-    if n_train + n_val >= n:
-        n_val = max(0, min(n_val, n - n_train - 1))
-    train_ids = set(perm[:n_train])
-    val_ids = set(perm[n_train : n_train + n_val])
-    test_ids = set(perm[n_train + n_val :])
-    if not test_ids and n > 1:
-        moved = perm[n_train - 1]
-        train_ids.remove(moved)
-        test_ids.add(moved)
-    train_df = df[df[sample_col].isin(train_ids)].reset_index(drop=True)
-    val_df = df[df[sample_col].isin(val_ids)].reset_index(drop=True)
-    test_df = df[df[sample_col].isin(test_ids)].reset_index(drop=True)
-    return train_df, val_df, test_df
+    bounds: dict[str, tuple[float, float]],
+    *,
+    psnr_col: str = PSNR_COL,
+    clip_col: str = CLIP_COL,
+    out_col: str = T_TARGET_COL,
+    already_normalized: bool = False,
+) -> pd.Series:
+    score = scalarize(
+        df[psnr_col].to_numpy(dtype=float),
+        df[clip_col].to_numpy(dtype=float),
+        bounds,
+        already_normalized=already_normalized,
+    )
+    return pd.Series(score, index=df.index, name=out_col)
+
+
+def prep_sample_id(value) -> str:
+    return f"{int(value):08d}"
+
+
+def resolve_cell_path(cell_path: str) -> str:
+    path = Path(cell_path)
+    if path.is_absolute():
+        return str(path)
+    return str(GENERATED_DIR / cell_path.lstrip("/"))
+
+
+def resolve_image_path(image_path: str) -> str:
+    path = Path(image_path)
+    if path.is_absolute():
+        return str(path)
+    return str(DATASET_DIR / image_path)
+
+
+def resolve_mask_path(mask_path: str) -> str:
+    path = Path(mask_path)
+    if path.is_absolute():
+        return str(path)
+    return str(DATASET_DIR / mask_path)

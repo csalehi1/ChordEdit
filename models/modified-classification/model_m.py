@@ -262,41 +262,8 @@ class MetricRegressor(nn.Module):
         return torch.cat([psnr, clip], dim=-1)
 
     def denormalize(self, standardized: torch.Tensor) -> torch.Tensor:
-        """Map standardized predictions back to raw metric units."""
+        """Map standardized predictions back to min-max normalized metric units."""
         return standardized * self.target_std + self.target_mean
-
-
-def upgrade_regressor_state_dict(
-    state_dict: dict[str, torch.Tensor],
-) -> dict[str, torch.Tensor]:
-    """Expand pre-mask checkpoints to the current img+mask+text context layout."""
-    if any(k.startswith("mask_proj.") for k in state_dict):
-        return state_dict
-
-    img_d, text_d, t_d = IMG_PROJ_DIM, TEXT_PROJ_DIM, T_PROJ_DIM
-    old_ctx, new_ctx = img_d + text_d, img_d * 2 + text_d
-    sd = dict(state_dict)
-
-    for key, value in list(sd.items()):
-        if key.startswith("img_proj."):
-            sd[key.replace("img_proj.", "mask_proj.", 1)] = value.clone()
-
-    w = sd["psnr_body.0.weight"]
-    nw = w.new_zeros(w.shape[0], new_ctx + t_d)
-    nw[:, :img_d] = w[:, :img_d]
-    nw[:, img_d : 2 * img_d] = w[:, :img_d]
-    nw[:, 2 * img_d : 2 * img_d + text_d] = w[:, img_d : img_d + text_d]
-    nw[:, new_ctx:] = w[:, old_ctx:]
-    sd["psnr_body.0.weight"] = nw
-
-    w = sd["clip_body.blocks.0.linear.weight"]
-    nw = w.new_zeros(w.shape[0], new_ctx)
-    nw[:, :img_d] = w[:, :img_d]
-    nw[:, img_d : 2 * img_d] = w[:, :img_d]
-    nw[:, 2 * img_d :] = w[:, img_d:]
-    sd["clip_body.blocks.0.linear.weight"] = nw
-
-    return sd
 
 
 class MetricPredictor(nn.Module):
@@ -304,7 +271,7 @@ class MetricPredictor(nn.Module):
 
     def __init__(
         self,
-        freeze_encoders: bool = True,
+        freeze_encoders: bool = FREEZE_ENCODERS,
         device: torch.device | str | None = None,
     ):
         super().__init__()
@@ -350,7 +317,7 @@ class MetricPredictor(nn.Module):
         tar_emb: torch.Tensor,
         t: torch.Tensor,
     ) -> torch.Tensor:
-        """Predict (psnr, clip) in raw units from precomputed embeddings."""
+        """Predict (psnr, clip) in min-max normalized units from precomputed embeddings."""
         out = self.regressor(img_emb, mask_emb, src_emb, tar_emb, t)
         return self.regressor.denormalize(out)
 

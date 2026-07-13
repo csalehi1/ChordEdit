@@ -1,2 +1,1 @@
-# Ignore all cached splits in this dir
-*.parquet.gz
+# Local data artifacts (if any)

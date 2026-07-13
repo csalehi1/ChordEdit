@@ -10,14 +10,14 @@ Dataset settings.
 """
 
 # NOTE: Set this to the directory containing the generated metrics and strings CSV files.
-GENERATED_DIR = Path("/shared/ssd_30T/mirick/generated/ultra_edit/UltraEdit_Region_100")
-DATASET_DIR = Path("/shared/ssd_30T/mirick/datasets/ultra_edit/UltraEdit_Region_100")
+GENERATED_DIR = Path("/shared/ssd_30T/mirick/generated/ultra_edit/UltraEdit_Region_10")
+DATASET_DIR = Path("/shared/ssd_30T/mirick/datasets/ultra_edit/UltraEdit_Region_10")
 
-INPUTS_CSV = GENERATED_DIR / "id_to_inputs_ultraeditregion100.csv"
-METRICS_CSV = GENERATED_DIR / "id_to_metrics_ultraeditregion100.csv"
+INPUTS_CSV = GENERATED_DIR / f"id_to_inputs_{GENERATED_DIR.name.replace('_', '').lower()}.csv"
+METRICS_CSV = GENERATED_DIR / f"id_to_metrics_{GENERATED_DIR.name.replace('_', '').lower()}.csv"
 
 # NOTE: Set this to the directory where the model outputs will be saved.
-OUTPUTS_DIR = Path(__file__).resolve().parent / "outputs/UltraEdit_Region_100"
+OUTPUTS_DIR = Path(__file__).resolve().parent / "outputs" / GENERATED_DIR.name
 if not OUTPUTS_DIR.exists():
     OUTPUTS_DIR.mkdir(parents=True)
 

@@ -21,11 +21,11 @@ Requires SD-Turbo weights at `SD_TURBO_ROOT` (see repo root `README.md`).
 python train_m.py
 ```
 
-Writes a timestamped run to `outputs/<dataset>/`, including `regressor_weights.pt` and train/val/test splits.
+Writes a timestamped run to `outputs/<dataset>/`, including `regressor_weights.pt`, `settings_hash.txt`, and train/val/test splits.
 
 **2. Evaluate**
 
-Open and run all cells in `eval_m.ipynb`. Set `GPU` in the first cell (`None`, `0`, `1`, …, or `"cpu"`) to pick the inference device. The notebook loads the latest run (or set `RUN_DIR` in the first cell) and reports prediction error, calibration, and grid-surface fidelity.
+Open and run all cells in `eval_m.ipynb`. Set `GPU` in the setup cell (`None`, `0`, `1`, …, or `"cpu"`) to pick the inference device. The notebook loads the latest run (or set `RUN_DIR`) and reports prediction error, calibration, and grid-surface fidelity.
 
 ## T — timestep selector
 
@@ -35,11 +35,18 @@ Run after M training completes.
 
 ```bash
 python train_t.py
-# optional: python train_t.py --run-dir outputs/ultra_edit_region_1000/<timestamp> --gpu 1
+# optional: python train_t.py --run-dir outputs/UltraEdit_Region_100/<timestamp> --gpu 1
 ```
 
-Reports regret, Spearman correlation, and deviate-gate precision/recall on the test split. Saves `t_train_metrics.json`.
+Reports regret, Spearman correlation, and deviate-gate precision/recall on the test split. Saves `t_train_metrics.json` and `t_test_selections.json`.
 
 **2. Visualize**
 
-Open and run all cells in `eval_t.ipynb` for selection plots and sparse-label budget analysis.
+Open and run all cells in `eval_t.ipynb` for selection diagnostics and plots.
+
+## Shared modules
+
+| File | Role |
+|------|------|
+| `model_t.py` | T selection, scalarization, and eval metrics (regret, Spearman, gate) |
+| `_helpers.py` | `settings_hash.txt` per run; raises if `settings.py` changed since training |
