@@ -54,20 +54,13 @@ SD_COMPONENT_SUBDIRS = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", required=True)
-    parser.add_argument("--model-root", default=DEFAULT_MODEL_ROOT)
-    parser.add_argument(
-        "--output-root",
-        default=None,
-        help="Parent output directory; results are saved under <dataset-folder-name>",
-    )
+    parser.add_argument("--model-root", required=True)
+    parser.add_argument("--output-root", default=None)
+    parser.add_argument("--gpus", nargs="+", type=int, default=[0])
     parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--grids", action="store_true", help="Also write grid_clean.png overviews")
-    parser.add_argument(
-        "--diagonal-optimization",
-        action="store_true",
-        help="Only generate cells where t_start > t_end",
-    )
-    parser.add_argument("--gpus", nargs="+", type=int, default=[0], help="GPU ids; one shard per GPU")
+    # Optional arguments: also write grid_clean.png overviews and only generate cells where t_start > t_end.
+    parser.add_argument("--add-grids", action="store_true")
+    parser.add_argument("--diagonal-optimization", action="store_true")
     return parser.parse_args()
 
 
@@ -222,7 +215,7 @@ def main() -> None:
         output_root=output_root,
         model_root=args.model_root,
         max_samples=args.max_samples,
-        write_grids=args.grids,
+        write_grids=args.add_grids,
         diagonal_optimization=args.diagonal_optimization,
         num_shards=len(gpus),
     )
