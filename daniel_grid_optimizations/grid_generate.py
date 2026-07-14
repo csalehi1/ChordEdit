@@ -54,8 +54,8 @@ SD_COMPONENT_SUBDIRS = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", required=True)
-    parser.add_argument("--model-root", required=True)
     parser.add_argument("--output-root", default=None)
+    parser.add_argument("--model-root", required=True)
     parser.add_argument("--gpus", nargs="+", type=int, default=[0])
     parser.add_argument("--max-samples", type=int, default=None)
     # Optional arguments: also write grid_clean.png overviews and only generate cells where t_start > t_end.
@@ -110,7 +110,7 @@ def run_shard(
 
     samples = load_samples(mapping_path, max_samples, shard, num_shards)
     LOGGER.info(
-        "GPU %d: Shard %d/%d on physical GPU %d (cuda:0) | %d sample(s)",
+        "GPU %d: Started shard %d/%d on GPU %d (cuda:0) | %d sample" + "s"*(len(samples) != 1),
         shard, shard + 1, num_shards, gpu, len(samples),
     )
 
@@ -127,7 +127,7 @@ def run_shard(
             for ts, te in iter_cell_pairs(grid_values, diagonal_optimization=diagonal_optimization)
         ]
         if expected and all(path.exists() for path in expected):
-            LOGGER.info("GPU %d: [%d/%d] %s already generated, skipping.", gpu, index, len(samples), sample_id)
+            LOGGER.info("GPU %d: [%d/%d] Skipped %s, already generated.", gpu, index, len(samples), sample_id)
             continue
 
         sample_start = time.perf_counter()
@@ -186,7 +186,7 @@ def run_shard(
             gpu, index, len(samples), sample_id, cell_count, elapsed,
         )
 
-    LOGGER.info("GPU %d: Shard %d/%d done.", gpu, shard + 1, num_shards)
+    LOGGER.info("GPU %d: Finished shard %d/%d.", gpu, shard + 1, num_shards)
 
 
 def main() -> None:

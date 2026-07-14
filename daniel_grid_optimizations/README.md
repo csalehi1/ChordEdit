@@ -1,30 +1,31 @@
-# daniel_create
+# Daniel Grid Optimizations
 
-Generate ChordEdit `t_start` by `t_end` image grids over a PIE-Bench-style dataset.
+## Environments
 
-## Output layout
+Generation and evaluation have different dependencies and should use separate conda environments:
 
-```
-<output-root>/<dataset-folder-name>[_n<max-samples>]/ # e.g. UltraEdit_Region_10000_n8
-  id_to_inputs_<suffix>.csv
-  <sample_id>/
-    grid_clean.png                   # only with --add-grids
-    cells/t_start_<..>__t_end_<..>.jpg
-```
+| Script | Dependencies |
+| --- | --- |
+| `grid_generate.py` | `torch`, `diffusers`, ChordEdit pipeline |
+| `grid_eval.py` | `torch`, `torchmetrics`, `transformers` (version-matched for `CLIPScore`) |
 
-## Args
+The evaluation metrics come from [PnPInversion](https://github.com/cure-lab/PnPInversion) and require compatible `torchmetrics`/`transformers` versions. The `chordedit` environment will fail on `CLIPScore` due to a version mismatch.
+
+## Grid Generation
+
+### Generation Arguments
 
 | Flag | Meaning |
-|------|---------|
-| `--data-root` | Dataset root (default UltraEdit_Region_1000) |
-| `--output-root` | Parent output directory; results are saved under `<dataset-folder-name>[_n<max-samples>]` |
-| `--model-root` | SD weights root |
-| `--max-samples` | Cap samples for a smoke test; output folder appends `_n<max-samples>` |
-| `--add-grids` | Write `grid_clean.png` overview images |
-| `--diagonal-optimization` | Only generate cells where `t_start > t_end` (55 cells vs 121) |
-| `--gpus 0 1 2 3` | GPU list; one shard process per GPU (default `0`) |
+| --- | --- |
+| `--data-root` | |
+| `--output-root` | |
+| `--model-root` | |
+| `--gpus` | |
+| `--max-samples` | |
+| `--add-grids` | |
+| `--diagonal-optimization` | |
 
-## Usage
+### Generation Usage
 
 Runs are resumable. One process is spawned per GPU in `--gpus`.
 
@@ -33,4 +34,21 @@ python daniel_create/grid_generate.py --data-root ... --model-root ... --gpus 0
 python daniel_create/grid_generate.py --data-root ... --output-root ./results --gpus 0
 python daniel_create/grid_generate.py --add-grids --gpus 0 1
 python daniel_create/grid_generate.py --diagonal-optimization --gpus 0
+```
+
+## Grid Evaluation
+
+### Evaluation Arguments
+
+| Flag | Meaning |
+| --- | --- |
+| `--generated-root` | |
+| `--result-path` | |
+| `--gpus` | |
+| `--max-samples` | |
+
+### Evaluation Usage
+
+```bash
+python grid_eval.py --generated-root /shared/ssd_30T/mirick/generated/ultra_edit/UltraEdit_Region_10
 ```
