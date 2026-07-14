@@ -12,11 +12,11 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
 import time
+from datasets import load_dataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from utils import bracket_diff, save_image
+from utils import bracket_diff, save_image, save_raw_bytes
 
 DATASET = "BleachNick/UltraEdit_Region_Based_100k"
 SPLIT = "RegionBase"
@@ -35,20 +35,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-edits", action="store_true")
     parser.add_argument("--include-masks", action="store_true")
     return parser.parse_args()
-
-
-def load_stream(token: str | None, include_masks: bool, include_edits: bool) -> Any:
-    try:
-        from datasets import load_dataset
-        stream = load_dataset(DATASET, name="default", split=SPLIT, streaming=True, token=token)
-        columns = list(BASE_COLUMNS)
-        if include_masks:
-            columns.append("mask_image")
-        if include_edits:
-            columns.append("edited_image")
-        return stream.select_columns(columns)
-    except ImportError as exc:
-        raise SystemExit("Install dependencies: pip install datasets pillow") from exc
 
 
 def main() -> int:
@@ -75,28 +61,53 @@ def main() -> int:
         if not gitignore.exists():
             gitignore.write_text("*\n!.gitignore\n", encoding="utf-8")
 
-    stream = load_stream(
-        os.environ.get("HF_TOKEN"), args.include_masks, args.include_edits
-    ).take(args.n_samples)
+    # List of columns to load from the dataset.
+    columns = list(BASE_COLUMNS)
+    if args.include_masks:
+        columns.append("mask_image")
+    if args.include_edits:
+        columns.append("edited_image")
+    stream = load_dataset(
+        DATASET, name="default", split=SPLIT,
+        streaming=True, token=os.environ.get("HF_TOKEN"), columns=columns,
+    )
+
+    # When JPEG_QUALITY is None, we don't need to decode the images.
+    # The raw bytes are saved to the image directory directly.
+    if JPEG_QUALITY is None:
+        stream = stream.decode(False)
+    else:
+        stream = stream.decode(num_threads=min(32, (os.cpu_count() or 1) + 4))
+    stream = stream.take(args.n_samples)
     print(f"Streaming {args.n_samples} samples from {DATASET}")
 
+    raw_mode = JPEG_QUALITY is None
     image_ext = ".jpg" if JPEG_QUALITY is not None else ".png"
     mapping: dict[str, dict[str, str]] = {}
     failed = 0
     for index, example in enumerate(stream):
         sample_start = time.perf_counter()
-        sample_id, image_name = f"{index:08d}", f"{index:08d}{image_ext}"
+        sample_id = f"{index:08d}"
+        base_name = f"{sample_id}{image_ext}"
         try:
-            save_image(example["source_image"], image_dir / image_name, JPEG_QUALITY)
-            original_prompt, editing_prompt = bracket_diff(str(example.get("source_caption")), str(example.get("target_caption")))
-            entry: dict[str, str] = {}
-            entry["image_path"] = f"annotation_images/{image_name}"
+            # List of columns to save to the image directory.
+            image_cols = [("source_image", "image_path", image_dir)]
             if args.include_masks:
-                save_image(example["mask_image"], mask_dir / image_name, JPEG_QUALITY)
-                entry["mask_image_path"] = f"annotation_masks/{image_name}"
+                image_cols.append(("mask_image", "mask_image_path", mask_dir))
             if args.include_edits:
-                save_image(example["edited_image"], edit_dir / image_name, JPEG_QUALITY)
-                entry["edited_image_path"] = f"annotation_edits/{image_name}"
+                image_cols.append(("edited_image", "edited_image_path", edit_dir))
+
+            # Save the images to the image directory.
+            entry: dict[str, str] = {}
+            for col, key, dest in image_cols:
+                if raw_mode:
+                    saved = save_raw_bytes(example[col]["bytes"], dest / base_name)
+                else:
+                    saved = dest / base_name
+                    save_image(example[col], saved, JPEG_QUALITY)
+                entry[key] = f"{dest.name}/{saved.name}"
+
+            original_prompt, editing_prompt = bracket_diff(str(example.get("source_caption")), str(example.get("target_caption")))
             entry["original_prompt"] = original_prompt
             entry["editing_prompt"] = editing_prompt
             entry["editing_instruction"] = str(example.get("edit_prompt"))

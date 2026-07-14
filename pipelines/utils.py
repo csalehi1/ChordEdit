@@ -50,3 +50,30 @@ def save_image(image: Any, path: Path, jpeg_quality: int | None = None) -> None:
         image = image.convert("RGB")
     image.save(path, format="JPEG", quality=jpeg_quality)
 
+
+_MAGIC_EXT = {
+    b"\xff\xd8\xff": ".jpg",
+    b"\x89PNG": ".png",
+    b"RIFF": ".webp",
+    b"GIF8": ".gif",
+    b"BM": ".bmp",
+}
+
+
+def image_ext_from_bytes(data: bytes) -> str:
+    """Detect image format from magic bytes and return the canonical extension."""
+    for magic, ext in _MAGIC_EXT.items():
+        if data[:len(magic)] == magic:
+            return ext
+    return ".png"
+
+
+def save_raw_bytes(data: bytes, path: Path) -> Path:
+    """Write raw image bytes to disk, fixing the extension to match the actual format."""
+    actual_ext = image_ext_from_bytes(data)
+    if path.suffix != actual_ext:
+        path = path.with_suffix(actual_ext)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return path
+
