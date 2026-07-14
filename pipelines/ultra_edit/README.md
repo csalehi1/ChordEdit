@@ -9,5 +9,6 @@ Download the first N samples:
 ```bash
 cd /data/home/mirick/ChordEdit/caleb-image-pipeline/pipelines/ultra_edit
 python main.py --n-samples 10
+python main.py --n-samples 10 --include-masks --include-edits
 ```
 
