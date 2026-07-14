@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from utils import bracket_diff
+from utils import bracket_diff, save_image
 
 DATASET = "BleachNick/UltraEdit_Region_Based_100k"
 SPLIT = "RegionBase"
@@ -33,17 +33,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def save_image(image: Any, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if JPEG_QUALITY is None:
-        # No re-encoding, keep the image's native mode and full resolution.
-        image.save(path)
-        return
-    if image.mode not in ("RGB", "L"):
-        image = image.convert("RGB")
-    image.save(path, format="JPEG", quality=JPEG_QUALITY)
-
-
 def load_stream(token: str | None) -> Any:
     try:
         # Streaming reads Parquet shards from the hub.
@@ -52,7 +41,6 @@ def load_stream(token: str | None) -> Any:
         return stream.select_columns(COLUMNS)
     except ImportError as exc:
         raise SystemExit("Install dependencies: pip install datasets pillow") from exc
-
 
 
 def main() -> int:
@@ -83,8 +71,8 @@ def main() -> int:
     for index, example in enumerate(stream):
         sample_id, image_name = f"{index:08d}", f"{index:08d}{image_ext}"
         try:
-            save_image(example["source_image"], image_dir / image_name)
-            save_image(example["mask_image"], mask_dir / image_name)
+            save_image(example["source_image"], image_dir / image_name, JPEG_QUALITY)
+            save_image(example["mask_image"], mask_dir / image_name, JPEG_QUALITY)
             original_prompt, editing_prompt = bracket_diff(str(example.get("source_caption")), str(example.get("target_caption")))
             mapping[sample_id] = {
                 "image_path": f"annotation_images/{image_name}",
@@ -103,7 +91,8 @@ def main() -> int:
     with mapping_path.open("w", encoding="utf-8") as handle:
         json.dump(mapping, handle, indent=4, ensure_ascii=False)
 
-    print(f"Done: {len(mapping)} saved, {failed} failed -> {mapping_path}")
+    print(f"Done: {len(mapping)} saved, {failed} failed")
+    print(f"Saved to: {out_root}")
     return 0
 
 
