@@ -1,0 +1,4 @@
+This directory was imported from the `PnPInversion` repository on 2026-07-14.
+
+Original repository:
+https://github.com/cure-lab/PnPInversion
