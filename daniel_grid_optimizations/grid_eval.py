@@ -14,16 +14,17 @@ import logging
 import numpy as np
 import re
 import time
+import torch
 from collections import defaultdict
 from pathlib import Path
 from PIL import Image
 
-from evaluation.evaluate import calculate_metric
 from evaluation.matrics_calculator import MetricsCalculator
 
 LOGGER = logging.getLogger("grid_eval")
 
 IMAGE_SIZE = 512
+DEVICE = "cuda"
 METRICS = [
     "psnr_unedit_part",
     "lpips_unedit_part",
@@ -66,14 +67,11 @@ def _format_mask_image(mask_image: Image.Image) -> np.ndarray:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
-    # os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    # os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-
     args = parse_args()
     max_samples = args.max_samples
     generated_root = Path(args.generated_root).expanduser().resolve()
-    inputs_path = generated_root / f"id_to_inputs_{generated_root.name.replace('_', '').lower()}{f'_n{max_samples}' if max_samples else ''}.csv"
-    result_path = generated_root / f"id_to_metrics_{generated_root.name.replace('_', '').lower()}{f'_n{max_samples}' if max_samples else ''}.csv"
+    inputs_path = generated_root / f"id_to_inputs_{generated_root.name.replace('_','').lower()}{f'_n{max_samples}' if max_samples else ''}.csv"
+    result_path = generated_root / f"id_to_metrics_{generated_root.name.replace('_','').lower()}{f'_n{max_samples}' if max_samples else ''}.csv"
 
     # Collect samples from the inputs CSV.
     samples: dict[str, dict[str, str]] = {}
@@ -97,8 +95,15 @@ def main() -> None:
 
     LOGGER.info("Found %d samples and %d total cells", len(samples), sum(len(v) for v in cells.values()))
 
-    # Initialize the metrics calculator from PnPInversion.
-    metrics_calculator = MetricsCalculator("cuda")
+    metrics_calculator = MetricsCalculator(DEVICE)
+
+    # OPT: Access the internal torchmetrics calculators and the CLIP model/processor
+    # directly from MetricsCalculator, so we can call them with pre-built GPU tensors
+    # instead of going through the PIL->numpy->tensor conversion on every call.
+    psnr_calc = metrics_calculator.psnr_metric_calculator
+    lpips_calc = metrics_calculator.lpips_metric_calculator
+    clip_model = metrics_calculator.clip_metric_calculator.model
+    clip_processor = metrics_calculator.clip_metric_calculator.processor
 
     # Write the header to the result file.
     with open(result_path, "w", newline="", encoding="utf-8") as f:
@@ -112,22 +117,77 @@ def main() -> None:
         mask_image = Image.open(sample_meta["mask_image_path"]).convert("L").resize((IMAGE_SIZE, IMAGE_SIZE))
         mask_array = _format_mask_image(mask_image)
 
+        # OPT 1: Precompute masked source tensors once per sample.
+        # The source image and inverse mask are constant across all cells in a sample.
+        # We bypass MetricsCalculator's PIL-accepting methods and call its internal
+        # torchmetrics calculators (psnr_metric_calculator, lpips_metric_calculator)
+        # directly with pre-built GPU tensors, eliminating redundant PIL->numpy->tensor
+        # conversion and mask application that would otherwise repeat for every cell.
+        src_np = np.array(source_image).astype(np.float32) / 255.0
+        inv_mask = (1.0 - mask_array).astype(np.float32)
+        has_unedit_part = inv_mask.sum() > 0
+        has_edit_part = mask_array.sum() > 0
+
+        src_psnr_tensor = torch.empty(0)
+        src_lpips_tensor = torch.empty(0)
+        text_features = torch.empty(0)
+
+        if has_unedit_part:
+            src_masked_np = src_np * inv_mask
+            src_psnr_tensor = torch.tensor(src_masked_np).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
+            src_lpips_tensor = src_psnr_tensor * 2 - 1
+
+        # OPT 2: Encode the target prompt through CLIP's text encoder once per sample.
+        # We access the CLIPScore metric's internal model (clip_metric_calculator.model)
+        # to extract text features, then compute image-text cosine similarity manually
+        # for each cell, avoiding N-1 redundant text forward passes per sample.
+        if has_edit_part:
+            target_prompt = sample_meta["target_prompt"]
+            with torch.no_grad():
+                text_processed = clip_processor(
+                    text=[target_prompt], return_tensors="pt", padding=True, truncation=True,
+                )
+                text_features = clip_model.get_text_features(
+                    text_processed["input_ids"].to(DEVICE),
+                )
+                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
         # Evaluate every cell.
         for t_start, t_end, cell_path in cell_list:
             target_image = Image.open(cell_path).convert("RGB").resize((IMAGE_SIZE, IMAGE_SIZE))
 
-            # Calculate the PSNR, LPIPS, and CLIP metrics for the cell.
-            row: list = [sample_id, f"{t_start:.1f}", f"{t_end:.1f}"]
-            for metric in METRICS:
-                score = calculate_metric(
-                    metrics_calculator, metric,
-                    source_image, target_image,
-                    mask_array, mask_array,
-                    sample_meta["source_prompt"], sample_meta["target_prompt"],
-                )
-                row.append(score)
+            # OPT 3: Convert the target image to numpy once per cell and derive all
+            # tensor variants, instead of repeating PIL->numpy->tensor 3x per metric.
+            target_arr = np.array(target_image)
 
-            # Write the row to the result file.
+            if has_unedit_part:
+                target_np = target_arr.astype(np.float32) / 255.0
+                target_masked_np = target_np * inv_mask
+                # Calculate PSNR between the target image and the source image.
+                target_psnr_tensor = torch.tensor(target_masked_np).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
+                psnr_score = psnr_calc(target_psnr_tensor, src_psnr_tensor).cpu().item()
+                # Calculate LPIPS between the target image and the source image.
+                target_lpips_tensor = target_psnr_tensor * 2 - 1
+                lpips_score = lpips_calc(target_lpips_tensor, src_lpips_tensor).cpu().item()
+            else:
+                # Fallback to NaN for metrics that require unedited parts.
+                psnr_score = "nan"
+                lpips_score = "nan"
+
+            if has_edit_part:
+                # Calculate CLIP score between the target image and the source image.
+                target_clip_arr = np.uint8(target_arr * mask_array)
+                image_for_clip = torch.tensor(target_clip_arr).permute(2, 0, 1)
+                with torch.no_grad():
+                    image_processed = clip_processor(images=[image_for_clip], return_tensors="pt")
+                    image_features = clip_model.get_image_features(image_processed["pixel_values"].to(DEVICE))
+                    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+                    clip_score = (100.0 * (image_features * text_features).sum(axis=-1)).item()
+            else:
+                # Fallback to NaN for metrics that require edited parts.
+                clip_score = "nan"
+
+            row = [sample_id, f"{t_start:.1f}", f"{t_end:.1f}", psnr_score, lpips_score, clip_score]
             with open(result_path, "a", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(row)
 
