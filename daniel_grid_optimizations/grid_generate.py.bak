@@ -1,0 +1,195 @@
+"""
+Generate a t_start by t_end cell grid for every sample in a dataset.
+
+Unoptimized baseline: uses the original pipeline from scripts/ with one full
+ChordEditPipeline call per cell.  No factorization or shared computation.
+Used as the performance reference for the optimized grid_generate.py.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict
+
+# Add scripts/ and repo root to path so we can import from the original pipeline.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_SCRIPTS_DIR = _REPO_ROOT / "scripts"
+sys.path.insert(0, str(_SCRIPTS_DIR))
+sys.path.insert(0, str(_REPO_ROOT))
+
+import settings
+from _helpers import (
+    cell_filename,
+    get_output_dir_name,
+    iter_cell_pairs,
+    load_samples,
+    resolve_under,
+    strip_brackets,
+    write_id_to_inputs,
+)
+from run_local_ablation import (
+    DEFAULT_EDIT_CONFIG,
+    DEFAULT_SEED,
+    resolve_component_paths,
+    run_single_edit,
+    LocalRecord,
+)
+
+LOGGER = logging.getLogger("grid_generate_baseline")
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+DEFAULT_MODEL_ROOT = "/shared/ssd_30T/mirick/models/sd-turbo"
+SEED = DEFAULT_SEED
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-root", required=True)
+    parser.add_argument("--output-root", default=None)
+    parser.add_argument("--model-root", required=True)
+    parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--add-grids", action="store_true")
+    parser.add_argument("--diagonal-optimization", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+
+    args = parse_args()
+    data_root = Path(args.data_root).expanduser().resolve()
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+
+    import torch
+    from PIL import Image
+
+    from pipeline_chord import ChordEditPipeline
+    from grid_render import save_clean_grid
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
+    output_root = (
+        Path(args.output_root).expanduser().resolve() / get_output_dir_name(data_root.name, args.max_samples)
+        if args.output_root is not None
+        else SCRIPT_DIR / "generated" / get_output_dir_name(data_root.name, args.max_samples)
+    )
+    output_root.mkdir(parents=True, exist_ok=True)
+    if args.output_root is None:
+        generated_gitignore = output_root.parent / ".gitignore"
+        if not generated_gitignore.exists():
+            generated_gitignore.write_text("*\n!.gitignore\n", encoding="utf-8")
+
+    mapping_path = data_root / "mapping_file.json"
+    dest = write_id_to_inputs(output_root, data_root, mapping_path)
+    LOGGER.info("Wrote %s", dest)
+
+    grid_values = list(settings.GRID_VALUES)
+    base_config = dict(DEFAULT_EDIT_CONFIG)
+    t_delta = settings.T_DELTA
+
+    samples = load_samples(mapping_path, args.max_samples)
+    LOGGER.info("Processing %d sample%s", len(samples), "s" * (len(samples) != 1))
+
+    # Load pipeline using the original scripts/ approach (no optimization).
+    component_paths = resolve_component_paths(args.model_root, "sd")
+    pipeline = ChordEditPipeline.from_local_weights(
+        component_paths=component_paths,
+        model_type="sd",
+        default_edit_config=base_config,
+        device="cuda:0",
+        torch_dtype=torch.float32,
+        image_size=settings.IMAGE_SIZE,
+        use_center_crop=True,
+        compute_dtype=torch.float32,
+        use_attention_mask=False,
+        use_safety_checker=False,
+        chord_edit_mode="default",
+    )
+
+    for index, (sample_id, meta) in enumerate(samples, start=1):
+        cells_dir = output_root / sample_id / "cells"
+
+        expected = [
+            cells_dir / cell_filename(ts, te)
+            for ts, te in iter_cell_pairs(grid_values, diagonal_optimization=args.diagonal_optimization)
+        ]
+        if expected and all(path.exists() for path in expected):
+            LOGGER.info("[%d/%d] Skipped %s, already generated.", index, len(samples), sample_id)
+            continue
+
+        sample_start = time.perf_counter()
+
+        image_path = resolve_under(data_root, meta[settings.FIELD_IMAGE_PATH])
+        category = Path(meta[settings.FIELD_IMAGE_PATH]).parent.name
+        source_prompt = strip_brackets(meta.get(settings.FIELD_SOURCE_PROMPT, ""))
+        target_prompt = strip_brackets(meta.get(settings.FIELD_TARGET_PROMPT, ""))
+
+        with Image.open(image_path) as img:
+            source_image = img.convert("RGB")
+
+        record = LocalRecord(
+            sample_name=category,
+            image_path=image_path,
+            source_prompt=source_prompt,
+            target_prompt=target_prompt,
+            edit_prompt=strip_brackets(meta.get(settings.FIELD_EDIT_INSTRUCTION, "")),
+            edit_id=sample_id,
+        )
+
+        cells_dir.mkdir(parents=True, exist_ok=True)
+
+        # Unoptimized: one full pipeline call per (t_start, t_end) cell
+        # using run_single_edit from scripts/run_local_ablation.py.
+        cell_count = 0
+        for t_start, t_end in iter_cell_pairs(grid_values, diagonal_optimization=args.diagonal_optimization):
+            cell_path = cells_dir / cell_filename(t_start, t_end)
+            if cell_path.exists():
+                cell_count += 1
+                continue
+
+            edit_config = dict(base_config)
+            edit_config["t_start"] = t_start
+            edit_config["t_end"] = t_end
+            edit_config["t_delta"] = t_delta
+
+            generated = run_single_edit(
+                pipeline=pipeline,
+                source_image=source_image,
+                record=record,
+                edit_config=edit_config,
+                seed=SEED,
+            )
+
+            cell = generated.convert("RGB").resize((settings.IMAGE_SIZE, settings.IMAGE_SIZE))
+            if settings.JPEG_QUALITY is None:
+                cell.save(cell_path)
+            else:
+                cell.save(cell_path, quality=settings.JPEG_QUALITY)
+            cell_count += 1
+
+        if args.add_grids:
+            title = f'{sample_id} ({category})\nSource: "{source_prompt}"\nTarget: "{target_prompt}"'
+            save_clean_grid(cells_dir, output_root / sample_id / "grid_clean.png", grid_values, t_delta, title)
+
+        elapsed = time.perf_counter() - sample_start
+        LOGGER.info(
+            "[%d/%d] Generated %s (%d cells in %.2fs)",
+            index, len(samples), sample_id, cell_count, elapsed,
+        )
+
+    LOGGER.info("Done. Images in %s", output_root)
+
+
+if __name__ == "__main__":
+    main()

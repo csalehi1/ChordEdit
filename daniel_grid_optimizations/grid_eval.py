@@ -24,14 +24,9 @@ from evaluation.matrics_calculator import MetricsCalculator
 LOGGER = logging.getLogger("grid_eval")
 
 IMAGE_SIZE = 512
-DEVICE = "cuda"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CLIP_BATCH_SIZE = 32
 LPIPS_BATCH_SIZE = 32
-METRICS = [
-    "psnr_unedit_part",
-    "lpips_unedit_part",
-    "clip_similarity_target_image_edit_part",
-]
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,8 +34,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--generated-root", required=True)
     # parser.add_argument("--model-root", required=True)
     parser.add_argument("--result-path", default=None)
-    parser.add_argument("--gpus", nargs="+", type=int, default=[0])
+    parser.add_argument("--gpu", type=int, default=0)
+    # parser.add_argument("--gpus", nargs="+", type=int, default=[0])
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--include-psnr", action="store_true", default=False)
+    parser.add_argument("--include-lpips", action="store_true", default=False)
+    parser.add_argument("--include-clip", action="store_true", default=False)
     return parser.parse_args()
 
 
@@ -77,12 +76,28 @@ def main() -> None:
     inputs_path = generated_root / f"id_to_inputs_{generated_root.name.replace('_','').lower()}{f'_n{max_samples}' if max_samples else ''}.csv"
     result_path = generated_root / f"id_to_metrics_{generated_root.name.replace('_','').lower()}{f'_n{max_samples}' if max_samples else ''}.csv"
 
+    # Build the list of metrics to evaluate. If no --include-* flags are
+    # specified, all metrics are included (the default behavior).
+    include_psnr = args.include_psnr
+    include_lpips = args.include_lpips
+    include_clip = args.include_clip
+    if not (include_psnr or include_lpips or include_clip):
+        include_psnr = include_lpips = include_clip = True
+
+    metrics: list[str] = []
+    if include_psnr:
+        metrics.append("psnr_unedit_part")
+    if include_lpips:
+        metrics.append("lpips_unedit_part")
+    if include_clip:
+        metrics.append("clip_similarity_target_image_edit_part")
+
     # Collect samples from the inputs CSV.
     samples: dict[str, dict[str, str]] = {}
     with open(inputs_path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        for row in reader:
-            samples[row["sample_id"]] = {k: v for k, v in row.items() if k != "sample_id"}
+        for row in reader: # type: ignore
+            samples[row["sample_id"]] = {k: v for k, v in row.items() if k != "sample_id"} # type: ignore[index]
 
     # Collect cells from the generated root.
     cells: defaultdict[str, list[tuple[float, float, Path]]] = defaultdict(list)
@@ -107,19 +122,25 @@ def main() -> None:
     psnr_calc = metrics_calculator.psnr_metric_calculator
     lpips_calc = metrics_calculator.lpips_metric_calculator
     clip_model = metrics_calculator.clip_metric_calculator.model
-    clip_processor = metrics_calculator.clip_metric_calculator.processor
+   
+    # OPT 3: Replace the default slow processor with the fast (Rust-based) variant.
+    from transformers import AutoProcessor
+    clip_processor = AutoProcessor.from_pretrained(
+        metrics_calculator.clip_metric_calculator.model.config._name_or_path,
+        use_fast=True,
+    )
 
     # Write the header to the result file.
     with open(result_path, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(["sample_id", "t_start", "t_end"] + METRICS)
+        csv.writer(f).writerow(["sample_id", "t_start", "t_end"] + metrics)
 
-    # OPT 3: Keep the result file open for the entire evaluation instead of
+    # OPT 4: Keep the result file open for the entire evaluation instead of
     # re-opening and closing it for every single cell row, eliminating thousands
     # of open()/close() syscall pairs. Flush after each sample for crash safety.
     with open(result_path, "a", newline="", encoding="utf-8") as result_file:
         result_writer = csv.writer(result_file)
 
-        # OPT 4: Wrap the entire evaluation in a single torch.no_grad() context
+        # OPT 5: Wrap the entire evaluation in a single torch.no_grad() context
         # instead of entering/exiting it per-cell for CLIP. No metric computation
         # here requires gradients, so one outer context eliminates repeated
         # context-manager overhead and ensures PSNR/LPIPS also skip grad tracking.
@@ -129,8 +150,6 @@ def main() -> None:
                 sample_start = time.perf_counter()
                 sample_meta = samples[sample_id]
                 source_image = Image.open(sample_meta["image_path"]).convert("RGB").resize((IMAGE_SIZE, IMAGE_SIZE))
-                # OPT 5: Let _format_mask_image handle .convert("L") and .resize()
-                # instead of doing it redundantly here and again inside the function.
                 mask_image = Image.open(sample_meta["mask_image_path"])
                 mask_array = _format_mask_image(mask_image)
 
@@ -151,11 +170,11 @@ def main() -> None:
                 src_lpips_tensor = torch.empty(0)
                 text_features = torch.empty(0)
 
-                if has_unedit_part:
+                # OPT 7: torch.from_numpy() shares memory with the numpy array
+                # instead of copying like torch.tensor(), avoiding a redundant
+                # CPU-side memcpy before the .to(DEVICE) GPU transfer.
+                if (include_psnr or include_lpips) and has_unedit_part:
                     src_masked_np = src_np * inv_mask
-                    # OPT 7: torch.from_numpy() shares memory with the numpy array
-                    # instead of copying like torch.tensor(), avoiding a redundant
-                    # CPU-side memcpy before the .to(DEVICE) GPU transfer.
                     src_psnr_tensor = torch.from_numpy(src_masked_np).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
                     src_lpips_tensor = src_psnr_tensor * 2 - 1
 
@@ -163,7 +182,7 @@ def main() -> None:
                 # We access the CLIPScore metric's internal model (clip_metric_calculator.model)
                 # to extract text features, then compute image-text cosine similarity manually
                 # for each cell, avoiding N-1 redundant text forward passes per sample.
-                if has_edit_part:
+                if include_clip and has_edit_part:
                     target_prompt = sample_meta["target_prompt"]
                     text_processed = clip_processor(
                         text=[target_prompt], return_tensors="pt", padding=True, truncation=True,
@@ -177,74 +196,84 @@ def main() -> None:
                 # all cells in a sample. Instead of running these networks once per cell
                 # (N separate GPU kernel launches at batch_size=1), we collect all cell
                 # images in a first pass (computing the cheap PSNR metric inline), then
-                # run LPIPS (SqueezeNet) and CLIP (ViT-L/14) in sub-batches of size
-                # LPIPS_BATCH_SIZE / CLIP_BATCH_SIZE. This maximizes GPU utilization by
-                # amortizing kernel-launch overhead and leveraging parallelism within
-                # each batch.
+                # run LPIPS (SqueezeNet) and CLIP (ViT-L/14) in sub-batches.
                 cell_meta = []
+                psnr_scores: list = []
                 lpips_target_tensors = []
                 clip_image_tensors = []
 
                 for t_start, t_end, cell_path in cell_list:
                     target_image = Image.open(cell_path).convert("RGB").resize((IMAGE_SIZE, IMAGE_SIZE))
-                    # OPT 10: Convert the target image to numpy once per cell and derive all
-                    # tensor variants, instead of repeating PIL->numpy->tensor 3x per metric.
+                    # OPT 9: Convert the target image to numpy once per cell and derive
+                    # all tensor variants, instead of repeating PIL->numpy->tensor per metric.
                     target_arr = np.array(target_image)
 
-                    psnr_score = "nan"
-                    if has_unedit_part:
+                    if (include_psnr or include_lpips) and has_unedit_part:
                         target_np = target_arr.astype(np.float32) / 255.0
                         target_masked_np = target_np * inv_mask
                         target_psnr_tensor = torch.from_numpy(target_masked_np).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
-                        psnr_score = psnr_calc(target_psnr_tensor, src_psnr_tensor).cpu().item()
-                        lpips_target_tensors.append(target_psnr_tensor * 2 - 1)
+                        if include_psnr:
+                            psnr_scores.append(psnr_calc(target_psnr_tensor, src_psnr_tensor).cpu().item())
+                        if include_lpips:
+                            lpips_target_tensors.append(target_psnr_tensor * 2 - 1)
+                    elif include_psnr:
+                        psnr_scores.append("nan")
 
-                    if has_edit_part:
+                    if include_clip and has_edit_part:
                         target_clip_arr = np.uint8(target_arr * mask_array)
                         clip_image_tensors.append(torch.from_numpy(target_clip_arr).permute(2, 0, 1))
 
-                    cell_meta.append((t_start, t_end, psnr_score))
+                    cell_meta.append((t_start, t_end))
 
                 # OPT 9 (cont.): Batched LPIPS -- run SqueezeNet on stacked target tensors.
                 # We call lpips_calc.net directly to get per-sample LPIPS scores;
                 # the torchmetrics wrapper would average across the batch.
-                if has_unedit_part and lpips_target_tensors:
-                    lpips_scores = []
-                    for i in range(0, len(lpips_target_tensors), LPIPS_BATCH_SIZE):
-                        batch = torch.cat(lpips_target_tensors[i:i + LPIPS_BATCH_SIZE], dim=0)
-                        src_batch = src_lpips_tensor.expand(batch.shape[0], -1, -1, -1)
-                        scores = lpips_calc.net(batch, src_batch).squeeze()
-                        if scores.dim() == 0:
-                            lpips_scores.append(scores.cpu().item())
-                        else:
-                            lpips_scores.extend(scores.cpu().tolist())
-                else:
-                    lpips_scores = ["nan"] * len(cell_meta)
+                lpips_scores: list = []
+                if include_lpips:
+                    if has_unedit_part and lpips_target_tensors:
+                        lpips_scores = []
+                        for i in range(0, len(lpips_target_tensors), LPIPS_BATCH_SIZE):
+                            batch = torch.cat(lpips_target_tensors[i:i + LPIPS_BATCH_SIZE], dim=0)
+                            src_batch = src_lpips_tensor.expand(batch.shape[0], -1, -1, -1)
+                            scores = lpips_calc.net(batch, src_batch).squeeze()
+                            if scores.dim() == 0:
+                                lpips_scores.append(scores.cpu().item())
+                            else:
+                                lpips_scores.extend(scores.cpu().tolist())
+                    else:
+                        lpips_scores = ["nan"] * len(cell_meta)
 
                 # OPT 9 (cont.): Batched CLIP -- run the CLIP image encoder on all collected
                 # masked cell images at once. clip_processor handles resizing and
                 # normalization; clip_model.get_image_features encodes the whole batch
                 # in one forward pass. Cosine similarities are computed vectorially.
-                if has_edit_part and clip_image_tensors:
-                    clip_scores = []
-                    for i in range(0, len(clip_image_tensors), CLIP_BATCH_SIZE):
-                        batch_images = clip_image_tensors[i:i + CLIP_BATCH_SIZE]
-                        image_processed = clip_processor(images=batch_images, return_tensors="pt")
-                        image_features = clip_model.get_image_features(
-                            image_processed["pixel_values"].to(DEVICE)
-                        )
-                        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-                        batch_scores = (100.0 * (image_features @ text_features.T)).squeeze(-1)
-                        if batch_scores.dim() == 0:
-                            clip_scores.append(batch_scores.cpu().item())
-                        else:
-                            clip_scores.extend(batch_scores.cpu().tolist())
-                else:
-                    clip_scores = ["nan"] * len(cell_meta)
+                clip_scores: list = []
+                if include_clip:
+                    if has_edit_part and clip_image_tensors:
+                        clip_scores = []
+                        for i in range(0, len(clip_image_tensors), CLIP_BATCH_SIZE):
+                            batch_images = clip_image_tensors[i:i + CLIP_BATCH_SIZE]
+                            image_processed = clip_processor(images=batch_images, return_tensors="pt")
+                            image_features = clip_model.get_image_features(
+                                image_processed["pixel_values"].to(DEVICE)
+                            )
+                            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+                            batch_scores = (100.0 * (image_features @ text_features.T)).squeeze(-1)
+                            if batch_scores.dim() == 0:
+                                clip_scores.append(batch_scores.cpu().item())
+                            else:
+                                clip_scores.extend(batch_scores.cpu().tolist())
+                    else:
+                        clip_scores = ["nan"] * len(cell_meta)
 
-                for idx, (t_start, t_end, psnr_score) in enumerate(cell_meta):
-                    row = [sample_id, f"{t_start:.1f}", f"{t_end:.1f}",
-                           psnr_score, lpips_scores[idx], clip_scores[idx]]
+                for idx, (t_start, t_end) in enumerate(cell_meta):
+                    row: list = [sample_id, f"{t_start:.1f}", f"{t_end:.1f}"]
+                    if include_psnr:
+                        row.append(psnr_scores[idx])
+                    if include_lpips:
+                        row.append(lpips_scores[idx])
+                    if include_clip:
+                        row.append(clip_scores[idx])
                     result_writer.writerow(row)
                 result_file.flush()
 
