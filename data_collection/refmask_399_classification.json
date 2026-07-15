@@ -1,0 +1,3994 @@
+[
+ {
+  "sid": "00000018",
+  "instruction": "Change the text to \"Merry Christmas!\"",
+  "concepts": [
+   "Happy Thanksgiving!"
+  ],
+  "ref_mask_frac": 0.8766,
+  "category": "ungroundable",
+  "reason": "concept is literal written text 'Happy Thanksgiving!' on a card"
+ },
+ {
+  "sid": "00000032",
+  "instruction": "Change the words to 'Gustav Klimt'",
+  "concepts": [
+   "La Joconde"
+  ],
+  "ref_mask_frac": 0.7303,
+  "category": "ungroundable",
+  "reason": "concept is literal mural text 'La Joconde'"
+ },
+ {
+  "sid": "00000063",
+  "instruction": "Add sunglasses to all the cats",
+  "concepts": [
+   "sunglasses"
+  ],
+  "ref_mask_frac": 0.2297,
+  "category": "concept_absent",
+  "reason": "sunglasses are the object to be added; cats wear none in source"
+ },
+ {
+  "sid": "00000086",
+  "instruction": "Replace the word 'joy' with glowing neon lights",
+  "concepts": [
+   "word 'joy'"
+  ],
+  "ref_mask_frac": 0.093,
+  "category": "ungroundable",
+  "reason": "concept is literal written text 'joy' on theater sign"
+ },
+ {
+  "sid": "00000151",
+  "instruction": "Change the text to 'Bank of England'",
+  "concepts": [
+   "Casa de Moneda de Mexico"
+  ],
+  "ref_mask_frac": 0.6936,
+  "category": "ungroundable",
+  "reason": "concept is the mint's name/inscription text on a coin"
+ },
+ {
+  "sid": "00000152",
+  "instruction": "change the sandwich into a pizza",
+  "concepts": [
+   "sandwich"
+  ],
+  "ref_mask_frac": 0.1246,
+  "category": "sam3_miss",
+  "reason": "large sandwich being eaten is clearly visible"
+ },
+ {
+  "sid": "00000177",
+  "instruction": "Replace the stand with a vintage record player",
+  "concepts": [
+   "stand"
+  ],
+  "ref_mask_frac": 0.1989,
+  "category": "sam3_miss",
+  "reason": "pink upholstered stand/ottoman clearly visible beside the bed"
+ },
+ {
+  "sid": "00000183",
+  "instruction": "transform the knife into a lightsaber",
+  "concepts": [
+   "knife"
+  ],
+  "ref_mask_frac": 0.325,
+  "category": "sam3_miss",
+  "reason": "utensil/knife visible on cake plate in woman's reach"
+ },
+ {
+  "sid": "00000188",
+  "instruction": "Change the bananas into a stack of pancakes",
+  "concepts": [
+   "bananas"
+  ],
+  "ref_mask_frac": 0.0046,
+  "category": "sam3_miss",
+  "reason": "yellow bananas visible on the dining table"
+ },
+ {
+  "sid": "00000232",
+  "instruction": "Add a rainbow in the sky above the elephant",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.9857,
+  "category": "concept_absent",
+  "reason": "no sky visible; frame is elephant, dirt, and green field"
+ },
+ {
+  "sid": "00000261",
+  "instruction": "Change the language to Arabic",
+  "concepts": [
+   "phone card"
+  ],
+  "ref_mask_frac": 0.3394,
+  "category": "sam3_miss",
+  "reason": "card products visibly displayed in the shop window racks"
+ },
+ {
+  "sid": "00000281",
+  "instruction": "replace 'carpe diem' with 'seize the day'",
+  "concepts": [
+   "carpe diem"
+  ],
+  "ref_mask_frac": 0.547,
+  "category": "ungroundable",
+  "reason": "concept is literal written text 'carpe diem'"
+ },
+ {
+  "sid": "00000374",
+  "instruction": "Transform the surroundings into a snowy winter wonderland",
+  "concepts": [
+   "sun"
+  ],
+  "ref_mask_frac": 1.0,
+  "category": "global",
+  "reason": "transform surroundings into snowy winter wonderland is a scene-wide edit"
+ },
+ {
+  "sid": "00000387",
+  "instruction": "change the currency to Japanese Yen",
+  "concepts": [
+   "euro bill"
+  ],
+  "ref_mask_frac": 0.2796,
+  "category": "sam3_miss",
+  "reason": "10-euro bill plainly visible on table"
+ },
+ {
+  "sid": "00000417",
+  "instruction": "Add fairy lights to illuminate the scene",
+  "concepts": [
+   "fairy lights"
+  ],
+  "ref_mask_frac": 0.1384,
+  "category": "concept_absent",
+  "reason": "fairy lights are the object to be added; none in street scene"
+ },
+ {
+  "sid": "00000428",
+  "instruction": "Transform the furby into a robot",
+  "concepts": [
+   "furby"
+  ],
+  "ref_mask_frac": 0.0425,
+  "category": "ungroundable",
+  "reason": "Furby is a toy product/brand name"
+ },
+ {
+  "sid": "00000433",
+  "instruction": "transform the cheerios into miniature planets",
+  "concepts": [
+   "cheerios"
+  ],
+  "ref_mask_frac": 0.4911,
+  "category": "ungroundable",
+  "reason": "'cheerios' is a brand name; only the cereal box is shown, no loose cereal"
+ },
+ {
+  "sid": "00000447",
+  "instruction": "change the letters to spell out \"LOVE\"",
+  "concepts": [
+   "HAKE"
+  ],
+  "ref_mask_frac": 0.3127,
+  "category": "ungroundable",
+  "reason": "concept is literal lettering 'HAKE' on bottle"
+ },
+ {
+  "sid": "00000468",
+  "instruction": "replace wine with a cup of coffee",
+  "concepts": [
+   "wine"
+  ],
+  "ref_mask_frac": 0.0535,
+  "category": "concept_absent",
+  "reason": "no wine bottle or glass of wine visible, only planter and figurine"
+ },
+ {
+  "sid": "00000473",
+  "instruction": "Change the labels on the envelopes to Paris, London, and New York respectively",
+  "concepts": [
+   "Munchen Germany"
+  ],
+  "ref_mask_frac": 0.5695,
+  "category": "ungroundable",
+  "reason": "concept is literal envelope text 'Munchen Germany'"
+ },
+ {
+  "sid": "00000492",
+  "instruction": "\"Enhance the colors to make it look like a neon sign.\"",
+  "concepts": [
+   "vanilla extract"
+  ],
+  "ref_mask_frac": 0.559,
+  "category": "global",
+  "reason": "enhance colors to look like neon sign is color-grading/style edit"
+ },
+ {
+  "sid": "00000506",
+  "instruction": "Turn the sandwich into a croissant.",
+  "concepts": [
+   "egg sandwich"
+  ],
+  "ref_mask_frac": 0.1565,
+  "category": "sam3_miss",
+  "reason": "bagel egg sandwich visible in box"
+ },
+ {
+  "sid": "00000559",
+  "instruction": "Transform the anteater into a mythical dragon",
+  "concepts": [
+   "anteater"
+  ],
+  "ref_mask_frac": 0.4038,
+  "category": "sam3_miss",
+  "reason": "anteater fills the frame, clearly visible"
+ },
+ {
+  "sid": "00000561",
+  "instruction": "Replace the dog with a magical dragon",
+  "concepts": [
+   "dog"
+  ],
+  "ref_mask_frac": 0.0151,
+  "category": "sam3_miss",
+  "reason": "dog visible mid-jump through hoop, though motion-blurred"
+ },
+ {
+  "sid": "00000630",
+  "instruction": "Transform the anteater into a mythical dragon",
+  "concepts": [
+   "anteater"
+  ],
+  "ref_mask_frac": 0.4038,
+  "category": "sam3_miss",
+  "reason": "the animal (labeled anteater) is large and clearly visible yawning on a log"
+ },
+ {
+  "sid": "00000654",
+  "instruction": "Replace Bose with kittens",
+  "concepts": [
+   "Bose"
+  ],
+  "ref_mask_frac": 0.6205,
+  "category": "ungroundable",
+  "reason": "concept is brand name text 'Bose' on boxes"
+ },
+ {
+  "sid": "00000675",
+  "instruction": "Transform the hotel into a medieval castle",
+  "concepts": [
+   "hotel"
+  ],
+  "ref_mask_frac": 0.2563,
+  "category": "sam3_miss",
+  "reason": "large ornate hotel building clearly visible behind the van"
+ },
+ {
+  "sid": "00000724",
+  "instruction": "replace the tennis racket with a lightsaber",
+  "concepts": [
+   "tennis racket"
+  ],
+  "ref_mask_frac": 0.0141,
+  "category": "concept_absent",
+  "reason": "player on court holds no visible tennis racket"
+ },
+ {
+  "sid": "00000773",
+  "instruction": "Add a rainbow arcing over the animals",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.1098,
+  "category": "concept_absent",
+  "reason": "no sky visible; barn wall fills the background behind the animals"
+ },
+ {
+  "sid": "00000791",
+  "instruction": "Replace Bose with kittens",
+  "concepts": [
+   "Bose"
+  ],
+  "ref_mask_frac": 0.6205,
+  "category": "ungroundable",
+  "reason": "'Bose' is a brand name written on boxes"
+ },
+ {
+  "sid": "00000878",
+  "instruction": "Transform the banana into a lightsaber",
+  "concepts": [
+   "banana"
+  ],
+  "ref_mask_frac": 0.0175,
+  "category": "sam3_miss",
+  "reason": "banana held to man's ear is clearly visible"
+ },
+ {
+  "sid": "00000897",
+  "instruction": "replace the office building with a medieval castle",
+  "concepts": [
+   "office building"
+  ],
+  "ref_mask_frac": 0.1211,
+  "category": "sam3_miss",
+  "reason": "large building clearly visible behind trees"
+ },
+ {
+  "sid": "00000905",
+  "instruction": "Replace George Bush with a famous historical figure",
+  "concepts": [
+   "George Bush"
+  ],
+  "ref_mask_frac": 0.0379,
+  "category": "ungroundable",
+  "reason": "'George Bush' is a personal name on a newspaper front page"
+ },
+ {
+  "sid": "00000946",
+  "instruction": "Replace the baseball bat with a bouquet of flowers",
+  "concepts": [
+   "baseball bat"
+  ],
+  "ref_mask_frac": 0.0237,
+  "category": "sam3_miss",
+  "reason": "wooden baseball bat clearly held in the photo"
+ },
+ {
+  "sid": "00000949",
+  "instruction": "Change the TAM to read 'Fly High'",
+  "concepts": [
+   "TAM"
+  ],
+  "ref_mask_frac": 0.1701,
+  "category": "ungroundable",
+  "reason": "TAM is brand text painted on the airplane fuselage"
+ },
+ {
+  "sid": "00000996",
+  "instruction": "Surround the cat with floating bubbles.",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.5945,
+  "category": "concept_absent",
+  "reason": "indoor close-up of cat on couch, no sky"
+ },
+ {
+  "sid": "00001026",
+  "instruction": "Change the text to a different TV show title",
+  "concepts": [
+   "Gavin & Stacey Series Two"
+  ],
+  "ref_mask_frac": 0.7041,
+  "category": "ungroundable",
+  "reason": "concept is a TV show title (written text on DVD)"
+ },
+ {
+  "sid": "00001041",
+  "instruction": "Add a rainbow in the sky above them.",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.583,
+  "category": "concept_absent",
+  "reason": "background is dense foliage, no sky visible"
+ },
+ {
+  "sid": "00001045",
+  "instruction": "Transform the Pound Bakery into a vintage bookstore",
+  "concepts": [
+   "Pound Bakery"
+  ],
+  "ref_mask_frac": 0.7002,
+  "category": "ungroundable",
+  "reason": "Pound Bakery is a brand/store name"
+ },
+ {
+  "sid": "00001047",
+  "instruction": "replace the Las Vegas print with a galaxy space theme",
+  "concepts": [
+   "Las Vegas print"
+  ],
+  "ref_mask_frac": 0.5427,
+  "category": "sam3_miss",
+  "reason": "Las Vegas skyline print covers most of visible mug"
+ },
+ {
+  "sid": "00001057",
+  "instruction": "Replace the brown sugar packets with colorful macarons",
+  "concepts": [
+   "brown sugar packets"
+  ],
+  "ref_mask_frac": 0.0948,
+  "category": "sam3_miss",
+  "reason": "brown paper sugar packet visible on table next to the mug"
+ },
+ {
+  "sid": "00001144",
+  "instruction": "Change the bunny into a tiny unicorn plushie",
+  "concepts": [
+   "bunny"
+  ],
+  "ref_mask_frac": 0.0104,
+  "category": "sam3_miss",
+  "reason": "plush bunny toy visible in girl's hand on bed"
+ },
+ {
+  "sid": "00001150",
+  "instruction": "add a flock of colorful birds flying overhead",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.5486,
+  "category": "concept_absent",
+  "reason": "canopy of bare branches and dark woods; no sky patch visible"
+ },
+ {
+  "sid": "00001172",
+  "instruction": "add a fantasy background with unicorns and rainbows",
+  "concepts": [
+   "glass container"
+  ],
+  "ref_mask_frac": 0.667,
+  "category": "global",
+  "reason": "edit adds a fantasy background (background replacement)"
+ },
+ {
+  "sid": "00001217",
+  "instruction": "Add a floating galaxy above the computer screen",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.6171,
+  "category": "concept_absent",
+  "reason": "indoor desk scene; no sky visible"
+ },
+ {
+  "sid": "00001220",
+  "instruction": "Change the currency to Euros",
+  "concepts": [
+   "pound note"
+  ],
+  "ref_mask_frac": 0.3194,
+  "category": "sam3_miss",
+  "reason": "pound notes hanging on clothesline are visible"
+ },
+ {
+  "sid": "00001224",
+  "instruction": "Add a fireplace with a crackling fire",
+  "concepts": [
+   "fireplace"
+  ],
+  "ref_mask_frac": 0.0363,
+  "category": "concept_absent",
+  "reason": "fireplace is the object to be added; living room has none"
+ },
+ {
+  "sid": "00001230",
+  "instruction": "change the netting to fairy lights",
+  "concepts": [
+   "netting"
+  ],
+  "ref_mask_frac": 0.1575,
+  "category": "sam3_miss",
+  "reason": "mosquito-net canopy netting clearly draped over bed"
+ },
+ {
+  "sid": "00001234",
+  "instruction": "add a candlelight effect",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.1948,
+  "category": "global",
+  "reason": "'add a candlelight effect' is a scene-wide lighting change"
+ },
+ {
+  "sid": "00001259",
+  "instruction": "Surround him with floating musical notes",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.5282,
+  "category": "concept_absent",
+  "reason": "close-up of suit and tie, no sky in frame"
+ },
+ {
+  "sid": "00001383",
+  "instruction": "Replace the baseball bat with a lightsaber",
+  "concepts": [
+   "baseball bat"
+  ],
+  "ref_mask_frac": 0.0098,
+  "category": "sam3_miss",
+  "reason": "bat visible in boy's hands extending off the left edge"
+ },
+ {
+  "sid": "00001392",
+  "instruction": "change the word to SUNSHINE",
+  "concepts": [
+   "PAYDAY"
+  ],
+  "ref_mask_frac": 0.5807,
+  "category": "ungroundable",
+  "reason": "concept is literal word/brand 'PAYDAY' on sign"
+ },
+ {
+  "sid": "00001436",
+  "instruction": "Add a rainbow in the sky",
+  "concepts": [
+   "fencing"
+  ],
+  "ref_mask_frac": 0.4152,
+  "category": "sam3_miss",
+  "reason": "chain-link/mesh fencing visibly wrapped around tree trunk"
+ },
+ {
+  "sid": "00001437",
+  "instruction": "add glowing fairy lights",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.8511,
+  "category": "concept_absent",
+  "reason": "fabric close-up, no sky in frame"
+ },
+ {
+  "sid": "00001443",
+  "instruction": "Add a whimsical rainbow above the elephant",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.5521,
+  "category": "concept_absent",
+  "reason": "background is dense foliage and rock, no sky visible"
+ },
+ {
+  "sid": "00001451",
+  "instruction": "add a flock of birds flying above",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.0232,
+  "category": "concept_absent",
+  "reason": "indoor wall with clock; no sky in frame"
+ },
+ {
+  "sid": "00001452",
+  "instruction": "Change the text to \"Wild Adventure\"",
+  "concepts": [
+   "Natural-Contours"
+  ],
+  "ref_mask_frac": 0.1179,
+  "category": "ungroundable",
+  "reason": "'Natural-Contours' is a brand/text string on a package"
+ },
+ {
+  "sid": "00001483",
+  "instruction": "Transform the scene into a winter wonderland with snow falling",
+  "concepts": [
+   "snow"
+  ],
+  "ref_mask_frac": 1.0,
+  "category": "global",
+  "reason": "winter-wonderland scene transformation is a whole-image edit"
+ },
+ {
+  "sid": "00001484",
+  "instruction": "Change the setting to a snowy winter wonderland",
+  "concepts": [
+   "business"
+  ],
+  "ref_mask_frac": 1.0,
+  "category": "global",
+  "reason": "setting change to snowy winter wonderland is a whole-scene edit"
+ },
+ {
+  "sid": "00001507",
+  "instruction": "change the background to a beach setting",
+  "concepts": [
+   "tub"
+  ],
+  "ref_mask_frac": 0.619,
+  "category": "global",
+  "reason": "edit changes background to a beach setting"
+ },
+ {
+  "sid": "00001508",
+  "instruction": "Replace the Cheetos with sushi rolls.",
+  "concepts": [
+   "Cheetos"
+  ],
+  "ref_mask_frac": 0.2116,
+  "category": "ungroundable",
+  "reason": "Cheetos is a brand/product name"
+ },
+ {
+  "sid": "00001527",
+  "instruction": "Add a rainbow in the background",
+  "concepts": [
+   "rainbow"
+  ],
+  "ref_mask_frac": 1.0,
+  "category": "concept_absent",
+  "reason": "rainbow is the object to be added, not in source"
+ },
+ {
+  "sid": "00001681",
+  "instruction": "Replace the bacon with fruit",
+  "concepts": [
+   "bacon"
+  ],
+  "ref_mask_frac": 0.2559,
+  "category": "sam3_miss",
+  "reason": "bacon visible through the package window"
+ },
+ {
+  "sid": "00001695",
+  "instruction": "change the napkin to a map of the world",
+  "concepts": [
+   "napkin"
+  ],
+  "ref_mask_frac": 0.8755,
+  "category": "sam3_miss",
+  "reason": "lace doily/napkin visible under crocheted bear"
+ },
+ {
+  "sid": "00001711",
+  "instruction": "Give the teddy bears sunglasses and Hawaiian leis",
+  "concepts": [
+   "sunglasses"
+  ],
+  "ref_mask_frac": 0.6836,
+  "category": "concept_absent",
+  "reason": "sunglasses are the object to be added; teddy bears wear none"
+ },
+ {
+  "sid": "00001730",
+  "instruction": "Change the plate of apples to a bowl of strawberries.",
+  "concepts": [
+   "plate of apples"
+  ],
+  "ref_mask_frac": 0.0293,
+  "category": "sam3_miss",
+  "reason": "plate of apple slices clearly visible on counter"
+ },
+ {
+  "sid": "00001746",
+  "instruction": "Replace the plastic bat with a lightsaber",
+  "concepts": [
+   "plastic bat"
+  ],
+  "ref_mask_frac": 0.0059,
+  "category": "sam3_miss",
+  "reason": "boy visibly holding a dark plastic bat raised in hand"
+ },
+ {
+  "sid": "00001780",
+  "instruction": "add colorful butterflies flying around",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.4282,
+  "category": "concept_absent",
+  "reason": "dense trees behind giraffes, no visible sky"
+ },
+ {
+  "sid": "00001790",
+  "instruction": "Change the book titles to historical figures",
+  "concepts": [
+   "Leonardo's Laptop"
+  ],
+  "ref_mask_frac": 0.7383,
+  "category": "ungroundable",
+  "reason": "concept is a book title string"
+ },
+ {
+  "sid": "00001844",
+  "instruction": "Replace the bamboo shoots with a blooming sunflower",
+  "concepts": [
+   "bamboo shoots"
+  ],
+  "ref_mask_frac": 0.4837,
+  "category": "concept_absent",
+  "reason": "blurry canned drink, no bamboo shoots visible"
+ },
+ {
+  "sid": "00001845",
+  "instruction": "Change the TAM to read 'Fly High'",
+  "concepts": [
+   "TAM"
+  ],
+  "ref_mask_frac": 0.1701,
+  "category": "ungroundable",
+  "reason": "TAM is airline brand lettering"
+ },
+ {
+  "sid": "00001856",
+  "instruction": "Replace the Christmas tree with a beach scene.",
+  "concepts": [
+   "Christmas tree"
+  ],
+  "ref_mask_frac": 0.0118,
+  "category": "sam3_miss",
+  "reason": "decorated Christmas tree visible top-right behind cat"
+ },
+ {
+  "sid": "00001874",
+  "instruction": "add glowing fairy lights",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.8511,
+  "category": "concept_absent",
+  "reason": "no sky; close-up of embroidered fabric"
+ },
+ {
+  "sid": "00001877",
+  "instruction": "\"Change the toy into a vintage camera.\"",
+  "concepts": [
+   "toy"
+  ],
+  "ref_mask_frac": 0.0909,
+  "category": "sam3_miss",
+  "reason": "boy holds a large red pop-up toy, clearly visible"
+ },
+ {
+  "sid": "00001902",
+  "instruction": "Replace the debris with colorful balloons",
+  "concepts": [
+   "debris"
+  ],
+  "ref_mask_frac": 0.2206,
+  "category": "sam3_miss",
+  "reason": "jumbled load of scrap/debris visible on the truck bed"
+ },
+ {
+  "sid": "00001916",
+  "instruction": "Replace Supergirl with Wonder Woman",
+  "concepts": [
+   "Supergirl"
+  ],
+  "ref_mask_frac": 0.2116,
+  "category": "ungroundable",
+  "reason": "concept is character name 'Supergirl' in comic panel"
+ },
+ {
+  "sid": "00001940",
+  "instruction": "Add a rainbow shooting out of the hose",
+  "concepts": [
+   "wrench"
+  ],
+  "ref_mask_frac": 0.2661,
+  "category": "concept_absent",
+  "reason": "hydrant, hose and valve wheel visible but no wrench"
+ },
+ {
+  "sid": "00001985",
+  "instruction": "Transform the Indian into a cowboy with a cowboy hat and boots",
+  "concepts": [
+   "Indian"
+  ],
+  "ref_mask_frac": 0.1783,
+  "category": "sam3_miss",
+  "reason": "Indian person clearly visible in street scene"
+ },
+ {
+  "sid": "00002007",
+  "instruction": "Transform the ground into a sandy beach",
+  "concepts": [
+   "ground"
+  ],
+  "ref_mask_frac": 0.2296,
+  "category": "sam3_miss",
+  "reason": "tile floor (ground) plainly visible"
+ },
+ {
+  "sid": "00002022",
+  "instruction": "turn the frisbee into a glowing rainbow disc",
+  "concepts": [
+   "frisbee"
+  ],
+  "ref_mask_frac": 0.0823,
+  "category": "sam3_miss",
+  "reason": "light disc-like frisbee visible at thrower's side"
+ },
+ {
+  "sid": "00002047",
+  "instruction": "Change \"Ariel\" to \"Atlantis\"",
+  "concepts": [
+   "Ariel"
+  ],
+  "ref_mask_frac": 0.4153,
+  "category": "ungroundable",
+  "reason": "'Ariel' is written title text on a book spine"
+ },
+ {
+  "sid": "00002117",
+  "instruction": "Turn the sandwich into a croissant.",
+  "concepts": [
+   "egg sandwich"
+  ],
+  "ref_mask_frac": 0.1565,
+  "category": "sam3_miss",
+  "reason": "egg-filled bagel sandwich clearly visible"
+ },
+ {
+  "sid": "00002125",
+  "instruction": "Convert the townhouses into a serene beach view.",
+  "concepts": [
+   "townhouses"
+  ],
+  "ref_mask_frac": 0.1252,
+  "category": "sam3_miss",
+  "reason": "townhouse buildings visible through the bathroom windows"
+ },
+ {
+  "sid": "00002185",
+  "instruction": "Change the ad to a Coca-Cola logo",
+  "concepts": [
+   "T-Mobile ad"
+  ],
+  "ref_mask_frac": 0.152,
+  "category": "ungroundable",
+  "reason": "concept is brand name 'T-Mobile ad'"
+ },
+ {
+  "sid": "00002193",
+  "instruction": "Transform Santa Claus into a futuristic robot Santa",
+  "concepts": [
+   "Santa Claus"
+  ],
+  "ref_mask_frac": 0.0702,
+  "category": "sam3_miss",
+  "reason": "costumed Santa figure visibly present at center of group photo"
+ },
+ {
+  "sid": "00002214",
+  "instruction": "Change the bear to a unicorn",
+  "concepts": [
+   "bear"
+  ],
+  "ref_mask_frac": 0.1112,
+  "category": "sam3_miss",
+  "reason": "white plush teddy bear held by child"
+ },
+ {
+  "sid": "00002259",
+  "instruction": "Transform it into a tropical island paradise",
+  "concepts": [
+   "lemon and ginger"
+  ],
+  "ref_mask_frac": 0.4396,
+  "category": "global",
+  "reason": "transform whole scene into tropical island paradise"
+ },
+ {
+  "sid": "00002262",
+  "instruction": "Add a flock of birds flying around the clock",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.4485,
+  "category": "concept_absent",
+  "reason": "indoor ceiling and ornate clock; no sky visible"
+ },
+ {
+  "sid": "00002279",
+  "instruction": "Add a rainbow in the background",
+  "concepts": [
+   "rainbow"
+  ],
+  "ref_mask_frac": 0.2388,
+  "category": "concept_absent",
+  "reason": "rainbow is the object to be added; none in the street scene"
+ },
+ {
+  "sid": "00002281",
+  "instruction": "Add a rainbow stretching across the sky",
+  "concepts": [
+   "sun light levels"
+  ],
+  "ref_mask_frac": 0.3643,
+  "category": "ungroundable",
+  "reason": "'sun light levels' is an abstract attribute, not a segmentable object"
+ },
+ {
+  "sid": "00002342",
+  "instruction": "Add butterflies flying around the vase",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.2758,
+  "category": "concept_absent",
+  "reason": "close-up of hydrangea in vase against dark interior; no sky"
+ },
+ {
+  "sid": "00002397",
+  "instruction": "Transform the ground into a sandy beach",
+  "concepts": [
+   "ground"
+  ],
+  "ref_mask_frac": 0.2296,
+  "category": "sam3_miss",
+  "reason": "pavement/ground clearly visible in scene"
+ },
+ {
+  "sid": "00002468",
+  "instruction": "Replace the baby powder with glitter",
+  "concepts": [
+   "baby powder"
+  ],
+  "ref_mask_frac": 0.734,
+  "category": "sam3_miss",
+  "reason": "baby powder bottle clearly visible in foreground"
+ },
+ {
+  "sid": "00002587",
+  "instruction": "change the sandwich into a pizza",
+  "concepts": [
+   "sandwich"
+  ],
+  "ref_mask_frac": 0.1246,
+  "category": "sam3_miss",
+  "reason": "large sandwich being eaten is clearly visible"
+ },
+ {
+  "sid": "00002619",
+  "instruction": "Add a rainbow arcing over the scene",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.3822,
+  "category": "concept_absent",
+  "reason": "indoor train museum, no sky in view"
+ },
+ {
+  "sid": "00002651",
+  "instruction": "Change the smiley faces into intricate mandalas",
+  "concepts": [
+   "smiley faces"
+  ],
+  "ref_mask_frac": 0.0292,
+  "category": "sam3_miss",
+  "reason": "blueberry-decorated orange forms visible smiley face"
+ },
+ {
+  "sid": "00002660",
+  "instruction": "add a flock of colorful birds flying overhead",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.5486,
+  "category": "concept_absent",
+  "reason": "dark tree canopy fills the top; no clear sky visible"
+ },
+ {
+  "sid": "00002662",
+  "instruction": "Add a rainbow in the sky above them.",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.583,
+  "category": "concept_absent",
+  "reason": "giraffes against dense foliage, no sky visible"
+ },
+ {
+  "sid": "00002709",
+  "instruction": "Add a flock of birds flying around the backhoe.",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.7942,
+  "category": "concept_absent",
+  "reason": "background is dense foliage; no visible sky region"
+ },
+ {
+  "sid": "00002721",
+  "instruction": "Add a rainbow in the sky above them.",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.583,
+  "category": "concept_absent",
+  "reason": "dense foliage behind giraffes, no visible sky"
+ },
+ {
+  "sid": "00002725",
+  "instruction": "Change the sign text to 'Welcome to Wonderland'",
+  "concepts": [
+   "prohanhikivi"
+  ],
+  "ref_mask_frac": 0.1299,
+  "category": "ungroundable",
+  "reason": "concept is the literal banner text 'prohanhikivi'"
+ },
+ {
+  "sid": "00002726",
+  "instruction": "Replace the author with Jane Austen",
+  "concepts": [
+   "Ovid Demaris"
+  ],
+  "ref_mask_frac": 0.7054,
+  "category": "ungroundable",
+  "reason": "'Ovid Demaris' is an author's printed name"
+ },
+ {
+  "sid": "00002743",
+  "instruction": "transform the design into a pixelated digital art piece",
+  "concepts": [
+   "Las Vegas print"
+  ],
+  "ref_mask_frac": 0.5403,
+  "category": "sam3_miss",
+  "reason": "printed design on the mug is visible and segmentable"
+ },
+ {
+  "sid": "00002748",
+  "instruction": "Add twinkling stars around the cat",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.3741,
+  "category": "concept_absent",
+  "reason": "indoor cat under blankets; no sky in frame"
+ },
+ {
+  "sid": "00002798",
+  "instruction": "Add a rainbow arcing overhead",
+  "concepts": [
+   "rainbow"
+  ],
+  "ref_mask_frac": 0.8249,
+  "category": "concept_absent",
+  "reason": "rainbow is the object to be added; train platform has none"
+ },
+ {
+  "sid": "00002812",
+  "instruction": "Add a rainbow in the background",
+  "concepts": [
+   "rainbow"
+  ],
+  "ref_mask_frac": 1.0,
+  "category": "concept_absent",
+  "reason": "rainbow is the object to be added, not in source"
+ },
+ {
+  "sid": "00002836",
+  "instruction": "Transform it into a towering castle cake",
+  "concepts": [
+   "hotdog"
+  ],
+  "ref_mask_frac": 0.0682,
+  "category": "sam3_miss",
+  "reason": "hotdog-shaped item on plate is the visible subject"
+ },
+ {
+  "sid": "00002852",
+  "instruction": "Change the colors to pink, purple, and gold",
+  "concepts": [
+   "bed cover"
+  ],
+  "ref_mask_frac": 0.85,
+  "category": "global",
+  "reason": "changing the colors of the frame-filling fabric is a whole-image color edit"
+ },
+ {
+  "sid": "00002878",
+  "instruction": "Replace the stand with a vintage record player",
+  "concepts": [
+   "stand"
+  ],
+  "ref_mask_frac": 0.1989,
+  "category": "sam3_miss",
+  "reason": "pink stand/ottoman chest clearly visible beside the bed"
+ },
+ {
+  "sid": "00002910",
+  "instruction": "Change the label to read \"Sunshine Farms\"",
+  "concepts": [
+   "Van Camps"
+  ],
+  "ref_mask_frac": 0.2852,
+  "category": "ungroundable",
+  "reason": "'Van Camps' is a brand name on can labels"
+ },
+ {
+  "sid": "00002916",
+  "instruction": "transform the airplane into a train",
+  "concepts": [
+   "airplane"
+  ],
+  "ref_mask_frac": 0.3648,
+  "category": "concept_absent",
+  "reason": "photo taken inside; airplane not visible as an object"
+ },
+ {
+  "sid": "00002922",
+  "instruction": "Turn the reflection into a smiling woman.",
+  "concepts": [
+   "crying woman"
+  ],
+  "ref_mask_frac": 0.3093,
+  "category": "sam3_miss",
+  "reason": "crying woman's tearful face clearly visible in hand mirror"
+ },
+ {
+  "sid": "00002939",
+  "instruction": "Turn the posters into vintage circus posters",
+  "concepts": [
+   "Le Cauchemar de Dracula"
+  ],
+  "ref_mask_frac": 0.6389,
+  "category": "ungroundable",
+  "reason": "'Le Cauchemar de Dracula' is a poster title text string"
+ },
+ {
+  "sid": "00002971",
+  "instruction": "Transform the wall into a mosaic of colorful tiles.",
+  "concepts": [
+   "scissors"
+  ],
+  "ref_mask_frac": 0.3539,
+  "category": "concept_absent",
+  "reason": "no scissors visible, only man and grinding wheel"
+ },
+ {
+  "sid": "00002995",
+  "instruction": "change the rugby field to a snowy mountain landscape",
+  "concepts": [
+   "rugby field"
+  ],
+  "ref_mask_frac": 0.4769,
+  "category": "global",
+  "reason": "replacing the field/venue with a snowy mountain landscape is a scene change"
+ },
+ {
+  "sid": "00003094",
+  "instruction": "Add a glowing rainbow aura around the women",
+  "concepts": [
+   "woman in a wedding dress"
+  ],
+  "ref_mask_frac": 0.0768,
+  "category": "sam3_miss",
+  "reason": "woman with veil clearly visible in room"
+ },
+ {
+  "sid": "00003095",
+  "instruction": "Change the 'thank you!' message to 'spread kindness'",
+  "concepts": [
+   "thank you!"
+  ],
+  "ref_mask_frac": 0.3821,
+  "category": "ungroundable",
+  "reason": "concept is the literal written message 'thank you!'"
+ },
+ {
+  "sid": "00003112",
+  "instruction": "Add a rainbow arching over the scene",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.5251,
+  "category": "concept_absent",
+  "reason": "indoor bicycle shop, no sky visible"
+ },
+ {
+  "sid": "00003181",
+  "instruction": "Change the background to a tropical beach.",
+  "concepts": [
+   "stairs"
+  ],
+  "ref_mask_frac": 0.7571,
+  "category": "global",
+  "reason": "background replacement with tropical beach"
+ },
+ {
+  "sid": "00003230",
+  "instruction": "Surround the cat with floating bubbles.",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.5945,
+  "category": "concept_absent",
+  "reason": "close-up of cat on couch indoors; no sky"
+ },
+ {
+  "sid": "00003239",
+  "instruction": "Surround the cat with floating bubbles.",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.5945,
+  "category": "concept_absent",
+  "reason": "indoor close-up of cat on couch; no sky"
+ },
+ {
+  "sid": "00003240",
+  "instruction": "Replace the drink products with various fruits.",
+  "concepts": [
+   "drink products"
+  ],
+  "ref_mask_frac": 0.0821,
+  "category": "sam3_miss",
+  "reason": "vendor's rack of packaged drink/snack products visible"
+ },
+ {
+  "sid": "00003274",
+  "instruction": "Transform the playground into a futuristic cityscape",
+  "concepts": [
+   "playground"
+  ],
+  "ref_mask_frac": 0.7204,
+  "category": "sam3_miss",
+  "reason": "wooden playground structure visible through the window blinds"
+ },
+ {
+  "sid": "00003278",
+  "instruction": "Add graffiti art on the buildings.",
+  "concepts": [
+   "fenced area"
+  ],
+  "ref_mask_frac": 0.1677,
+  "category": "concept_absent",
+  "reason": "street with buildings, no fenced area visible"
+ },
+ {
+  "sid": "00003294",
+  "instruction": "Place miniature sunglasses on each bear",
+  "concepts": [
+   "sunglasses"
+  ],
+  "ref_mask_frac": 0.5924,
+  "category": "concept_absent",
+  "reason": "sunglasses are the object to be added; bears wear none"
+ },
+ {
+  "sid": "00003365",
+  "instruction": "Add graffiti art on the buildings.",
+  "concepts": [
+   "fenced area"
+  ],
+  "ref_mask_frac": 0.1677,
+  "category": "concept_absent",
+  "reason": "street with buildings, no fenced area visible"
+ },
+ {
+  "sid": "00003372",
+  "instruction": "Add a holographic projection above the laptop",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.022,
+  "category": "concept_absent",
+  "reason": "indoor office, windows blown out, no discernible sky"
+ },
+ {
+  "sid": "00003378",
+  "instruction": "replace wine glass with a cup of coffee",
+  "concepts": [
+   "wine glass"
+  ],
+  "ref_mask_frac": 0.5784,
+  "category": "sam3_miss",
+  "reason": "glass-like object held in her hands, blurred but visible"
+ },
+ {
+  "sid": "00003393",
+  "instruction": "Add a magical rainbow arching over the scene",
+  "concepts": [
+   "rainbow"
+  ],
+  "ref_mask_frac": 0.9292,
+  "category": "concept_absent",
+  "reason": "rainbow is the object to be added; ski slope has none"
+ },
+ {
+  "sid": "00003396",
+  "instruction": "Add a rainbow in the sky",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.4551,
+  "category": "concept_absent",
+  "reason": "elephants fill frame over bare ground, no sky"
+ },
+ {
+  "sid": "00003432",
+  "instruction": "Replace the workers with robots",
+  "concepts": [
+   "workers"
+  ],
+  "ref_mask_frac": 0.499,
+  "category": "sam3_miss",
+  "reason": "food workers clearly visible at the griddle"
+ },
+ {
+  "sid": "00003449",
+  "instruction": "Replace the game title with Mario Kart",
+  "concepts": [
+   "Left 4 Dead 2"
+  ],
+  "ref_mask_frac": 0.4632,
+  "category": "ungroundable",
+  "reason": "concept is game title 'Left 4 Dead 2'"
+ },
+ {
+  "sid": "00003462",
+  "instruction": "transform it into a cosmic galaxy soup can",
+  "concepts": [
+   "Campbell's Chunky Baked Potato with Cheddar & Bacon Bits soup"
+  ],
+  "ref_mask_frac": 0.2987,
+  "category": "ungroundable",
+  "reason": "concept is a Campbell's product name string"
+ },
+ {
+  "sid": "00003514",
+  "instruction": "Replace the lovebirds with miniature blooming flowers",
+  "concepts": [
+   "lovebirds"
+  ],
+  "ref_mask_frac": 0.3934,
+  "category": "sam3_miss",
+  "reason": "dove lovebird figurines on cake are visible"
+ },
+ {
+  "sid": "00003548",
+  "instruction": "add glowing fairy lights",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.8511,
+  "category": "concept_absent",
+  "reason": "close-up of fabric, no sky"
+ },
+ {
+  "sid": "00003555",
+  "instruction": "Change the words to 'Gustav Klimt'",
+  "concepts": [
+   "La Joconde"
+  ],
+  "ref_mask_frac": 0.7303,
+  "category": "ungroundable",
+  "reason": "concept is the literal painted text 'La Joconde'"
+ },
+ {
+  "sid": "00003559",
+  "instruction": "Add a rainbow in the background",
+  "concepts": [
+   "military vehicles"
+  ],
+  "ref_mask_frac": 0.2879,
+  "category": "sam3_miss",
+  "reason": "military fighter jet (a military vehicle) fills the frame"
+ },
+ {
+  "sid": "00003563",
+  "instruction": "Change the sky to a starry night",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.5376,
+  "category": "concept_absent",
+  "reason": "teddy bear in dense forest, no sky visible"
+ },
+ {
+  "sid": "00003591",
+  "instruction": "add glowing fairy lights",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.8511,
+  "category": "concept_absent",
+  "reason": "close-up of checked fabric; no sky anywhere"
+ },
+ {
+  "sid": "00003606",
+  "instruction": "Transform the ground into a sandy beach",
+  "concepts": [
+   "ground"
+  ],
+  "ref_mask_frac": 0.2296,
+  "category": "sam3_miss",
+  "reason": "pavement/ground clearly visible in scene"
+ },
+ {
+  "sid": "00003611",
+  "instruction": "Add a gentle snowfall",
+  "concepts": [
+   "snowfall"
+  ],
+  "ref_mask_frac": 0.5827,
+  "category": "global",
+  "reason": "adding snowfall is a weather change over the whole scene"
+ },
+ {
+  "sid": "00003617",
+  "instruction": "Replace the drink products with various fruits.",
+  "concepts": [
+   "drink products"
+  ],
+  "ref_mask_frac": 0.0821,
+  "category": "sam3_miss",
+  "reason": "vendor's stacked drink products visible on bicycle rack"
+ },
+ {
+  "sid": "00003624",
+  "instruction": "Change the location to Hollywood",
+  "concepts": [
+   "Mumbai"
+  ],
+  "ref_mask_frac": 0.2401,
+  "category": "ungroundable",
+  "reason": "Mumbai is literal place-name text on the sign"
+ },
+ {
+  "sid": "00003626",
+  "instruction": "Change the ad to a Coca-Cola logo",
+  "concepts": [
+   "T-Mobile ad"
+  ],
+  "ref_mask_frac": 0.152,
+  "category": "ungroundable",
+  "reason": "brand-name concept; only airline livery on plane, no distinct T-Mobile ad"
+ },
+ {
+  "sid": "00003650",
+  "instruction": "make it snowing",
+  "concepts": [
+   "snow"
+  ],
+  "ref_mask_frac": 1.0,
+  "category": "global",
+  "reason": "'make it snowing' is a scene-wide weather change"
+ },
+ {
+  "sid": "00003690",
+  "instruction": "transform them into ice sculptures",
+  "concepts": [
+   "bear"
+  ],
+  "ref_mask_frac": 0.5993,
+  "category": "sam3_miss",
+  "reason": "two bear-shaped fabric figures clearly visible"
+ },
+ {
+  "sid": "00003711",
+  "instruction": "Replace them with tiny houses on a meadow",
+  "concepts": [
+   "condom"
+  ],
+  "ref_mask_frac": 0.1223,
+  "category": "sam3_miss",
+  "reason": "condom packets visibly laid out on the fabric"
+ },
+ {
+  "sid": "00003769",
+  "instruction": "Change the word Niagara to a mountain range",
+  "concepts": [
+   "Niagara"
+  ],
+  "ref_mask_frac": 0.0743,
+  "category": "ungroundable",
+  "reason": "concept is literal word 'Niagara' printed on shirt"
+ },
+ {
+  "sid": "00003787",
+  "instruction": "Replace the ocean view with a bustling cityscape",
+  "concepts": [
+   "ocean"
+  ],
+  "ref_mask_frac": 0.1101,
+  "category": "sam3_miss",
+  "reason": "sliver of ocean visible through the balcony window"
+ },
+ {
+  "sid": "00003838",
+  "instruction": "change the water jug to a floating disco ball",
+  "concepts": [
+   "water jug"
+  ],
+  "ref_mask_frac": 0.5116,
+  "category": "sam3_miss",
+  "reason": "translucent hanging water jug at giraffe's mouth"
+ },
+ {
+  "sid": "00003924",
+  "instruction": "Add a flock of seagulls flying around him",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.9892,
+  "category": "concept_absent",
+  "reason": "frame is entirely ocean and wave, no sky"
+ },
+ {
+  "sid": "00003940",
+  "instruction": "Turn the meatball subs into ice cream cones",
+  "concepts": [
+   "meatball sub"
+  ],
+  "ref_mask_frac": 0.0366,
+  "category": "sam3_miss",
+  "reason": "sub sandwiches clearly visible on platter"
+ },
+ {
+  "sid": "00003944",
+  "instruction": "Add a rainbow in the background",
+  "concepts": [
+   "rainbow"
+  ],
+  "ref_mask_frac": 0.2388,
+  "category": "concept_absent",
+  "reason": "rainbow is the object to be added; market street has none"
+ },
+ {
+  "sid": "00003955",
+  "instruction": "Add a rainbow in the sky above the bus.",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.2471,
+  "category": "concept_absent",
+  "reason": "indoor TV shot, no real sky in frame"
+ },
+ {
+  "sid": "00003976",
+  "instruction": "transform the airplane into a train",
+  "concepts": [
+   "airplane"
+  ],
+  "ref_mask_frac": 0.3648,
+  "category": "global",
+  "reason": "transforming the airplane into a train rebuilds the entire cabin scene"
+ },
+ {
+  "sid": "00003987",
+  "instruction": "Transform the doughnut into a glittering golden trophy",
+  "concepts": [
+   "doughnut"
+  ],
+  "ref_mask_frac": 0.1429,
+  "category": "sam3_miss",
+  "reason": "girl holds visible pastry/doughnut in hands"
+ },
+ {
+  "sid": "00004013",
+  "instruction": "Add a whimsical rainbow above the elephant",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.5521,
+  "category": "sam3_miss",
+  "reason": "bright sky patches visible through the tree canopy"
+ },
+ {
+  "sid": "00004023",
+  "instruction": "add a rainbow arching over the ocean",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.649,
+  "category": "concept_absent",
+  "reason": "frame is entirely ocean waves, no sky"
+ },
+ {
+  "sid": "00004030",
+  "instruction": "turn the sand into a field of lavender",
+  "concepts": [
+   "sand"
+  ],
+  "ref_mask_frac": 0.4026,
+  "category": "sam3_miss",
+  "reason": "sandy shoreline strip visible in the framed beach painting"
+ },
+ {
+  "sid": "00004045",
+  "instruction": "Convert the townhouses into a serene beach view.",
+  "concepts": [
+   "townhouses"
+  ],
+  "ref_mask_frac": 0.1252,
+  "category": "sam3_miss",
+  "reason": "townhouses visible through bathroom window"
+ },
+ {
+  "sid": "00004097",
+  "instruction": "Add butterflies flying around the vase",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.2758,
+  "category": "concept_absent",
+  "reason": "indoor flower-in-vase shot; no sky"
+ },
+ {
+  "sid": "00004119",
+  "instruction": "Replace the shopping cart with a flying carpet",
+  "concepts": [
+   "shopping cart"
+  ],
+  "ref_mask_frac": 0.1828,
+  "category": "sam3_miss",
+  "reason": "shopping-cart sculpture clearly visible on pole"
+ },
+ {
+  "sid": "00004150",
+  "instruction": "change the sign to say \"Vintage Bookstore\"",
+  "concepts": [
+   "Psychic Boutique"
+  ],
+  "ref_mask_frac": 0.5119,
+  "category": "ungroundable",
+  "reason": "Psychic Boutique is literal sign text"
+ },
+ {
+  "sid": "00004152",
+  "instruction": "Add a flock of birds flying overhead",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.1942,
+  "category": "concept_absent",
+  "reason": "dense garden shrubs behind man, no visible sky"
+ },
+ {
+  "sid": "00004157",
+  "instruction": "Add a rainbow in the sky",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.3978,
+  "category": "concept_absent",
+  "reason": "rocks fill the background; no sky visible"
+ },
+ {
+  "sid": "00004177",
+  "instruction": "Add a rain effect",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.3221,
+  "category": "sam3_miss",
+  "reason": "bright sky patches visible through tree canopy"
+ },
+ {
+  "sid": "00004192",
+  "instruction": "Add a flock of birds flying overhead",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.1942,
+  "category": "concept_absent",
+  "reason": "dense garden foliage behind man, no sky"
+ },
+ {
+  "sid": "00004203",
+  "instruction": "add a rainbow in the sky",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.6787,
+  "category": "concept_absent",
+  "reason": "lawn/sidewalk scene; no sky visible in frame"
+ },
+ {
+  "sid": "00004208",
+  "instruction": "Replace the Cheetos with sushi rolls.",
+  "concepts": [
+   "Cheetos"
+  ],
+  "ref_mask_frac": 0.2116,
+  "category": "ungroundable",
+  "reason": "'Cheetos' is a brand/product name prompt"
+ },
+ {
+  "sid": "00004212",
+  "instruction": "Change the junked car into a giant floating bubble",
+  "concepts": [
+   "junked car"
+  ],
+  "ref_mask_frac": 0.3038,
+  "category": "sam3_miss",
+  "reason": "junked vehicle wreckage visible in the debris pile"
+ },
+ {
+  "sid": "00004213",
+  "instruction": "replace the furniture with oversized flowers.",
+  "concepts": [
+   "bed",
+   "furniture"
+  ],
+  "ref_mask_frac": 0.3388,
+  "category": "sam3_miss",
+  "reason": "mattress and household furniture visible on the pickup bed"
+ },
+ {
+  "sid": "00004237",
+  "instruction": "Surround it with a swarm of butterflies",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.4271,
+  "category": "concept_absent",
+  "reason": "fire hydrant close-up on sidewalk, no sky"
+ },
+ {
+  "sid": "00004298",
+  "instruction": "Replace the author with Jane Austen",
+  "concepts": [
+   "Ovid Demaris"
+  ],
+  "ref_mask_frac": 0.7054,
+  "category": "ungroundable",
+  "reason": "concept is an author's personal name on a book cover"
+ },
+ {
+  "sid": "00004299",
+  "instruction": "Transform the tennis ball into a flaming fireball",
+  "concepts": [
+   "tennis ball"
+  ],
+  "ref_mask_frac": 0.1994,
+  "category": "concept_absent",
+  "reason": "player and racket only, no tennis ball in frame"
+ },
+ {
+  "sid": "00004307",
+  "instruction": "Replace the remote with a fluffy plush toy",
+  "concepts": [
+   "remote"
+  ],
+  "ref_mask_frac": 0.0224,
+  "category": "sam3_miss",
+  "reason": "remote in baby's hands is visible"
+ },
+ {
+  "sid": "00004342",
+  "instruction": "Change Lady Explore to a mythical creature like a centaur",
+  "concepts": [
+   "Lady Explore"
+  ],
+  "ref_mask_frac": 0.4011,
+  "category": "ungroundable",
+  "reason": "'Lady Explore' is a team/jersey name text"
+ },
+ {
+  "sid": "00004392",
+  "instruction": "Replace Mr. T with a cartoon character",
+  "concepts": [
+   "Mr. T"
+  ],
+  "ref_mask_frac": 0.2693,
+  "category": "ungroundable",
+  "reason": "'Mr. T' is a personal name (printed on a mug)"
+ },
+ {
+  "sid": "00004415",
+  "instruction": "Turn the sky into a galaxy filled with stars",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.7934,
+  "category": "concept_absent",
+  "reason": "scooter rider against vehicles/wall, no sky visible"
+ },
+ {
+  "sid": "00004448",
+  "instruction": "Change the text to glowing neon green",
+  "concepts": [
+   "store is open"
+  ],
+  "ref_mask_frac": 0.0764,
+  "category": "ungroundable",
+  "reason": "'store is open' is a literal text string"
+ },
+ {
+  "sid": "00004452",
+  "instruction": "replace the steak with sushi rolls",
+  "concepts": [
+   "steak"
+  ],
+  "ref_mask_frac": 0.7286,
+  "category": "concept_absent",
+  "reason": "only a dark wrapped package labeled steak, no visible meat"
+ },
+ {
+  "sid": "00004459",
+  "instruction": "replace the Grand Canyon with a futuristic cityscape",
+  "concepts": [
+   "Grand Canyon"
+  ],
+  "ref_mask_frac": 0.2287,
+  "category": "ungroundable",
+  "reason": "Grand Canyon is a proper landmark name, only depicted inside a TV infographic"
+ },
+ {
+  "sid": "00004475",
+  "instruction": "Change the setting to a snowy winter wonderland",
+  "concepts": [
+   "wilds"
+  ],
+  "ref_mask_frac": 0.4588,
+  "category": "global",
+  "reason": "setting change to snowy winter wonderland"
+ },
+ {
+  "sid": "00004478",
+  "instruction": "Replace the controllers with magic wands",
+  "concepts": [
+   "video game controllers"
+  ],
+  "ref_mask_frac": 0.5264,
+  "category": "sam3_miss",
+  "reason": "controllers held by both men are visible"
+ },
+ {
+  "sid": "00004527",
+  "instruction": "Change the beer brand to Corona",
+  "concepts": [
+   "Beck's beer"
+  ],
+  "ref_mask_frac": 0.2459,
+  "category": "sam3_miss",
+  "reason": "Beck's beer bottle fills frame, clearly visible"
+ },
+ {
+  "sid": "00004558",
+  "instruction": "Add a rainbow in the background",
+  "concepts": [
+   "rug"
+  ],
+  "ref_mask_frac": 0.5586,
+  "category": "sam3_miss",
+  "reason": "carpet/rug floor clearly visible under the dog"
+ },
+ {
+  "sid": "00004587",
+  "instruction": "Change the team color to blue",
+  "concepts": [
+   "team color"
+  ],
+  "ref_mask_frac": 0.1681,
+  "category": "ungroundable",
+  "reason": "'team color' is an abstract attribute, not a segmentable object"
+ },
+ {
+  "sid": "00004660",
+  "instruction": "Transform the tennis ball into a burst of colorful confetti",
+  "concepts": [
+   "tennis ball"
+  ],
+  "ref_mask_frac": 0.921,
+  "category": "concept_absent",
+  "reason": "player and racket visible but no tennis ball in frame"
+ },
+ {
+  "sid": "00004667",
+  "instruction": "Change the sign to read Hotel Atlantica",
+  "concepts": [
+   "Hotel Horizontes Capri"
+  ],
+  "ref_mask_frac": 0.6989,
+  "category": "ungroundable",
+  "reason": "concept is hotel sign text/name"
+ },
+ {
+  "sid": "00004670",
+  "instruction": "Replace the hair strands with shimmering gemstones",
+  "concepts": [
+   "hair strands"
+  ],
+  "ref_mask_frac": 0.3874,
+  "category": "sam3_miss",
+  "reason": "tangled dark hair strands clearly visible"
+ },
+ {
+  "sid": "00004676",
+  "instruction": "Transform the sunny day into a starry night",
+  "concepts": [
+   "sunny"
+  ],
+  "ref_mask_frac": 0.1681,
+  "category": "global",
+  "reason": "day-to-starry-night whole-scene change"
+ },
+ {
+  "sid": "00004742",
+  "instruction": "transform the computer into a stack of books",
+  "concepts": [
+   "computer"
+  ],
+  "ref_mask_frac": 0.1127,
+  "category": "sam3_miss",
+  "reason": "laptop computer under the cat is visible"
+ },
+ {
+  "sid": "00004754",
+  "instruction": "change the grassland into a snowy winter wonderland",
+  "concepts": [
+   "grassland"
+  ],
+  "ref_mask_frac": 0.5275,
+  "category": "global",
+  "reason": "season change to snowy winter wonderland is scene-wide"
+ },
+ {
+  "sid": "00004765",
+  "instruction": "Replace the whale with a mermaid.",
+  "concepts": [
+   "whale"
+  ],
+  "ref_mask_frac": 0.3313,
+  "category": "sam3_miss",
+  "reason": "engraved whale/fish figure clearly visible on the coin"
+ },
+ {
+  "sid": "00004797",
+  "instruction": "replace the dog with a fluffy white bear",
+  "concepts": [
+   "dog"
+  ],
+  "ref_mask_frac": 0.0054,
+  "category": "sam3_miss",
+  "reason": "dog visible in the convertible's passenger area"
+ },
+ {
+  "sid": "00004827",
+  "instruction": "Change the color of the shirt to blue and add a floral pattern",
+  "concepts": [
+   "cloth shirt"
+  ],
+  "ref_mask_frac": 0.9964,
+  "category": "sam3_miss",
+  "reason": "patterned shirt cloth fills the entire frame"
+ },
+ {
+  "sid": "00004864",
+  "instruction": "Transform the doughnut into a glittering golden trophy",
+  "concepts": [
+   "doughnut"
+  ],
+  "ref_mask_frac": 0.1429,
+  "category": "sam3_miss",
+  "reason": "doughnut girl is biting is clearly visible"
+ },
+ {
+  "sid": "00004884",
+  "instruction": "Replace the pirate ship kite with a mystical dragon kite",
+  "concepts": [
+   "pirate boat kite"
+  ],
+  "ref_mask_frac": 0.1159,
+  "category": "sam3_miss",
+  "reason": "pirate ship kite clearly visible held by the girl"
+ },
+ {
+  "sid": "00004901",
+  "instruction": "Add a sparkling galaxy backdrop",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.9451,
+  "category": "global",
+  "reason": "galaxy backdrop replacement is a global edit"
+ },
+ {
+  "sid": "00004921",
+  "instruction": "replace the potato with a golden apple",
+  "concepts": [
+   "potato"
+  ],
+  "ref_mask_frac": 0.4049,
+  "category": "sam3_miss",
+  "reason": "potato depicted on the can label is visible"
+ },
+ {
+  "sid": "00004975",
+  "instruction": "Turn the baseball field into a beach setting",
+  "concepts": [
+   "baseball field"
+  ],
+  "ref_mask_frac": 0.4659,
+  "category": "global",
+  "reason": "turning field into beach setting replaces whole scene"
+ },
+ {
+  "sid": "00005029",
+  "instruction": "change the pool water to look like a sea beach",
+  "concepts": [
+   "pool"
+  ],
+  "ref_mask_frac": 0.062,
+  "category": "concept_absent",
+  "reason": "pool water not discernible; background is blurred/overexposed"
+ },
+ {
+  "sid": "00005035",
+  "instruction": "Add a rainbow effect to the image",
+  "concepts": [
+   "rainbow effect"
+  ],
+  "ref_mask_frac": 0.0597,
+  "category": "global",
+  "reason": "rainbow effect applied to the whole image is a global edit"
+ },
+ {
+  "sid": "00005054",
+  "instruction": "Transform the shrimp into butterflies",
+  "concepts": [
+   "shrimp"
+  ],
+  "ref_mask_frac": 0.5223,
+  "category": "sam3_miss",
+  "reason": "pink-orange shrimp topping visible on the bread being eaten"
+ },
+ {
+  "sid": "00005067",
+  "instruction": "turn the snowman into a giant ice sculpture",
+  "concepts": [
+   "snowman"
+  ],
+  "ref_mask_frac": 0.0378,
+  "category": "sam3_miss",
+  "reason": "large snowball/snowman under construction visible"
+ },
+ {
+  "sid": "00005120",
+  "instruction": "Change the word 'BARRE' to 'DANCE'",
+  "concepts": [
+   "BARRE"
+  ],
+  "ref_mask_frac": 0.988,
+  "category": "ungroundable",
+  "reason": "concept is the literal word 'BARRE' on the map"
+ },
+ {
+  "sid": "00005135",
+  "instruction": "Replace Alexa Chung with a famous historical figure",
+  "concepts": [
+   "Alexa Chung"
+  ],
+  "ref_mask_frac": 0.6681,
+  "category": "ungroundable",
+  "reason": "'Alexa Chung' is a personal name"
+ },
+ {
+  "sid": "00005137",
+  "instruction": "Add a rainbow in the background",
+  "concepts": [
+   "rainbow"
+  ],
+  "ref_mask_frac": 0.2388,
+  "category": "concept_absent",
+  "reason": "rainbow is the object to be added; none present"
+ },
+ {
+  "sid": "00005175",
+  "instruction": "replace cheese fries with onion rings",
+  "concepts": [
+   "cheese fries"
+  ],
+  "ref_mask_frac": 0.3793,
+  "category": "sam3_miss",
+  "reason": "bowl of fries topped with cheese clearly visible"
+ },
+ {
+  "sid": "00005190",
+  "instruction": "transform the TV remote into a book",
+  "concepts": [
+   "TV remote"
+  ],
+  "ref_mask_frac": 0.297,
+  "category": "sam3_miss",
+  "reason": "remote-like device with buttons visible next to the cat"
+ },
+ {
+  "sid": "00005327",
+  "instruction": "surround him with a swarm of butterflies",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.6141,
+  "category": "concept_absent",
+  "reason": "close-up of jacket and tie, no sky in frame"
+ },
+ {
+  "sid": "00005339",
+  "instruction": "Change the sky to a starry galaxy backdrop",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.755,
+  "category": "concept_absent",
+  "reason": "aerial view of river wave and bank; no sky visible"
+ },
+ {
+  "sid": "00005347",
+  "instruction": "add a burst of colorful butterflies flying around",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.1251,
+  "category": "concept_absent",
+  "reason": "indoor table with shakers and sweets, no sky"
+ },
+ {
+  "sid": "00005455",
+  "instruction": "Add a rainbow across the sky",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.5926,
+  "category": "sam3_miss",
+  "reason": "sky visible through trees at top-left of the pasture scene"
+ },
+ {
+  "sid": "00005459",
+  "instruction": "change the background to a snowy winter wonderland",
+  "concepts": [
+   "shade"
+  ],
+  "ref_mask_frac": 0.599,
+  "category": "global",
+  "reason": "background replaced with winter wonderland"
+ },
+ {
+  "sid": "00005460",
+  "instruction": "Transform the sandwich into a book",
+  "concepts": [
+   "sandwich"
+  ],
+  "ref_mask_frac": 0.0207,
+  "category": "sam3_miss",
+  "reason": "wrapped sandwich in her hands is visible"
+ },
+ {
+  "sid": "00005467",
+  "instruction": "Change the picture into a tropical beach scene",
+  "concepts": [
+   "picture"
+  ],
+  "ref_mask_frac": 0.5463,
+  "category": "sam3_miss",
+  "reason": "large arched-corridor mural picture visible above bed"
+ },
+ {
+  "sid": "00005468",
+  "instruction": "Add a miniature forest inside the bottle",
+  "concepts": [
+   "message"
+  ],
+  "ref_mask_frac": 0.2156,
+  "category": "sam3_miss",
+  "reason": "rolled paper message clearly visible inside the bottle"
+ },
+ {
+  "sid": "00005567",
+  "instruction": "Change the bears to unicorns",
+  "concepts": [
+   "bear"
+  ],
+  "ref_mask_frac": 0.0651,
+  "category": "sam3_miss",
+  "reason": "plush bear toys visible with both boys"
+ },
+ {
+  "sid": "00005608",
+  "instruction": "Add a rainbow in the sky",
+  "concepts": [
+   "ball"
+  ],
+  "ref_mask_frac": 0.519,
+  "category": "sam3_miss",
+  "reason": "ball-like object visible at the players' outstretched hands"
+ },
+ {
+  "sid": "00005617",
+  "instruction": "transform the design into a pixelated digital art piece",
+  "concepts": [
+   "Las Vegas print"
+  ],
+  "ref_mask_frac": 0.5403,
+  "category": "sam3_miss",
+  "reason": "Las Vegas printed design clearly visible on mug"
+ },
+ {
+  "sid": "00005645",
+  "instruction": "Make the cliff appear as a cascading waterfall",
+  "concepts": [
+   "cliff"
+  ],
+  "ref_mask_frac": 0.7881,
+  "category": "sam3_miss",
+  "reason": "rock cliff face clearly visible behind the giraffe"
+ },
+ {
+  "sid": "00005662",
+  "instruction": "Change the game to Mario Kart",
+  "concepts": [
+   "The Legend of Zelda"
+  ],
+  "ref_mask_frac": 0.7135,
+  "category": "ungroundable",
+  "reason": "'The Legend of Zelda' is a product/brand name"
+ },
+ {
+  "sid": "00005674",
+  "instruction": "Add a vibrant rainbow stretching across the sky between the elephants.",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.4922,
+  "category": "concept_absent",
+  "reason": "dense trees behind elephants, no sky visible"
+ },
+ {
+  "sid": "00005715",
+  "instruction": "Change windmills to lighthouses",
+  "concepts": [
+   "windmills"
+  ],
+  "ref_mask_frac": 0.0935,
+  "category": "sam3_miss",
+  "reason": "small windmill visible inside circular wall photo"
+ },
+ {
+  "sid": "00005745",
+  "instruction": "Change the label to read \"Sunshine Farms\"",
+  "concepts": [
+   "Van Camps"
+  ],
+  "ref_mask_frac": 0.2852,
+  "category": "ungroundable",
+  "reason": "'Van Camps' is a brand name on can labels"
+ },
+ {
+  "sid": "00005855",
+  "instruction": "Replace the teddy bear with a surreal abstract object",
+  "concepts": [
+   "teddy bear"
+  ],
+  "ref_mask_frac": 0.0657,
+  "category": "sam3_miss",
+  "reason": "tan plush teddy bear visible at woman's shoulder"
+ },
+ {
+  "sid": "00005856",
+  "instruction": "add a celestial backdrop with galaxies and stars",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.882,
+  "category": "global",
+  "reason": "adding a celestial backdrop is a background replacement of the scene"
+ },
+ {
+  "sid": "00005879",
+  "instruction": "Add a rainbow above the cat",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.3986,
+  "category": "concept_absent",
+  "reason": "indoor cat with shoe on carpet, no sky"
+ },
+ {
+  "sid": "00005887",
+  "instruction": "Transform the house into a fairytale castle, complete with turrets and a moat",
+  "concepts": [
+   "house"
+  ],
+  "ref_mask_frac": 0.6738,
+  "category": "sam3_miss",
+  "reason": "house exterior (wood siding) fills the frame around the sign"
+ },
+ {
+  "sid": "00005909",
+  "instruction": "Replace the lovebirds with miniature blooming flowers",
+  "concepts": [
+   "lovebirds"
+  ],
+  "ref_mask_frac": 0.3934,
+  "category": "sam3_miss",
+  "reason": "dove lovebird figurines on cake are visible"
+ },
+ {
+  "sid": "00005939",
+  "instruction": "Add a whimsical unicorn flying above the bag.",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.5302,
+  "category": "concept_absent",
+  "reason": "indoor shot of paper bag, no sky"
+ },
+ {
+  "sid": "00005954",
+  "instruction": "Replace the mushrooms with pineapple chunks",
+  "concepts": [
+   "mushroom"
+  ],
+  "ref_mask_frac": 0.2299,
+  "category": "sam3_miss",
+  "reason": "brown mushroom-like topping visible on hot dog"
+ },
+ {
+  "sid": "00005977",
+  "instruction": "Change the paddle into a flaming torch",
+  "concepts": [
+   "paddle"
+  ],
+  "ref_mask_frac": 0.0014,
+  "category": "sam3_miss",
+  "reason": "paddle/racquet visible in the player's hand"
+ },
+ {
+  "sid": "00005982",
+  "instruction": "Add a reflection of a rainbow in the mirror",
+  "concepts": [
+   "mirror"
+  ],
+  "ref_mask_frac": 0.4532,
+  "category": "concept_absent",
+  "reason": "no mirror visible, only doorway and frosted door"
+ },
+ {
+  "sid": "00006010",
+  "instruction": "Add a rainbow unicorn prancing in the background",
+  "concepts": [
+   "black tag"
+  ],
+  "ref_mask_frac": 1.0,
+  "category": "concept_absent",
+  "reason": "white shirt shows only a dark button; no black tag present"
+ },
+ {
+  "sid": "00006015",
+  "instruction": "Turn the bakery into a cozy coffee shop with customers inside",
+  "concepts": [
+   "customers"
+  ],
+  "ref_mask_frac": 0.2422,
+  "category": "global",
+  "reason": "turning the whole bakery into a coffee shop is a scene transformation"
+ },
+ {
+  "sid": "00006046",
+  "instruction": "Add a flaming dragon flying above",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.4807,
+  "category": "concept_absent",
+  "reason": "indoor pizza close-up; no sky visible"
+ },
+ {
+  "sid": "00006065",
+  "instruction": "Add a whimsical unicorn flying above the bag.",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.5302,
+  "category": "concept_absent",
+  "reason": "paper bag against wall, no sky in frame"
+ },
+ {
+  "sid": "00006089",
+  "instruction": "replace the meat with colorful confetti",
+  "concepts": [
+   "meat"
+  ],
+  "ref_mask_frac": 0.8301,
+  "category": "concept_absent",
+  "reason": "only a 'meat' label on an empty-looking bag; no meat visible"
+ },
+ {
+  "sid": "00006109",
+  "instruction": "Change the tennis racket to a guitar",
+  "concepts": [
+   "tennis racket"
+  ],
+  "ref_mask_frac": 0.0526,
+  "category": "sam3_miss",
+  "reason": "thin racket visible in bent-over player's hands"
+ },
+ {
+  "sid": "00006124",
+  "instruction": "turn the snowfall into cherry blossom petals",
+  "concepts": [
+   "snowfall"
+  ],
+  "ref_mask_frac": 0.3856,
+  "category": "sam3_miss",
+  "reason": "falling snowflakes clearly visible throughout the street scene"
+ },
+ {
+  "sid": "00006126",
+  "instruction": "Transform the pizza into a dessert pizza by adding chocolate syrup drizzle and marshmallows, replace the drink container with a milkshake, and replace the sunglasses with a dessert spoon",
+  "concepts": [
+   "sunglasses"
+  ],
+  "ref_mask_frac": 0.5964,
+  "category": "concept_absent",
+  "reason": "no sunglasses visible in the pizza scene"
+ },
+ {
+  "sid": "00006133",
+  "instruction": "replace the cooler with a vibrant display of tropical fruits",
+  "concepts": [
+   "cooler"
+  ],
+  "ref_mask_frac": 0.6143,
+  "category": "sam3_miss",
+  "reason": "glass-door beverage coolers clearly visible and dominant"
+ },
+ {
+  "sid": "00006183",
+  "instruction": "Transform the beans into colorful jellybeans",
+  "concepts": [
+   "pinto beans"
+  ],
+  "ref_mask_frac": 0.5447,
+  "category": "sam3_miss",
+  "reason": "pinto beans visible through clear package window"
+ },
+ {
+  "sid": "00006189",
+  "instruction": "Replace the stairwell with a cascading waterfall",
+  "concepts": [
+   "stairwell"
+  ],
+  "ref_mask_frac": 0.7439,
+  "category": "sam3_miss",
+  "reason": "staircase structure with railing visibly runs across the wall"
+ },
+ {
+  "sid": "00006213",
+  "instruction": "Transform the scene into a snowy winter wonderland",
+  "concepts": [
+   "horse"
+  ],
+  "ref_mask_frac": 0.3162,
+  "category": "global",
+  "reason": "scene transformed into winter wonderland"
+ },
+ {
+  "sid": "00006217",
+  "instruction": "Change the sky to a starry night",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.5376,
+  "category": "concept_absent",
+  "reason": "dark forest scene, no visible sky patches"
+ },
+ {
+  "sid": "00006239",
+  "instruction": "Replace the dog balloons with cat balloons",
+  "concepts": [
+   "dog balloons"
+  ],
+  "ref_mask_frac": 0.3931,
+  "category": "sam3_miss",
+  "reason": "dog-shaped balloon kites clearly visible in chain"
+ },
+ {
+  "sid": "00006250",
+  "instruction": "Add a rainbow over the train",
+  "concepts": [
+   "rainbow"
+  ],
+  "ref_mask_frac": 1.0,
+  "category": "concept_absent",
+  "reason": "rainbow is the object to be added; train landscape has none"
+ },
+ {
+  "sid": "00006270",
+  "instruction": "turn the person into a fairy and add a glowing halo above the dog's head",
+  "concepts": [
+   "person"
+  ],
+  "ref_mask_frac": 0.918,
+  "category": "concept_absent",
+  "reason": "only a dog on floor, no person discernible"
+ },
+ {
+  "sid": "00006342",
+  "instruction": "Replace the text with 'Unstoppable'",
+  "concepts": [
+   "Mission Impossible"
+  ],
+  "ref_mask_frac": 0.7692,
+  "category": "ungroundable",
+  "reason": "Mission Impossible is literal printed text on the shirt"
+ },
+ {
+  "sid": "00006411",
+  "instruction": "change the yoga studio to a haunted house",
+  "concepts": [
+   "yoga"
+  ],
+  "ref_mask_frac": 0.7555,
+  "category": "ungroundable",
+  "reason": "concept 'yoga' is sign text/abstract activity"
+ },
+ {
+  "sid": "00006474",
+  "instruction": "Replace the cheese bites with mini donuts",
+  "concepts": [
+   "cheese bites"
+  ],
+  "ref_mask_frac": 0.2992,
+  "category": "sam3_miss",
+  "reason": "cheese bites visibly depicted on the box artwork"
+ },
+ {
+  "sid": "00006502",
+  "instruction": "replace the wheels with giant donuts",
+  "concepts": [
+   "wheels"
+  ],
+  "ref_mask_frac": 0.5873,
+  "category": "sam3_miss",
+  "reason": "car and bicycle wheels clearly visible"
+ },
+ {
+  "sid": "00006527",
+  "instruction": "Change the surroundings to a snowy mountain peak",
+  "concepts": [
+   "surroundings"
+  ],
+  "ref_mask_frac": 1.0,
+  "category": "global",
+  "reason": "surroundings/setting replacement to snowy mountain"
+ },
+ {
+  "sid": "00006574",
+  "instruction": "change the wall text to Good Night",
+  "concepts": [
+   "wall text"
+  ],
+  "ref_mask_frac": 0.7598,
+  "category": "sam3_miss",
+  "reason": "painted mural text clearly visible on brick wall"
+ },
+ {
+  "sid": "00006586",
+  "instruction": "Add a flock of colorful birds flying overhead",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.9998,
+  "category": "concept_absent",
+  "reason": "close-up of blue fabric; no sky"
+ },
+ {
+  "sid": "00006588",
+  "instruction": "transform the computer into a stack of books",
+  "concepts": [
+   "computer"
+  ],
+  "ref_mask_frac": 0.1127,
+  "category": "sam3_miss",
+  "reason": "computer monitor/screen visible behind the cat"
+ },
+ {
+  "sid": "00006593",
+  "instruction": "transform the labels to read 'Magical Elixir'",
+  "concepts": [
+   "Elderberry Wine"
+  ],
+  "ref_mask_frac": 0.9741,
+  "category": "ungroundable",
+  "reason": "Elderberry Wine is literal label text/product name"
+ },
+ {
+  "sid": "00006664",
+  "instruction": "transform the design into a pixelated digital art piece",
+  "concepts": [
+   "Las Vegas print"
+  ],
+  "ref_mask_frac": 0.5403,
+  "category": "sam3_miss",
+  "reason": "Las Vegas printed design clearly visible on mug"
+ },
+ {
+  "sid": "00006700",
+  "instruction": "place her in a snowy winter setting",
+  "concepts": [
+   "snowy winter setting"
+  ],
+  "ref_mask_frac": 1.0,
+  "category": "global",
+  "reason": "placing her in a snowy winter setting is a background/setting replacement"
+ },
+ {
+  "sid": "00006706",
+  "instruction": "Add a rainbow shooting out of the hose",
+  "concepts": [
+   "wrench"
+  ],
+  "ref_mask_frac": 0.2661,
+  "category": "sam3_miss",
+  "reason": "hydrant wrench visible on top of the hydrant"
+ },
+ {
+  "sid": "00006785",
+  "instruction": "replace the Grand Canyon with a futuristic cityscape",
+  "concepts": [
+   "Grand Canyon"
+  ],
+  "ref_mask_frac": 0.2287,
+  "category": "ungroundable",
+  "reason": "Grand Canyon is a proper landmark name"
+ },
+ {
+  "sid": "00006812",
+  "instruction": "Add a magical rainbow arch above the elephants",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.1217,
+  "category": "concept_absent",
+  "reason": "zoo enclosure with building/trees behind elephants; no sky"
+ },
+ {
+  "sid": "00006830",
+  "instruction": "Change the kool aid man into a cartoon octopus",
+  "concepts": [
+   "kool aid man"
+  ],
+  "ref_mask_frac": 0.0605,
+  "category": "ungroundable",
+  "reason": "'kool aid man' is a brand mascot name (on a drink packet)"
+ },
+ {
+  "sid": "00006843",
+  "instruction": "add a flock of pigeons flying around",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.6157,
+  "category": "concept_absent",
+  "reason": "hydrant against wall and sidewalk, no sky"
+ },
+ {
+  "sid": "00006846",
+  "instruction": "Add twinkling fairy lights around the chair",
+  "concepts": [
+   "chair"
+  ],
+  "ref_mask_frac": 0.6991,
+  "category": "concept_absent",
+  "reason": "kitten sits in a blanket; no chair discernible in frame"
+ },
+ {
+  "sid": "00006873",
+  "instruction": "Add a rainbow above the puppy",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.3239,
+  "category": "concept_absent",
+  "reason": "puppy in indoor crate, no sky"
+ },
+ {
+  "sid": "00006966",
+  "instruction": "add a rainbow arching over the ocean",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.649,
+  "category": "concept_absent",
+  "reason": "frame is entirely ocean and waves; no sky visible"
+ },
+ {
+  "sid": "00006970",
+  "instruction": "Transform the glass bottle into a spaceship",
+  "concepts": [
+   "glass bottle"
+  ],
+  "ref_mask_frac": 0.4378,
+  "category": "sam3_miss",
+  "reason": "giant glass bottle sculpture fills the frame"
+ },
+ {
+  "sid": "00007014",
+  "instruction": "add a rainbow in the background",
+  "concepts": [
+   "rainbow"
+  ],
+  "ref_mask_frac": 0.7708,
+  "category": "concept_absent",
+  "reason": "rainbow is the object to be added; none present"
+ },
+ {
+  "sid": "00007021",
+  "instruction": "transform the toddler into a mermaid",
+  "concepts": [
+   "toddler"
+  ],
+  "ref_mask_frac": 0.1725,
+  "category": "sam3_miss",
+  "reason": "toddler standing on boogie board clearly visible"
+ },
+ {
+  "sid": "00007027",
+  "instruction": "Change the background to a tropical beach setting",
+  "concepts": [
+   "mountain lake"
+  ],
+  "ref_mask_frac": 0.4177,
+  "category": "global",
+  "reason": "background replaced with a tropical beach setting"
+ },
+ {
+  "sid": "00007037",
+  "instruction": "Add fairy lights around the headboard.",
+  "concepts": [
+   "headboard"
+  ],
+  "ref_mask_frac": 0.6667,
+  "category": "concept_absent",
+  "reason": "bed shown but no headboard visible in frame"
+ },
+ {
+  "sid": "00007045",
+  "instruction": "Add fairy lights around the headboard.",
+  "concepts": [
+   "headboard"
+  ],
+  "ref_mask_frac": 0.6667,
+  "category": "concept_absent",
+  "reason": "bed and dresser visible but no headboard in view"
+ },
+ {
+  "sid": "00007094",
+  "instruction": "Add a rainbow in the sky",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.4551,
+  "category": "concept_absent",
+  "reason": "elephants and dirt fill frame, no sky"
+ },
+ {
+  "sid": "00007129",
+  "instruction": "turn the medics into superheroes",
+  "concepts": [
+   "medics"
+  ],
+  "ref_mask_frac": 0.412,
+  "category": "sam3_miss",
+  "reason": "uniformed medics with stretcher visible in the newspaper photo"
+ },
+ {
+  "sid": "00007171",
+  "instruction": "replace the linoleum floor with a shimmering pool",
+  "concepts": [
+   "linoleum floor"
+  ],
+  "ref_mask_frac": 0.7577,
+  "category": "sam3_miss",
+  "reason": "linoleum floor covers most of the image"
+ },
+ {
+  "sid": "00007175",
+  "instruction": "Surround the dog with colorful butterflies",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.7653,
+  "category": "concept_absent",
+  "reason": "close-up of dog on blanket, no sky"
+ },
+ {
+  "sid": "00007189",
+  "instruction": "Transform the scene into a snowy winter wonderland",
+  "concepts": [
+   "silver car"
+  ],
+  "ref_mask_frac": 0.3913,
+  "category": "global",
+  "reason": "transform scene into winter wonderland is scene-wide"
+ },
+ {
+  "sid": "00007240",
+  "instruction": "Add a rainbow arching over the scene",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.7227,
+  "category": "concept_absent",
+  "reason": "pavement and wall fill the frame; no sky visible"
+ },
+ {
+  "sid": "00007250",
+  "instruction": "Surround the dog with a flock of butterflies",
+  "concepts": [
+   "ball"
+  ],
+  "ref_mask_frac": 0.7723,
+  "category": "concept_absent",
+  "reason": "dog running on grass, no ball present"
+ },
+ {
+  "sid": "00007278",
+  "instruction": "Replace the oatmeal product with a glowing crystal orb",
+  "concepts": [
+   "oatmeal product"
+  ],
+  "ref_mask_frac": 0.6219,
+  "category": "sam3_miss",
+  "reason": "Nature's Miracle oatmeal product bottle dominates the frame"
+ },
+ {
+  "sid": "00007332",
+  "instruction": "Convert the bear into a gingerbread cookie",
+  "concepts": [
+   "bear"
+  ],
+  "ref_mask_frac": 0.1285,
+  "category": "sam3_miss",
+  "reason": "teddy bear clearly visible on carpet"
+ },
+ {
+  "sid": "00007356",
+  "instruction": "Transform the racquet into a lightsaber",
+  "concepts": [
+   "racquet"
+  ],
+  "ref_mask_frac": 0.0053,
+  "category": "concept_absent",
+  "reason": "serving player and ball visible but no racquet in frame"
+ },
+ {
+  "sid": "00007375",
+  "instruction": "replace the donut with a vinyl record",
+  "concepts": [
+   "donut"
+  ],
+  "ref_mask_frac": 0.0357,
+  "category": "sam3_miss",
+  "reason": "chocolate donut held in front of man's eye"
+ },
+ {
+  "sid": "00007420",
+  "instruction": "Swap the man's face with a lion",
+  "concepts": [
+   "man's face"
+  ],
+  "ref_mask_frac": 0.6597,
+  "category": "concept_absent",
+  "reason": "man's face is cropped out of frame; only torso visible"
+ },
+ {
+  "sid": "00007441",
+  "instruction": "add twinkling stars in the background",
+  "concepts": [
+   "background"
+  ],
+  "ref_mask_frac": 0.978,
+  "category": "concept_absent",
+  "reason": "fabric close-up fills frame; no distinct background region"
+ },
+ {
+  "sid": "00007445",
+  "instruction": "Add a sparkling galaxy backdrop",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.9451,
+  "category": "global",
+  "reason": "'add a sparkling galaxy backdrop' is a backdrop replacement"
+ },
+ {
+  "sid": "00007473",
+  "instruction": "Make the bike neon pink with glowing lights.",
+  "concepts": [
+   "bike"
+  ],
+  "ref_mask_frac": 0.0755,
+  "category": "sam3_miss",
+  "reason": "exercise bike clearly visible in the room"
+ },
+ {
+  "sid": "00007475",
+  "instruction": "Change the gemstone to a blue sapphire",
+  "concepts": [
+   "gemstone"
+  ],
+  "ref_mask_frac": 0.0168,
+  "category": "sam3_miss",
+  "reason": "ring with small gemstone visible on finger despite blur"
+ },
+ {
+  "sid": "00007491",
+  "instruction": "replace the steak with sushi rolls",
+  "concepts": [
+   "steak"
+  ],
+  "ref_mask_frac": 0.7286,
+  "category": "concept_absent",
+  "reason": "dark wrapped package labeled steak, no visible meat"
+ },
+ {
+  "sid": "00007498",
+  "instruction": "Replace the zoo animal decorations with graffiti art",
+  "concepts": [
+   "zoo animal decorations"
+  ],
+  "ref_mask_frac": 0.3897,
+  "category": "sam3_miss",
+  "reason": "animal artwork decorations visibly painted on the bus side"
+ },
+ {
+  "sid": "00007501",
+  "instruction": "change the setting to a snowy forest",
+  "concepts": [
+   "brush"
+  ],
+  "ref_mask_frac": 0.1602,
+  "category": "global",
+  "reason": "setting change to a snowy forest"
+ },
+ {
+  "sid": "00007507",
+  "instruction": "replace the meat with colorful confetti",
+  "concepts": [
+   "meat"
+  ],
+  "ref_mask_frac": 0.8301,
+  "category": "concept_absent",
+  "reason": "only a 'meat' label on the bag; no meat visible"
+ },
+ {
+  "sid": "00007562",
+  "instruction": "Replace the Nintendo Wii controller with a magical orb",
+  "concepts": [
+   "Nintendo Wii controller"
+  ],
+  "ref_mask_frac": 0.0086,
+  "category": "sam3_miss",
+  "reason": "white Wii remote visible held to boy's ear"
+ },
+ {
+  "sid": "00007580",
+  "instruction": "transform the ear buds into flowers",
+  "concepts": [
+   "ear buds"
+  ],
+  "ref_mask_frac": 0.0167,
+  "category": "sam3_miss",
+  "reason": "earbuds clearly visible on the laptop keyboard"
+ },
+ {
+  "sid": "00007621",
+  "instruction": "Replace Las Vegas with a tropical beach scene",
+  "concepts": [
+   "Las Vegas"
+  ],
+  "ref_mask_frac": 0.8711,
+  "category": "ungroundable",
+  "reason": "concept is place-name text 'Las Vegas' on mug"
+ },
+ {
+  "sid": "00007640",
+  "instruction": "Change the sign to say 'new beginnings'",
+  "concepts": [
+   "dead end"
+  ],
+  "ref_mask_frac": 0.0316,
+  "category": "ungroundable",
+  "reason": "dead end is literal text on the road sign"
+ },
+ {
+  "sid": "00007655",
+  "instruction": "replace the muffins with sushi rolls",
+  "concepts": [
+   "muffin"
+  ],
+  "ref_mask_frac": 0.2547,
+  "category": "sam3_miss",
+  "reason": "English muffin sandwiches clearly visible"
+ },
+ {
+  "sid": "00007675",
+  "instruction": "Replace the word 'scholastic' with 'explorer'",
+  "concepts": [
+   "scholastic"
+  ],
+  "ref_mask_frac": 0.7934,
+  "category": "ungroundable",
+  "reason": "concept is the literal word 'scholastic' on the bus"
+ },
+ {
+  "sid": "00007690",
+  "instruction": "Replace the apple computers with books",
+  "concepts": [
+   "apple computer"
+  ],
+  "ref_mask_frac": 0.2848,
+  "category": "sam3_miss",
+  "reason": "several white Apple laptops clearly visible"
+ },
+ {
+  "sid": "00007710",
+  "instruction": "add a celestial backdrop with galaxies and stars",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.882,
+  "category": "global",
+  "reason": "adding a celestial backdrop is background replacement"
+ },
+ {
+  "sid": "00007841",
+  "instruction": "Transform it into a winter wonderland",
+  "concepts": [
+   "damaged by water"
+  ],
+  "ref_mask_frac": 1.0,
+  "category": "global",
+  "reason": "transform it into winter wonderland is scene-wide"
+ },
+ {
+  "sid": "00007845",
+  "instruction": "turn the cat into a tiger",
+  "concepts": [
+   "cat"
+  ],
+  "ref_mask_frac": 0.0138,
+  "category": "sam3_miss",
+  "reason": "cat visibly curled up on the motorcycle cover"
+ },
+ {
+  "sid": "00007855",
+  "instruction": "Transform the rice grains into twinkling stars",
+  "concepts": [
+   "rice grains"
+  ],
+  "ref_mask_frac": 0.2794,
+  "category": "sam3_miss",
+  "reason": "rice grains visible on the package in drawer"
+ },
+ {
+  "sid": "00007873",
+  "instruction": "Surround the hydrant with colorful butterflies",
+  "concepts": [
+   "black and white area"
+  ],
+  "ref_mask_frac": 0.7633,
+  "category": "sam3_miss",
+  "reason": "desaturated black-and-white surroundings clearly visible around hydrant"
+ },
+ {
+  "sid": "00007883",
+  "instruction": "Add twinkling stars around the cat",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.3741,
+  "category": "concept_absent",
+  "reason": "cat on plaid blanket indoors, no sky"
+ },
+ {
+  "sid": "00007887",
+  "instruction": "add a mountain backdrop to the scene",
+  "concepts": [
+   "white placket"
+  ],
+  "ref_mask_frac": 0.8985,
+  "category": "global",
+  "reason": "adding a mountain backdrop is a background/scene edit"
+ },
+ {
+  "sid": "00007893",
+  "instruction": "Replace Las Vegas with a tropical beach scene",
+  "concepts": [
+   "Las Vegas"
+  ],
+  "ref_mask_frac": 0.8711,
+  "category": "ungroundable",
+  "reason": "'Las Vegas' is a place name/text on mug"
+ },
+ {
+  "sid": "00007964",
+  "instruction": "3. \"Add fairy lights around the chair for a magical effect.\"",
+  "concepts": [
+   "chair"
+  ],
+  "ref_mask_frac": 0.5622,
+  "category": "sam3_miss",
+  "reason": "wooden chair/bench under the cat is visible"
+ },
+ {
+  "sid": "00007968",
+  "instruction": "Change the street name to 'Bollywood Boulevard'",
+  "concepts": [
+   "Ronald Reagan Allee"
+  ],
+  "ref_mask_frac": 0.0776,
+  "category": "ungroundable",
+  "reason": "street-name text on sign, a proper name string"
+ },
+ {
+  "sid": "00007975",
+  "instruction": "Change the letters to read NBA",
+  "concepts": [
+   "BAH"
+  ],
+  "ref_mask_frac": 0.6129,
+  "category": "ungroundable",
+  "reason": "'BAH' is literal lettering on an athlete's bib"
+ },
+ {
+  "sid": "00008011",
+  "instruction": "Turn it into a vintage typewriter",
+  "concepts": [
+   "laptop"
+  ],
+  "ref_mask_frac": 0.1131,
+  "category": "sam3_miss",
+  "reason": "laptop with keyboard visible under the cat"
+ },
+ {
+  "sid": "00008017",
+  "instruction": "replace the textbooks with vintage comic books",
+  "concepts": [
+   "American Journal of Pathology"
+  ],
+  "ref_mask_frac": 0.6448,
+  "category": "ungroundable",
+  "reason": "American Journal of Pathology is a literal book title"
+ },
+ {
+  "sid": "00008041",
+  "instruction": "add colorful butterflies flying around",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.4282,
+  "category": "concept_absent",
+  "reason": "vegetation and dirt behind elephants, no visible sky"
+ },
+ {
+  "sid": "00008055",
+  "instruction": "Replace the game title with Mario Kart",
+  "concepts": [
+   "Left 4 Dead 2"
+  ],
+  "ref_mask_frac": 0.4632,
+  "category": "ungroundable",
+  "reason": "concept is the game title 'Left 4 Dead 2'"
+ },
+ {
+  "sid": "00008081",
+  "instruction": "Transform the snowball into a flaming fireball",
+  "concepts": [
+   "snowball"
+  ],
+  "ref_mask_frac": 0.0607,
+  "category": "concept_absent",
+  "reason": "skier on slope, no discrete snowball visible"
+ },
+ {
+  "sid": "00008167",
+  "instruction": "Change the lighting to neon pink",
+  "concepts": [
+   "lighting"
+  ],
+  "ref_mask_frac": 0.4241,
+  "category": "global",
+  "reason": "lighting/color grading change to neon pink"
+ },
+ {
+  "sid": "00008176",
+  "instruction": "place her in a snowy winter setting",
+  "concepts": [
+   "snowy winter setting"
+  ],
+  "ref_mask_frac": 1.0,
+  "category": "global",
+  "reason": "placing her in snowy setting replaces surroundings"
+ },
+ {
+  "sid": "00008189",
+  "instruction": "Give the teddy bears sunglasses and Hawaiian leis",
+  "concepts": [
+   "sunglasses"
+  ],
+  "ref_mask_frac": 0.6836,
+  "category": "concept_absent",
+  "reason": "sunglasses are the object to be added; teddy bears wear none"
+ },
+ {
+  "sid": "00008195",
+  "instruction": "transform the cans into colorful balloons",
+  "concepts": [
+   "cans"
+  ],
+  "ref_mask_frac": 0.3005,
+  "category": "concept_absent",
+  "reason": "truck load is wrapped bundles, no cans discernible"
+ },
+ {
+  "sid": "00008207",
+  "instruction": "Replace the device with a glowing crystal ball.",
+  "concepts": [
+   "device"
+  ],
+  "ref_mask_frac": 0.348,
+  "category": "sam3_miss",
+  "reason": "handheld device visible in the monk's hands"
+ },
+ {
+  "sid": "00008258",
+  "instruction": "Change the smiley faces into intricate mandalas",
+  "concepts": [
+   "smiley faces"
+  ],
+  "ref_mask_frac": 0.0292,
+  "category": "sam3_miss",
+  "reason": "bento food face (mandarin with blueberry smiley) visible"
+ },
+ {
+  "sid": "00008272",
+  "instruction": "change the grassland into a snowy winter wonderland",
+  "concepts": [
+   "grassland"
+  ],
+  "ref_mask_frac": 0.5275,
+  "category": "global",
+  "reason": "changing scene into snowy winter wonderland is season/scene-wide edit"
+ },
+ {
+  "sid": "00008311",
+  "instruction": "Add a rainbow stretching across the sky above the elephants.",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.6853,
+  "category": "sam3_miss",
+  "reason": "sky glimpses visible through forest canopy"
+ },
+ {
+  "sid": "00008359",
+  "instruction": "Add a rainbow in the background above the ponies.",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.5012,
+  "category": "concept_absent",
+  "reason": "dirt paddock behind pony, no sky in frame"
+ },
+ {
+  "sid": "00008361",
+  "instruction": "Change the weather to a sunny day with a rainbow in the sky",
+  "concepts": [
+   "rainy"
+  ],
+  "ref_mask_frac": 0.6536,
+  "category": "global",
+  "reason": "weather change to sunny day is scene-wide"
+ },
+ {
+  "sid": "00008365",
+  "instruction": "turn the carafe into a crystal ball",
+  "concepts": [
+   "syrup carafe"
+  ],
+  "ref_mask_frac": 0.1834,
+  "category": "sam3_miss",
+  "reason": "glass carafe clearly visible holding the flower"
+ },
+ {
+  "sid": "00008384",
+  "instruction": "Replace the pipe with a crystal ball",
+  "concepts": [
+   "pipe"
+  ],
+  "ref_mask_frac": 0.5418,
+  "category": "sam3_miss",
+  "reason": "smoking pipe clearly held in the man's hand"
+ },
+ {
+  "sid": "00008416",
+  "instruction": "Change the sign to read 'Electric Boulevard' in neon colors",
+  "concepts": [
+   "Spauling Ave"
+  ],
+  "ref_mask_frac": 0.3167,
+  "category": "ungroundable",
+  "reason": "Spauling Ave is a literal street-sign name"
+ },
+ {
+  "sid": "00008431",
+  "instruction": "transform the scene into a snowy winter wonderland",
+  "concepts": [
+   "snowy winter wonderland"
+  ],
+  "ref_mask_frac": 0.5005,
+  "category": "global",
+  "reason": "transform scene into snowy winter wonderland is a whole-scene edit"
+ },
+ {
+  "sid": "00008442",
+  "instruction": "Replace the apple computers with books",
+  "concepts": [
+   "apple computer"
+  ],
+  "ref_mask_frac": 0.2848,
+  "category": "sam3_miss",
+  "reason": "white Apple laptops clearly visible on the man's lap"
+ },
+ {
+  "sid": "00008468",
+  "instruction": "Replace the plastic bat with a lightsaber",
+  "concepts": [
+   "plastic bat"
+  ],
+  "ref_mask_frac": 0.0059,
+  "category": "sam3_miss",
+  "reason": "boy gripping the bat, handle visible in frame"
+ },
+ {
+  "sid": "00008481",
+  "instruction": "replace the wheels with giant donuts",
+  "concepts": [
+   "wheels"
+  ],
+  "ref_mask_frac": 0.5873,
+  "category": "concept_absent",
+  "reason": "rear view of bus, wheels not visible"
+ },
+ {
+  "sid": "00008528",
+  "instruction": "Transform the snowball into a flaming fireball",
+  "concepts": [
+   "snowball"
+  ],
+  "ref_mask_frac": 0.0607,
+  "category": "concept_absent",
+  "reason": "no distinct snowball discernible against snowy slope"
+ },
+ {
+  "sid": "00008562",
+  "instruction": "Replace the building with a lighthouse",
+  "concepts": [
+   "building"
+  ],
+  "ref_mask_frac": 0.7647,
+  "category": "concept_absent",
+  "reason": "no building visible; truck with boat against hazy sky and branches"
+ },
+ {
+  "sid": "00008580",
+  "instruction": "Turn the tunnel into a vibrant rainbow",
+  "concepts": [
+   "tunnel"
+  ],
+  "ref_mask_frac": 0.8161,
+  "category": "sam3_miss",
+  "reason": "subway tunnel clearly visible around the train"
+ },
+ {
+  "sid": "00008658",
+  "instruction": "Change the baking dish into a bouquet of colorful balloons.",
+  "concepts": [
+   "baking dish"
+  ],
+  "ref_mask_frac": 0.1677,
+  "category": "sam3_miss",
+  "reason": "dish/container with crumbly contents visible in person's hands"
+ },
+ {
+  "sid": "00008733",
+  "instruction": "Transform the letter into a blooming flower",
+  "concepts": [
+   "K"
+  ],
+  "ref_mask_frac": 0.0034,
+  "category": "ungroundable",
+  "reason": "concept is handwritten letter 'K' (literal text)"
+ },
+ {
+  "sid": "00008735",
+  "instruction": "Change the color to navy blue",
+  "concepts": [
+   "polo shirt"
+  ],
+  "ref_mask_frac": 0.9296,
+  "category": "sam3_miss",
+  "reason": "the shirt garment fills the frame and is clearly visible"
+ },
+ {
+  "sid": "00008760",
+  "instruction": "Change the LED screen to a holographic display showing a futuristic cityscape.",
+  "concepts": [
+   "LED screen"
+  ],
+  "ref_mask_frac": 0.7742,
+  "category": "sam3_miss",
+  "reason": "blurry LED display with digits fills the frame"
+ },
+ {
+  "sid": "00008778",
+  "instruction": "Add a whimsical rainbow in the sky above them",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.2657,
+  "category": "concept_absent",
+  "reason": "elephants under thatched shelter, no sky visible"
+ },
+ {
+  "sid": "00008781",
+  "instruction": "Change the hat into a miniature forest scene",
+  "concepts": [
+   "hat"
+  ],
+  "ref_mask_frac": 0.3679,
+  "category": "sam3_miss",
+  "reason": "leopard-print hat clearly visible atop hydrant"
+ },
+ {
+  "sid": "00008807",
+  "instruction": "Turn it into a galaxy theme",
+  "concepts": [
+   "Whipped Buttercream"
+  ],
+  "ref_mask_frac": 0.9921,
+  "category": "global",
+  "reason": "'turn it into a galaxy theme' is a whole-image theme change"
+ },
+ {
+  "sid": "00008825",
+  "instruction": "add a rainbow over the watering hole",
+  "concepts": [
+   "watering hole"
+  ],
+  "ref_mask_frac": 0.6365,
+  "category": "sam3_miss",
+  "reason": "watering hole with elephants clearly visible"
+ },
+ {
+  "sid": "00008845",
+  "instruction": "change the grassland into a snowy winter wonderland",
+  "concepts": [
+   "grassland"
+  ],
+  "ref_mask_frac": 0.5275,
+  "category": "global",
+  "reason": "converting terrain to snowy winter wonderland is a whole-scene change"
+ },
+ {
+  "sid": "00008859",
+  "instruction": "Surround the plant with floating fairy lights",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.3264,
+  "category": "concept_absent",
+  "reason": "indoor potted plant on table, no sky"
+ },
+ {
+  "sid": "00008864",
+  "instruction": "Change the titles to \"My Life\" by Bill Clinton",
+  "concepts": [
+   "Barack Obama"
+  ],
+  "ref_mask_frac": 0.725,
+  "category": "ungroundable",
+  "reason": "Barack Obama is a personal name"
+ },
+ {
+  "sid": "00008929",
+  "instruction": "replace the text with 'Healthy Living'",
+  "concepts": [
+   "hungerectomy"
+  ],
+  "ref_mask_frac": 0.1729,
+  "category": "ungroundable",
+  "reason": "'hungerectomy' is literal billboard text"
+ },
+ {
+  "sid": "00008950",
+  "instruction": "Add a rainbow in the sky",
+  "concepts": [
+   "gentleman"
+  ],
+  "ref_mask_frac": 0.3456,
+  "category": "concept_absent",
+  "reason": "no clearly visible gentleman; only a distant umbrella"
+ },
+ {
+  "sid": "00008956",
+  "instruction": "surround him with a swarm of butterflies",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.6141,
+  "category": "concept_absent",
+  "reason": "close-up of man's collar and tie; no sky"
+ },
+ {
+  "sid": "00008960",
+  "instruction": "Add fairy lights above the bed",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.3063,
+  "category": "concept_absent",
+  "reason": "indoor bedroom shot; no sky"
+ },
+ {
+  "sid": "00008963",
+  "instruction": "Replace the bottle of lotion with a colorful mug",
+  "concepts": [
+   "bottle of lotion"
+  ],
+  "ref_mask_frac": 0.24,
+  "category": "sam3_miss",
+  "reason": "white lotion container visible on the counter"
+ },
+ {
+  "sid": "00008993",
+  "instruction": "Replace the calculator with a book",
+  "concepts": [
+   "calculator"
+  ],
+  "ref_mask_frac": 0.0524,
+  "category": "sam3_miss",
+  "reason": "calculator-like keypad device visible in toddler's hand"
+ },
+ {
+  "sid": "00009019",
+  "instruction": "Add a flock of magical flying unicorns in the background",
+  "concepts": [
+   "Calcott Road"
+  ],
+  "ref_mask_frac": 0.516,
+  "category": "ungroundable",
+  "reason": "concept is street-name sign text 'Calcott Road'"
+ },
+ {
+  "sid": "00009035",
+  "instruction": "Transform the tractor into a vintage wooden sailing ship",
+  "concepts": [
+   "tractor"
+  ],
+  "ref_mask_frac": 0.029,
+  "category": "concept_absent",
+  "reason": "harbor with boat and pier; no tractor present"
+ },
+ {
+  "sid": "00009037",
+  "instruction": "Replace the desert with a lush, tropical rainforest",
+  "concepts": [
+   "desert"
+  ],
+  "ref_mask_frac": 0.9243,
+  "category": "global",
+  "reason": "entire desert surroundings replaced with rainforest"
+ },
+ {
+  "sid": "00009159",
+  "instruction": "Transform them into astronauts exploring Mars",
+  "concepts": [
+   "trolley car"
+  ],
+  "ref_mask_frac": 0.2085,
+  "category": "sam3_miss",
+  "reason": "green trolley/shuttle car is clearly visible"
+ },
+ {
+  "sid": "00009169",
+  "instruction": "Replace George Bush with a famous historical figure",
+  "concepts": [
+   "George Bush"
+  ],
+  "ref_mask_frac": 0.0379,
+  "category": "ungroundable",
+  "reason": "personal name George Bush, only text/photo on newspaper"
+ },
+ {
+  "sid": "00009174",
+  "instruction": "Change the sky to a starry night",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.0205,
+  "category": "concept_absent",
+  "reason": "dense foliage and rock wall fill background; no clear sky visible"
+ },
+ {
+  "sid": "00009177",
+  "instruction": "Replace the Cinnamon buns with colorful fruit tarts",
+  "concepts": [
+   "Cinnamon buns"
+  ],
+  "ref_mask_frac": 0.253,
+  "category": "sam3_miss",
+  "reason": "glazed cinnamon bun clearly visible in bowl"
+ },
+ {
+  "sid": "00009198",
+  "instruction": "Add a rainbow in the background",
+  "concepts": [
+   "military vehicles"
+  ],
+  "ref_mask_frac": 0.2879,
+  "category": "sam3_miss",
+  "reason": "military fighter jet clearly visible on the tarmac"
+ },
+ {
+  "sid": "00009228",
+  "instruction": "Replace the pizza with a giant ice cream cone",
+  "concepts": [
+   "pizza"
+  ],
+  "ref_mask_frac": 0.0326,
+  "category": "sam3_miss",
+  "reason": "pizza slice boy is eating is clearly visible"
+ },
+ {
+  "sid": "00009238",
+  "instruction": "replace the boy with a ghostly figure",
+  "concepts": [
+   "boy"
+  ],
+  "ref_mask_frac": 0.1473,
+  "category": "sam3_miss",
+  "reason": "boy-like young person visible at the parking meter among pedestrians"
+ },
+ {
+  "sid": "00009244",
+  "instruction": "Change the tablet into a crystal ball",
+  "concepts": [
+   "tablet"
+  ],
+  "ref_mask_frac": 0.1238,
+  "category": "sam3_miss",
+  "reason": "white tablet-like object held by man is visible"
+ },
+ {
+  "sid": "00009286",
+  "instruction": "Surround the cat with floating bubbles",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.6458,
+  "category": "concept_absent",
+  "reason": "indoor cat on red couch, no sky"
+ },
+ {
+  "sid": "00009312",
+  "instruction": "Replace the apple computers with books",
+  "concepts": [
+   "apple computer"
+  ],
+  "ref_mask_frac": 0.2848,
+  "category": "sam3_miss",
+  "reason": "white Apple laptops clearly visible in foreground"
+ },
+ {
+  "sid": "00009330",
+  "instruction": "Transform the scene into a winter wonderland with falling snow",
+  "concepts": [
+   "cushion"
+  ],
+  "ref_mask_frac": 0.7406,
+  "category": "global",
+  "reason": "scene transformed into a winter wonderland (whole-scene change)"
+ },
+ {
+  "sid": "00009346",
+  "instruction": "Replace the baby powder with glitter",
+  "concepts": [
+   "baby powder"
+  ],
+  "ref_mask_frac": 0.734,
+  "category": "sam3_miss",
+  "reason": "Angel baby powder bottle clearly visible"
+ },
+ {
+  "sid": "00009394",
+  "instruction": "Add a rainbow in the sky",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.3587,
+  "category": "concept_absent",
+  "reason": "elephants against grass bank; no sky in frame"
+ },
+ {
+  "sid": "00009415",
+  "instruction": "Add a flock of colorful birds flying overhead",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.9998,
+  "category": "concept_absent",
+  "reason": "image is blue fabric close-up, no sky"
+ },
+ {
+  "sid": "00009423",
+  "instruction": "add a fantasy background with unicorns and rainbows",
+  "concepts": [
+   "glass container"
+  ],
+  "ref_mask_frac": 0.667,
+  "category": "global",
+  "reason": "adding a fantasy background is a background replacement"
+ },
+ {
+  "sid": "00009462",
+  "instruction": "overlay a shimmering holographic pattern",
+  "concepts": [
+   "computer bag"
+  ],
+  "ref_mask_frac": 0.7677,
+  "category": "sam3_miss",
+  "reason": "computer bag close-up fills the frame"
+ },
+ {
+  "sid": "00009503",
+  "instruction": "add colorful fairy lights",
+  "concepts": [
+   "dish"
+  ],
+  "ref_mask_frac": 0.7118,
+  "category": "sam3_miss",
+  "reason": "silver cake stand/dish under the cake is visible"
+ },
+ {
+  "sid": "00009527",
+  "instruction": "replace the potato with a golden apple",
+  "concepts": [
+   "potato"
+  ],
+  "ref_mask_frac": 0.4049,
+  "category": "sam3_miss",
+  "reason": "potatoes visibly pictured on can label"
+ },
+ {
+  "sid": "00009538",
+  "instruction": "Replace the kite with a hot air balloon",
+  "concepts": [
+   "kite"
+  ],
+  "ref_mask_frac": 0.0149,
+  "category": "concept_absent",
+  "reason": "kite itself is out of frame; only lines and bar visible"
+ },
+ {
+  "sid": "00009540",
+  "instruction": "Replace the purse with a stack of books.",
+  "concepts": [
+   "purse"
+  ],
+  "ref_mask_frac": 0.082,
+  "category": "sam3_miss",
+  "reason": "floral purse visible under the cat"
+ },
+ {
+  "sid": "00009607",
+  "instruction": "Change the sky to a whimsical galaxy",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.4877,
+  "category": "concept_absent",
+  "reason": "street crowd fills background; no sky visible"
+ },
+ {
+  "sid": "00009614",
+  "instruction": "Change the street sign to read Broadway and 5th Avenue",
+  "concepts": [
+   "Emile-Buploye",
+   "Sherbrooke"
+  ],
+  "ref_mask_frac": 0.1049,
+  "category": "ungroundable",
+  "reason": "concepts are street sign names (literal text)"
+ },
+ {
+  "sid": "00009673",
+  "instruction": "Change the text to glowing neon green",
+  "concepts": [
+   "store is open"
+  ],
+  "ref_mask_frac": 0.0764,
+  "category": "ungroundable",
+  "reason": "concept is the literal text 'store is open'"
+ },
+ {
+  "sid": "00009675",
+  "instruction": "Replace the valley with a futuristic cityscape.",
+  "concepts": [
+   "valley"
+  ],
+  "ref_mask_frac": 0.7795,
+  "category": "global",
+  "reason": "whole aerial landscape replaced with cityscape"
+ },
+ {
+  "sid": "00009699",
+  "instruction": "change the label to read \"Magic Elixir\"",
+  "concepts": [
+   "Aktie"
+  ],
+  "ref_mask_frac": 0.9214,
+  "category": "ungroundable",
+  "reason": "Aktie is brand label text on the bottle"
+ },
+ {
+  "sid": "00009740",
+  "instruction": "Add a mystical forest background",
+  "concepts": [
+   "mystical forest background"
+  ],
+  "ref_mask_frac": 0.1517,
+  "category": "global",
+  "reason": "adding mystical forest background replaces backdrop"
+ },
+ {
+  "sid": "00009790",
+  "instruction": "add a rainbow in the background",
+  "concepts": [
+   "car"
+  ],
+  "ref_mask_frac": 1.0,
+  "category": "concept_absent",
+  "reason": "no car visible; bird flying over a wall and fence"
+ },
+ {
+  "sid": "00009838",
+  "instruction": "Add a whimsical unicorn flying above the bag.",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.5302,
+  "category": "concept_absent",
+  "reason": "indoor shot of paper bag against wall, no sky"
+ },
+ {
+  "sid": "00009856",
+  "instruction": "Transform the sandwich into a dragon",
+  "concepts": [
+   "sandwich"
+  ],
+  "ref_mask_frac": 0.0031,
+  "category": "concept_absent",
+  "reason": "boy holds a small wrapped snack; no sandwich visible"
+ },
+ {
+  "sid": "00009857",
+  "instruction": "Change the sky to a vibrant purple hue",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.0129,
+  "category": "sam3_miss",
+  "reason": "bright sky visible between buildings at top of street"
+ },
+ {
+  "sid": "00009866",
+  "instruction": "transform the silhouette into a city skyline",
+  "concepts": [
+   "silhouette"
+  ],
+  "ref_mask_frac": 0.8813,
+  "category": "sam3_miss",
+  "reason": "dark silhouette shapes of the woven portrait visibly present"
+ },
+ {
+  "sid": "00009869",
+  "instruction": "Change the lighting to neon pink",
+  "concepts": [
+   "lighting"
+  ],
+  "ref_mask_frac": 0.4241,
+  "category": "global",
+  "reason": "lighting/color-grade change to neon pink"
+ },
+ {
+  "sid": "00009916",
+  "instruction": "Transform Hamlet into a tiny fairy",
+  "concepts": [
+   "Hamlet"
+  ],
+  "ref_mask_frac": 0.3489,
+  "category": "ungroundable",
+  "reason": "Hamlet is a personal/title name (book cover text)"
+ },
+ {
+  "sid": "00009924",
+  "instruction": "Change the spread to blueberry flavor",
+  "concepts": [
+   "strawberry spread"
+  ],
+  "ref_mask_frac": 0.8258,
+  "category": "sam3_miss",
+  "reason": "strawberry spread jar with visible contents fills frame"
+ },
+ {
+  "sid": "00009942",
+  "instruction": "Surround them with floating bubbles",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.5789,
+  "category": "concept_absent",
+  "reason": "indoor cats on a blanket; no sky"
+ },
+ {
+  "sid": "00009947",
+  "instruction": "Add a flock of birds flying around the backhoe.",
+  "concepts": [
+   "sky"
+  ],
+  "ref_mask_frac": 0.7942,
+  "category": "concept_absent",
+  "reason": "skid steer against dense foliage, no sky visible"
+ },
+ {
+  "sid": "00009953",
+  "instruction": "add colorful confetti falling around her",
+  "concepts": [
+   "confetti"
+  ],
+  "ref_mask_frac": 0.3063,
+  "category": "concept_absent",
+  "reason": "confetti is the object to be added; none present in source"
+ },
+ {
+  "sid": "00009967",
+  "instruction": "Replace the popcorn with colorful jellybeans spilling out of the bag",
+  "concepts": [
+   "popcorn"
+  ],
+  "ref_mask_frac": 0.8026,
+  "category": "sam3_miss",
+  "reason": "popcorn visible through clear window of package"
+ },
+ {
+  "sid": "00009985",
+  "instruction": "add a rainbow in the background",
+  "concepts": [
+   "rainbow"
+  ],
+  "ref_mask_frac": 0.3143,
+  "category": "concept_absent",
+  "reason": "rainbow is the object to be added; none present"
+ },
+ {
+  "sid": "00009986",
+  "instruction": "turn the dog into a mythical creature",
+  "concepts": [
+   "dog"
+  ],
+  "ref_mask_frac": 0.0037,
+  "category": "sam3_miss",
+  "reason": "small white dog visible in the street"
+ },
+ {
+  "sid": "00009988",
+  "instruction": "replace the tennis racket with a lightsaber",
+  "concepts": [
+   "tennis racket"
+  ],
+  "ref_mask_frac": 0.0141,
+  "category": "concept_absent",
+  "reason": "boy's hands are empty; no tennis racket visible"
+ }
+]
