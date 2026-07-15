@@ -49,7 +49,7 @@ N_BUCKETS_END = 1
 TARGET_T_DELTA = 0.0
 
 # By default, use DEFAULT_T_START = PAPER_T_START - (PAPER_T_DELTA - TARGET_T_DELTA)
-DEFAULT_T_START = 0.9
+DEFAULT_T_START = 0.7
 DEFAULT_T_END = 0.3
 
 # Values from the original paper, should *not* be modified
