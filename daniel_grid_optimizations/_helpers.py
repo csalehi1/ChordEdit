@@ -75,7 +75,7 @@ def load_samples(
 def write_id_to_inputs(output_root: Path, data_root: Path, mapping_path: Path) -> Path:
     """Write id_to_inputs_<suffix>.csv for the whole mapping (all samples)."""
     mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
-    suffix = output_root.name.lower().replace("_", "")
+    suffix = output_root.name.lower().replace("_", "").replace("-", "")
     dest = output_root / f"id_to_inputs_{suffix}.csv"
 
     with dest.open("w", encoding="utf-8", newline="") as handle:
@@ -92,8 +92,8 @@ def write_id_to_inputs(output_root: Path, data_root: Path, mapping_path: Path) -
                     "sample_id": str(sample_id).zfill(settings.SAMPLE_ID_WIDTH),
                     "source_prompt": meta.get(settings.FIELD_SOURCE_PROMPT, ""),
                     "target_prompt": meta.get(settings.FIELD_TARGET_PROMPT, ""),
-                    "image_path": str(resolve_under(data_root, image_rel)),
-                    "mask_image_path": str(resolve_under(data_root, mask_rel)) if mask_rel else "",
+                    "image_path": image_rel,
+                    "mask_image_path": mask_rel,
                 }
             )
     return dest

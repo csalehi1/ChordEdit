@@ -4,27 +4,20 @@ Evaluate the metrics of a grid of cells for every sample in a dataset.
 
 from __future__ import annotations
 
-import os
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-
 import argparse
 import csv
 import logging
-import numpy as np
+import os
 import re
 import time
-import torch
 from collections import defaultdict
+from multiprocessing import get_context
 from pathlib import Path
-from PIL import Image
-
-from evaluation.matrics_calculator import MetricsCalculator
+from typing import List
 
 LOGGER = logging.getLogger("grid_eval")
 
 IMAGE_SIZE = 512
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CLIP_BATCH_SIZE = 32
 LPIPS_BATCH_SIZE = 32
 
@@ -33,8 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--generated-root", required=True)
     parser.add_argument("--result-path", default=None)
-    parser.add_argument("--gpu", type=int, default=0)
-    # parser.add_argument("--gpus", nargs="+", type=int, default=[0])
+    parser.add_argument("--gpus", nargs="+", type=int, default=[0])
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--include-psnr", action="store_true", default=False)
     parser.add_argument("--include-lpips", action="store_true", default=False)
@@ -42,8 +34,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _format_mask_image(mask_image: Image.Image) -> np.ndarray:
-    # Convert the mask image to grayscale and resize.
+def _format_mask_image(mask_image: "Image.Image") -> "np.ndarray":
+    import numpy as np
+    from PIL import Image
+
     mask_image = mask_image.convert("L")
     if mask_image.size != (IMAGE_SIZE, IMAGE_SIZE):
         mask_image = mask_image.resize((IMAGE_SIZE, IMAGE_SIZE))
@@ -66,41 +60,48 @@ def _format_mask_image(mask_image: Image.Image) -> np.ndarray:
     return mask_array
 
 
-def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+def run_shard(
+    *,
+    generated_root: Path,
+    inputs_path: Path,
+    result_path: Path,
+    metrics: List[str],
+    include_psnr: bool,
+    include_lpips: bool,
+    include_clip: bool,
+    max_samples: int | None,
+    shard: int,
+    num_shards: int,
+    gpu: int,
+) -> None:
+    """Evaluate one round-robin shard of samples on a single GPU."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", force=True)
 
-    args = parse_args()
-    max_samples = args.max_samples
-    generated_root = Path(args.generated_root).expanduser().resolve()
-    inputs_path = generated_root / f"id_to_inputs_{generated_root.name.replace('_','').replace('-','').lower()}.csv"
-    result_path = generated_root / f"id_to_metrics_{generated_root.name.replace('_','').replace('-','').lower()}{f'_n{max_samples}' if max_samples else ''}.csv"
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
-    # Build the list of metrics to evaluate. If no --include-* flags are
-    # specified, all metrics are included (the default behavior).
-    include_psnr = args.include_psnr
-    include_lpips = args.include_lpips
-    include_clip = args.include_clip
-    if not (include_psnr or include_lpips or include_clip):
-        include_psnr = include_lpips = include_clip = True
+    import numpy as np
+    import torch
+    from PIL import Image
+    from evaluation.matrics_calculator import MetricsCalculator
 
-    metrics: list[str] = []
-    if include_psnr:
-        metrics.append("psnr_unedit_part")
-    if include_lpips:
-        metrics.append("lpips_unedit_part")
-    if include_clip:
-        metrics.append("clip_similarity_target_image_edit_part")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
+    DEVICE = torch.device("cuda:0")
 
     # Collect samples from the inputs CSV.
-    samples: dict[str, dict[str, str]] = {}
+    all_samples: dict[str, dict[str, str]] = {}
     with open(inputs_path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        for row in reader: # type: ignore
-            samples[row["sample_id"]] = {k: v for k, v in row.items() if k != "sample_id"} # type: ignore[index]
+        for row in reader:
+            all_samples[row["sample_id"]] = {k: v for k, v in row.items() if k != "sample_id"}
 
     # Collect cells from the generated root.
-    cells: defaultdict[str, list[tuple[float, float, Path]]] = defaultdict(list)
-    for sample_id in samples:
+    all_cells: defaultdict[str, list[tuple[float, float, Path]]] = defaultdict(list)
+    for sample_id in all_samples:
         cells_dir = generated_root / sample_id / "cells"
         if not cells_dir.is_dir():
             continue
@@ -109,13 +110,18 @@ def main() -> None:
             if match is None:
                 raise ValueError(f"Invalid cell filename: {path.name}")
             t_start, t_end = (float(x.replace("p", ".")) for x in match.groups())
-            cells[sample_id].append((t_start, t_end, path.absolute()))
+            all_cells[sample_id].append((t_start, t_end, path.absolute()))
 
+    # Apply max_samples cap, then round-robin shard.
+    sample_ids = list(all_cells.keys())
     if max_samples is not None:
-        sample_ids_to_keep = list(cells.keys())[:max_samples]
-        cells = defaultdict(list, {sid: cells[sid] for sid in sample_ids_to_keep})
+        sample_ids = sample_ids[:max_samples]
+    shard_ids = sample_ids[shard::num_shards]
 
-    LOGGER.info("Found %d samples and %d total cells", len(cells), sum(len(v) for v in cells.values()))
+    LOGGER.info(
+        "GPU %d: Started shard %d/%d (%d sample%s)",
+        gpu, shard + 1, num_shards, len(shard_ids), "s" * (len(shard_ids) != 1),
+    )
 
     metrics_calculator = MetricsCalculator(DEVICE)
 
@@ -125,7 +131,7 @@ def main() -> None:
     psnr_calc = metrics_calculator.psnr_metric_calculator
     lpips_calc = metrics_calculator.lpips_metric_calculator
     clip_model = metrics_calculator.clip_metric_calculator.model
-   
+
     # OPT 3: Replace the default slow processor with the fast (Rust-based) variant.
     from transformers import AutoProcessor
     clip_processor = AutoProcessor.from_pretrained(
@@ -148,10 +154,10 @@ def main() -> None:
         # here requires gradients, so one outer context eliminates repeated
         # context-manager overhead and ensures PSNR/LPIPS also skip grad tracking.
         with torch.no_grad():
-
-            for sample_idx, (sample_id, cell_list) in enumerate(cells.items()):
+            for sample_idx, sample_id in enumerate(shard_ids):
                 sample_start = time.perf_counter()
-                sample_meta = samples[sample_id]
+                cell_list = all_cells[sample_id]
+                sample_meta = all_samples[sample_id]
                 source_image = Image.open(sample_meta["image_path"]).convert("RGB").resize((IMAGE_SIZE, IMAGE_SIZE))
                 mask_image = Image.open(sample_meta["mask_image_path"])
                 mask_array = _format_mask_image(mask_image)
@@ -286,10 +292,91 @@ def main() -> None:
                 result_file.flush()
 
                 elapsed = time.perf_counter() - sample_start
-                LOGGER.info("[%d/%d] Evaluated %s (%d cells in %.2fs)",
-                            sample_idx + 1, len(cells), sample_id, len(cell_list), elapsed)
+                LOGGER.info("GPU %d: [%d/%d] Evaluated %s (%d cells in %.2fs)",
+                            gpu, sample_idx + 1, len(shard_ids), sample_id, len(cell_list), elapsed)
 
-    LOGGER.info("Done. Metrics in %s", result_path.absolute())
+    LOGGER.info("GPU %d: Finished shard %d/%d.", gpu, shard + 1, num_shards)
+
+
+def main() -> None:
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+
+    args = parse_args()
+    max_samples = args.max_samples
+    gpus = args.gpus
+    generated_root = Path(args.generated_root).expanduser().resolve()
+    inputs_path = generated_root / f"id_to_inputs_{generated_root.name.replace('_','').replace('-','').lower()}.csv"
+    metrics_path = generated_root / f"id_to_metrics_{generated_root.name.replace('_','').replace('-','').lower()}{f'_n{max_samples}' if max_samples else ''}.csv"
+
+    include_psnr = args.include_psnr
+    include_lpips = args.include_lpips
+    include_clip = args.include_clip
+    if not (include_psnr or include_lpips or include_clip):
+        include_psnr = include_lpips = include_clip = True
+
+    metrics: list[str] = []
+    if include_psnr:
+        metrics.append("psnr_unedit_part")
+    if include_lpips:
+        metrics.append("lpips_unedit_part")
+    if include_clip:
+        metrics.append("clip_similarity_target_image_edit_part")
+
+    # OPT 10: Multi-GPU sharding -- distribute samples round-robin across GPUs.
+    # Each GPU runs an independent spawned process with its own CUDA context,
+    # MetricsCalculator, and CLIP/LPIPS models. Every shard writes to its own
+    # temporary CSV (avoiding write races), and main() merges them at the end.
+    # With N GPUs the wall-clock time is ~1/N of single-GPU evaluation.
+    shard_paths = [
+        metrics_path.with_suffix(f".shard{shard}.csv")
+        for shard in range(len(gpus))
+    ]
+
+    kwargs = dict(
+        generated_root=generated_root,
+        inputs_path=inputs_path,
+        metrics=metrics,
+        include_psnr=include_psnr,
+        include_lpips=include_lpips,
+        include_clip=include_clip,
+        max_samples=max_samples,
+        num_shards=len(gpus),
+    )
+
+    if len(gpus) == 1:
+        run_shard(result_path=shard_paths[0], shard=0, gpu=gpus[0], **kwargs)
+    else:
+        ctx = get_context("spawn")
+        processes = [
+            ctx.Process(target=run_shard, kwargs={**kwargs, "result_path": shard_paths[shard], "shard": shard, "gpu": gpu})
+            for shard, gpu in enumerate(gpus)
+        ]
+        for process in processes:
+            process.start()
+            # Stagger by a second so .
+            time.sleep(1.0)
+        failed = False
+        for process in processes:
+            process.join()
+            if process.exitcode != 0:
+                failed = True
+        if failed:
+            raise SystemExit("One or more eval shards failed.")
+
+    # Merge per-shard CSVs into the final result file.
+    with open(metrics_path, "w", newline="", encoding="utf-8") as out:
+        writer = csv.writer(out)
+        writer.writerow(["sample_id", "t_start", "t_end"] + metrics)
+        for shard_path in shard_paths:
+            with open(shard_path, encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    writer.writerow([row[col] for col in ["sample_id", "t_start", "t_end"] + metrics])
+            shard_path.unlink()
+
+    LOGGER.info("Done. Metrics in %s", metrics_path.absolute())
 
 
 if __name__ == "__main__":
