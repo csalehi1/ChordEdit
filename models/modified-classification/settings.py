@@ -10,14 +10,15 @@ Dataset settings.
 """
 
 # NOTE: Set this to the directory containing the generated metrics and strings CSV files.
-GENERATED_DIR = Path("/shared/ssd_30T/mirick/generated/ultra_edit/UltraEdit_Region_10")
-DATASET_DIR = Path("/shared/ssd_30T/mirick/datasets/ultra_edit/UltraEdit_Region_10")
+DIR_NAME = "UltraEdit_Region_10000"
+GENERATED_DIR = Path(f"/shared/ssd_30T/mirick/generated/ultra_edit/{DIR_NAME}")
+DATASET_DIR = Path(f"/shared/ssd_30T/mirick/datasets/ultra_edit/{DIR_NAME}")
 
-INPUTS_CSV = GENERATED_DIR / f"id_to_inputs_{GENERATED_DIR.name.replace('_', '').lower()}.csv"
-METRICS_CSV = GENERATED_DIR / f"id_to_metrics_{GENERATED_DIR.name.replace('_', '').lower()}.csv"
+INPUTS_CSV = GENERATED_DIR / f"id_to_inputs_{DIR_NAME.replace('_', '').lower()}.csv"
+METRICS_CSV = GENERATED_DIR / f"id_to_metrics_{DIR_NAME.replace('_', '').lower()}.csv"
 
 # NOTE: Set this to the directory where the model outputs will be saved.
-OUTPUTS_DIR = Path(__file__).resolve().parent / "outputs" / GENERATED_DIR.name
+OUTPUTS_DIR = Path(__file__).resolve().parent / "outputs" / DIR_NAME
 if not OUTPUTS_DIR.exists():
     OUTPUTS_DIR.mkdir(parents=True)
 
@@ -34,7 +35,8 @@ CATEGORY_COL = "category"
 T_START_COL = "t_start"
 T_END_COL = "t_end"
 T_DELTA_COL = "t_delta"
-PSNR_COL = "psnr"
+PSNR_COL = "psnr_unedit_part"
+LPIPS_COL = "lpips_unedit_part"
 CLIP_COL = "clip_similarity_target_image_edit_part"
 CELL_PATH_COL = "cell_path"
 
@@ -78,7 +80,7 @@ MLP_WIDE = 256
 MLP_HIDDEN = 128
 MLP_INNER = 64
 MLP_DROPOUT = 0.2
-MLP_CLIP_DROPOUT = 0.0
+MLP_CLIP_DROPOUT = 0.2
 T_FOURIER_FREQS = 8
 T_PROJ_DIM = 128
 
@@ -86,7 +88,7 @@ T_PROJ_DIM = 128
 EPOCHS = 10
 BATCH_SIZE = 64
 LR = 1e-3
-WEIGHT_DECAY = 0.01
+WEIGHT_DECAY = 0.05
 NORMALIZE_TARGETS = True
 RANKING_LOSS_WEIGHT = 0.3
 
