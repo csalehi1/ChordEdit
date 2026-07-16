@@ -29,7 +29,6 @@ import pandas as pd
 import torch
 
 from _data import (
-    IX_Y,
     create_dataloaders,
     load_df,
     model_inputs,
@@ -56,7 +55,7 @@ def evaluate(
 ) -> dict[str, float]:
     """Per-target MAE/RMSE/R² in normalized metric units, plus standardized loss."""
     if device is None:
-        device = next(model.parameters()).device
+        device = next(model.regressor.parameters()).device
     model.regressor.eval()
     preds, trues = [], []
     loss_sum, n = 0.0, 0
@@ -106,7 +105,11 @@ def train(
     train_loader, val_loader, test_loader = create_dataloaders(
         model, train_X, train_y, val_X, val_y, test_X, test_y, group_train_by_sample=use_ranking
         )
-    y_train = train_loader.dataset.tensors[IX_Y]
+    # record encoder dims, then free VAE/text pipeline GPU memory for training.
+    img_dim, text_dim = model.encoder_img_dim, model.encoder_text_dim
+    model.release_encoders()
+
+    y_train = train_loader.dataset.y
     print(f"Dataset: train={len(train_loader.dataset)} cells val={len(val_loader.dataset)} cells")
 
     # Normalize the targets if specified.
@@ -128,7 +131,7 @@ def train(
     # Train the model.
     weights_out = run_dir / "regressor_weights.pt"
     best_val = float("inf")
-    device = next(model.parameters()).device
+    device = next(model.regressor.parameters()).device
     n_cells, n_samples = len(train_X), train_X[SAMPLE_ID_COL].nunique()
     print(f"\nTraining for {EPOCHS} epochs...")
     if use_ranking:
@@ -136,11 +139,15 @@ def train(
     for epoch in range(1, EPOCHS + 1):
         epoch_start = time.perf_counter()
         model.regressor.train()
+        # accumulate running train MSE during the epoch instead of a full
+        # train-set evaluate pass every epoch (saves ~half the forward cost on large data).
+        train_loss_sum, train_n = 0.0, 0
         for batch in train_loader:
             img, mask, src, tar, t, y = model_inputs(batch, device)
             out = model.regressor(img, mask, src, tar, t)
             y_std = (y - mean) / std
-            loss = torch.nn.functional.mse_loss(out, y_std)
+            mse = torch.nn.functional.mse_loss(out, y_std)
+            loss = mse
             if use_ranking:
                 pred_m = combined_score_tensor(model.regressor.denormalize(out))
                 true_m = combined_score_tensor(y)
@@ -148,8 +155,10 @@ def train(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-        # Evaluate the model on the train and val sets, save the best weights.
-        train_results = evaluate(model, train_loader, device)
+            train_loss_sum += mse.detach().item() * y.numel()
+            train_n += y.numel()
+
+        # full val metrics every epoch; full train MAE/R² only on the last epoch.
         val_results = evaluate(model, val_loader, device)
         improved = val_results["loss"] < best_val
         if improved:
@@ -160,16 +169,21 @@ def train(
                     "target_mean": model.regressor.target_mean.cpu(),
                     "target_std": model.regressor.target_std.cpu(),
                     "target_cols": list(M_TARGET_COLS),
-                    "img_dim": model.image_encoder.hidden_dim,
-                    "text_dim": model.text_encoder.hidden_dim,
+                    "img_dim": img_dim,
+                    "text_dim": text_dim,
                 },
                 weights_out,
             )
         elapsed = time.perf_counter() - epoch_start
+        if epoch == EPOCHS:
+            train_results = evaluate(model, train_loader, device)
+            train_line = format_results(train_results)
+        else:
+            train_line = f"loss={train_loss_sum / max(train_n, 1):7.4f}  (running MSE)"
         print(
             f"Epoch [{epoch:03d}/{EPOCHS:03d}] | {n_cells} cells ({n_samples} samples) in {elapsed:.2f}s"
-            f"\n\t{'Train:':<6} {format_results(train_results)}"
-            f"\n\t{'Val:':<6} {format_results(val_results)}"
+            f"\n    {'Train:':<6} {train_line}"
+            f"\n    {'Val:':<6} {format_results(val_results)}"
             + ("  *" if improved else "")
         )
 
@@ -177,7 +191,7 @@ def train(
     ckpt = torch.load(weights_out, map_location=device, weights_only=False)
     model.regressor.load_state_dict(ckpt["regressor_state_dict"])
     results = evaluate(model, test_loader, device)
-    print(f"\n\t{'Test:':<6} {format_results(results)}")
+    print(f"\n    {'Test:':<6} {format_results(results)}")
 
     # Save the run directory, splits, and metrics.
     save_settings_hash(run_dir)

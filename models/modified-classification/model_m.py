@@ -140,14 +140,16 @@ class VaeImageEncoder(nn.Module):
 
     @torch.no_grad()
     def forward(self, images: list) -> torch.Tensor:
+        # stack pixels and run one batched VAE encode instead of
+        # encoding images one-at-a-time (much faster for large sample counts).
         if not images:
             raise ValueError("images must be a non-empty list")
-        latents = []
-        for image in images:
-            pixel_values = self._pipeline._prepare_image_tensor(image.convert("RGB"))
-            encoded = self._pipeline._encode_image_to_latent(pixel_values)
-            latents.append(encoded.flatten(start_dim=1))
-        return torch.cat(latents, dim=0)
+        pixel_values = torch.cat(
+            [self._pipeline._prepare_image_tensor(image.convert("RGB")) for image in images],
+            dim=0,
+        )
+        encoded = self._pipeline._encode_image_to_latent(pixel_values)
+        return encoded.flatten(start_dim=1)
 
 
 class MetricRegressor(nn.Module):
@@ -292,10 +294,35 @@ class MetricPredictor(nn.Module):
 
         self.image_encoder = VaeImageEncoder(self.pipeline)
         self.text_encoder = TextEncoder(self.pipeline)
+        self._encoder_img_dim = self.image_encoder.hidden_dim
+        self._encoder_text_dim = self.text_encoder.hidden_dim
         self.regressor = MetricRegressor(
-            img_dim=self.image_encoder.hidden_dim,
-            text_dim=self.text_encoder.hidden_dim,
+            img_dim=self._encoder_img_dim,
+            text_dim=self._encoder_text_dim,
         )
+
+    @property
+    def encoder_img_dim(self) -> int:
+        return self._encoder_img_dim
+
+    @property
+    def encoder_text_dim(self) -> int:
+        return self._encoder_text_dim
+
+    def release_encoders(self) -> None:
+        """Free VAE/text pipeline after embeddings are precomputed."""
+        # drop frozen SD encoders from GPU once embeddings exist so
+        # training only keeps the small regressor on device.
+        import gc
+
+        if "image_encoder" in self._modules:
+            del self.image_encoder
+        if "text_encoder" in self._modules:
+            del self.text_encoder
+        self.pipeline = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     @torch.no_grad()
     def encode(

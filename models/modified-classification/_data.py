@@ -2,38 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
+import time
 from PIL import Image
-from torch.utils.data import DataLoader, Sampler, TensorDataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from model_m import MetricPredictor
-from settings import (
-    BATCH_SIZE,
-    CELL_PATH_COL,
-    CLIP_COL,
-    DATASET_DIR,
-    GENERATED_DIR,
-    IMAGE_PATH_COL,
-    INPUTS_CSV,
-    MASK_PATH_COL,
-    METRICS_CSV,
-    M_TARGET_COLS,
-    PSNR_COL,
-    SAMPLE_ID_COL,
-    SEED,
-    SOURCE_PROMPT_COL,
-    T_DELTA_COL,
-    T_END_COL,
-    T_START_COL,
-    TARGET_PROMPT_COL,
-    TARGET_T_DELTA,
-    TRAIN_FRAC,
-    VAL_FRAC,
-)
+from settings import *
 
 
 from _helpers import (
@@ -50,7 +31,7 @@ INPUTS_COLS = [SAMPLE_ID_COL, SOURCE_PROMPT_COL, TARGET_PROMPT_COL, IMAGE_PATH_C
 DATA_COLS = list(dict.fromkeys(METRICS_COLS + INPUTS_COLS))
 ID_TO_SPLIT_NAME = "id_to_split.csv"
 
-# build_tensors TensorDataset layout. sample_idx is metadata only — not model input.
+# EmbeddingIndexedDataset / batch layout. sample_idx is metadata only — not model input.
 IX_SAMPLE_IDX = 0
 IX_IMG = 1
 IX_MASK = 2
@@ -60,9 +41,9 @@ IX_T = 5
 IX_Y = 6
 MODEL_BATCH_SLICE = slice(IX_IMG, IX_Y + 1)
 
-
 def model_inputs(batch, device: torch.device) -> tuple[torch.Tensor, ...]:
     """Return (img, mask, src, tar, t, y) on device."""
+    # embeddings live on CPU in the dataset; move only this batch to GPU.
     return tuple(x.to(device) for x in batch[MODEL_BATCH_SLICE])
 
 
@@ -85,6 +66,53 @@ class SampleGridBatchSampler(Sampler[list[int]]):
 
     def __len__(self) -> int:
         return len(self.sample_ids)
+
+
+@dataclass(frozen=True)
+class EmbeddingTables:
+    """One embedding row per unique sample_id. Shared across train/val/test datasets."""
+
+    img: torch.Tensor   # (n_samples, img_dim)
+    mask: torch.Tensor  # (n_samples, img_dim)
+    src: torch.Tensor   # (n_samples, text_dim)
+    tar: torch.Tensor   # (n_samples, text_dim)
+
+
+class CellEmbeddingDataset(Dataset):
+    """
+    Map each grid cell to embeddings via a shared EmbeddingTables.
+
+    The dataset has one row per (sample_id, t_start, t_end). Image/mask/text
+    embeddings depend only on sample_id, so train/val/test datasets all reference
+    the same EmbeddingTables and only store per-cell sample_idx, t, and y.
+    """
+
+    def __init__(
+        self,
+        sample_idx: torch.Tensor,
+        emb_tables: EmbeddingTables,
+        t: torch.Tensor,
+        y: torch.Tensor,
+    ):
+        self.sample_idx = sample_idx
+        self.emb_tables = emb_tables
+        self.t = t
+        self.y = y
+
+    def __len__(self) -> int:
+        return self.sample_idx.shape[0]
+
+    def __getitem__(self, i: int) -> tuple[torch.Tensor, ...]:
+        sid = int(self.sample_idx[i])
+        return (
+            self.sample_idx[i],
+            self.emb_tables.img[sid],
+            self.emb_tables.mask[sid],
+            self.emb_tables.src[sid],
+            self.emb_tables.tar[sid],
+            self.t[i],
+            self.y[i],
+        )
 
 
 def save_splits_df(
@@ -194,48 +222,102 @@ def grid_axes_from_df(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     return np.sort(df[T_START_COL].unique()), np.sort(df[T_END_COL].unique())
 
 
-def precompute_embeddings(
-    df: pd.DataFrame, predictor: MetricPredictor, device: torch.device
-) -> dict[str, dict[str, torch.Tensor]]:
-    """Encode the source image, mask, and prompt pair once per sample_id."""
-    samples = df.drop_duplicates(subset=SAMPLE_ID_COL).sort_values(SAMPLE_ID_COL)
-    images = [Image.open(i).convert("RGB") for i in samples[IMAGE_PATH_COL]]
-    masks = [Image.open(m).convert("RGB") for m in samples[MASK_PATH_COL]]
+def _get_embeddings(
+    samples: pd.DataFrame,
+    predictor: MetricPredictor,
+    *,
+    use_cache: bool = True,
+    batch_size: int = EMBED_BATCH_SIZE,
+) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return CPU embedding tables for unique samples, using disk cache when possible."""
+    
+    # Disk cache keyed by encoder and inputs CSV so re-runs skip VAE/text encode.
+    # NOTE: May be a source of future issues if the inputs CSV changes or new models are added.
+    cache_key = hashlib.sha256(f"{INPUTS_CSV}|{SD_TURBO_ROOT}".encode()).hexdigest()[:12]
+    cache_path = Path(OUTPUTS_DIR.parent / ".cache" / "embeddings" / f"{cache_key}.pt").resolve()
+    
+    sample_ids = samples[SAMPLE_ID_COL].tolist()
+
+    # Try to load embeddings from cache if it exists and is complete.
+    if use_cache and cache_path.exists():
+        data = torch.load(cache_path, map_location="cpu", weights_only=False)
+        id_to_i = {sid: i for i, sid in enumerate(data["sample_ids"])}
+        if all(sid in id_to_i for sid in sample_ids):
+            idxs = [id_to_i[sid] for sid in sample_ids]
+            print(f"Loaded embeddings from cache: {cache_path} ({len(sample_ids)} samples)")
+            return (
+                sample_ids,
+                data["img"][idxs].contiguous(),
+                data["mask"][idxs].contiguous(),
+                data["src"][idxs].contiguous(),
+                data["tar"][idxs].contiguous(),
+            )
+        print(f"Embedding cache miss (incomplete): {cache_path}")
+
+    n_samples = len(sample_ids)
+    image_paths = samples[IMAGE_PATH_COL].tolist()
+    mask_paths = samples[MASK_PATH_COL].tolist()
     src_prompts = samples[SOURCE_PROMPT_COL].tolist()
     tar_prompts = samples[TARGET_PROMPT_COL].tolist()
+    img_chunks: list[torch.Tensor] = []
+    mask_chunks: list[torch.Tensor] = []
+    src_chunks: list[torch.Tensor] = []
+    tar_chunks: list[torch.Tensor] = []
 
-    img_emb = predictor.image_encoder(images).to(device)
-    mask_emb = predictor.image_encoder(masks).to(device)
-    src_emb = predictor.text_encoder(src_prompts).to(device)
-    tar_emb = predictor.text_encoder(tar_prompts).to(device)
+    # Encode embeddings in chunks (bounded peak RAM); keep results on CPU.
+    print(f"Encoding embeddings for {n_samples} samples (batch_size={batch_size})...")
+    for start in range(0, n_samples, batch_size):
+        batch_start = time.perf_counter()
+        end = min(start + batch_size, n_samples)
+        images = [Image.open(p).convert("RGB") for p in image_paths[start:end]]
+        masks = [Image.open(p).convert("RGB") for p in mask_paths[start:end]]
+        with torch.no_grad():
+            img_chunks.append(predictor.image_encoder(images).float().cpu())
+            mask_chunks.append(predictor.image_encoder(masks).float().cpu())
+            src_chunks.append(predictor.text_encoder(src_prompts[start:end]).float().cpu())
+            tar_chunks.append(predictor.text_encoder(tar_prompts[start:end]).float().cpu())
+        del images, masks
+        elapsed = time.perf_counter() - batch_start
+        print(f"    Encoded [{end}/{n_samples}] ({end - start} samples in {elapsed:.2f}s)", flush=True)
 
+    # TODO: What is the size of the embeddings? Update this comment.
+    img_emb = torch.cat(img_chunks, dim=0)
+    mask_emb = torch.cat(mask_chunks, dim=0)
+    src_emb = torch.cat(src_chunks, dim=0)
+    tar_emb = torch.cat(tar_chunks, dim=0)
+
+    if use_cache:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "sample_ids": list(sample_ids),
+            "img": img_emb,
+            "mask": mask_emb,
+            "src": src_emb,
+            "tar": tar_emb,
+        }, cache_path)
+        print(f"Saved embedding cache: {cache_path}")
+
+    return sample_ids, img_emb, mask_emb, src_emb, tar_emb
+
+
+def get_embeddings_by_sample(
+    df: pd.DataFrame,
+    predictor: MetricPredictor,
+    device: torch.device,
+    *,
+    use_cache: bool = True,
+) -> dict[str, dict[str, torch.Tensor]]:
+    """
+    Get the embeddings for all sample_id, returned as a sample-indexed
+    dictionary of separate embedding tensors.
+    """
+    samples = df.drop_duplicates(subset=SAMPLE_ID_COL).sort_values(SAMPLE_ID_COL)
+    sample_ids, img_emb, mask_emb, src_emb, tar_emb = _get_embeddings(samples, predictor, use_cache=use_cache)
+    img_emb, mask_emb, src_emb, tar_emb = img_emb.to(device), mask_emb.to(device), src_emb.to(device), tar_emb.to(device)
     return {
         sid: {"img": img_emb[i], "mask": mask_emb[i], "src": src_emb[i], "tar": tar_emb[i]}
-        for i, sid in enumerate(samples[SAMPLE_ID_COL].tolist())
+        for i, sid in enumerate(sample_ids)
     }
-
-
-def build_tensors(
-    X: pd.DataFrame,
-    y: pd.DataFrame,
-    embeddings: dict[str, dict[str, torch.Tensor]],
-) -> tuple[torch.Tensor, ...]:
-    """
-    Assemble per-row (sample_idx, img, mask, src, tar, t, y) tensors from X
-    and y where t is (t_start, t_end) and y is the target columns. Use
-    precomputed embeddings for image, mask, source, and target text.
-
-    The model only trains on MODEL_BATCH_SLICE, so sample_idx is metadata only.
-    """
-    return (
-        torch.tensor(pd.factorize(X[SAMPLE_ID_COL], sort=True)[0], dtype=torch.long),
-        torch.stack([embeddings[i]["img"] for i in X[SAMPLE_ID_COL]]),
-        torch.stack([embeddings[i]["mask"] for i in X[SAMPLE_ID_COL]]),
-        torch.stack([embeddings[i]["src"] for i in X[SAMPLE_ID_COL]]),
-        torch.stack([embeddings[i]["tar"] for i in X[SAMPLE_ID_COL]]),
-        torch.tensor(X[[T_START_COL, T_END_COL]].values, dtype=torch.float),
-        torch.tensor(y[list(M_TARGET_COLS)].values, dtype=torch.float),
-    )
 
 
 def create_dataloaders(
@@ -251,33 +333,33 @@ def create_dataloaders(
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Build train/val/test DataLoaders from split feature and target tables."""
     
-    def _dataloader(
-        X: pd.DataFrame,
-        y: pd.DataFrame,
-        shuffle: bool,
-        *,
-        by_sample: bool = False,
-    ) -> DataLoader:
-        tensors = build_tensors(X, y, embeddings)
-        dataset = TensorDataset(*tensors)
+    # One shared embedding table for all splits; each dataset only stores cell-level rows.
+    samples = pd.concat([train_X, val_X, test_X], ignore_index=True).drop_duplicates(SAMPLE_ID_COL).sort_values(SAMPLE_ID_COL)
+    sample_ids, img_emb, mask_emb, src_emb, tar_emb = _get_embeddings(samples, predictor, use_cache=True)
+    emb_tables = EmbeddingTables(img=img_emb, mask=mask_emb, src=src_emb, tar=tar_emb)
+    sample_id_to_idx = {sid: i for i, sid in enumerate(sample_ids)}
+
+    def _dataloader(X, y, shuffle: bool, by_sample: bool = False) -> DataLoader:
+        # Make the dataset, dataloader objects for one split.
+        dataset = CellEmbeddingDataset(
+            torch.tensor([sample_id_to_idx[sid] for sid in X[SAMPLE_ID_COL].tolist()], dtype=torch.long),
+            emb_tables,
+            torch.tensor(X[[T_START_COL, T_END_COL]].values, dtype=torch.float),
+            torch.tensor(y[list(M_TARGET_COLS)].values, dtype=torch.float),
+        )
         if by_sample:
-            return DataLoader(
-                dataset,
-                batch_sampler=SampleGridBatchSampler(tensors[IX_SAMPLE_IDX], shuffle=shuffle),
-            )
+            # When RANKING_LOSS_WEIGHT > 0, use one sample's full timestep grid
+            # per batch so pairwise ranking can compare cells within the same image.
+            return DataLoader(dataset, batch_sampler=SampleGridBatchSampler(dataset.sample_idx, shuffle=shuffle))
+        # Otherwise, use a fixed batch size for MSE, which treats each cell independently.
         return DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=shuffle)
 
-    device = next(predictor.parameters()).device
-    unique_X = (
-        pd.concat([train_X, val_X, test_X], ignore_index=True)
-        .drop_duplicates(SAMPLE_ID_COL)
-        .sort_values(SAMPLE_ID_COL)
-    )
-    embeddings = precompute_embeddings(unique_X, predictor, device)
-
     return (
+        # Train dataloader.
         _dataloader(train_X, train_y, shuffle=True, by_sample=group_train_by_sample),
+        # Val dataloader.
         _dataloader(val_X, val_y, shuffle=False),
+        # Test dataloader
         _dataloader(test_X, test_y, shuffle=False),
     )
 
