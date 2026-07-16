@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import sys
+import time
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_DIR, "..", ".."))
@@ -36,7 +37,7 @@ from _data import (
     save_splits_df,
     split_df,
 )
-from _helpers import format_results, save_settings_hash
+from _helpers import combined_score_tensor, format_results, pairwise_ranking_loss, save_settings_hash
 from model_m import MetricPredictor
 from settings import *
 
@@ -101,9 +102,10 @@ def train(
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Create dataloaders for the train, val, and test sets.
+    use_ranking = RANKING_LOSS_WEIGHT > 0
     train_loader, val_loader, test_loader = create_dataloaders(
-        model, train_X, train_y, val_X, val_y, test_X, test_y
-    )
+        model, train_X, train_y, val_X, val_y, test_X, test_y, group_train_by_sample=use_ranking
+        )
     y_train = train_loader.dataset.tensors[IX_Y]
     print(f"Dataset: train={len(train_loader.dataset)} cells val={len(val_loader.dataset)} cells")
 
@@ -127,14 +129,22 @@ def train(
     weights_out = run_dir / "regressor_weights.pt"
     best_val = float("inf")
     device = next(model.parameters()).device
+    n_cells, n_samples = len(train_X), train_X[SAMPLE_ID_COL].nunique()
     print(f"\nTraining for {EPOCHS} epochs...")
+    if use_ranking:
+        print(f"Ranking loss weight: {RANKING_LOSS_WEIGHT} (sample-grouped train batches)")
     for epoch in range(1, EPOCHS + 1):
+        epoch_start = time.perf_counter()
         model.regressor.train()
         for batch in train_loader:
             img, mask, src, tar, t, y = model_inputs(batch, device)
             out = model.regressor(img, mask, src, tar, t)
             y_std = (y - mean) / std
             loss = torch.nn.functional.mse_loss(out, y_std)
+            if use_ranking:
+                pred_m = combined_score_tensor(model.regressor.denormalize(out))
+                true_m = combined_score_tensor(y)
+                loss = loss + RANKING_LOSS_WEIGHT * pairwise_ranking_loss(pred_m, true_m)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -155,8 +165,11 @@ def train(
                 },
                 weights_out,
             )
+        elapsed = time.perf_counter() - epoch_start
         print(
-            f"Epoch {epoch:03d}  train: {format_results(train_results)}  | val: {format_results(val_results)}"
+            f"Epoch [{epoch:03d}/{EPOCHS:03d}] | {n_cells} cells ({n_samples} samples) in {elapsed:.2f}s"
+            f"\n\t{'Train:':<6} {format_results(train_results)}"
+            f"\n\t{'Val:':<6} {format_results(val_results)}"
             + ("  *" if improved else "")
         )
 
@@ -164,7 +177,7 @@ def train(
     ckpt = torch.load(weights_out, map_location=device, weights_only=False)
     model.regressor.load_state_dict(ckpt["regressor_state_dict"])
     results = evaluate(model, test_loader, device)
-    print(f"Test: {format_results(results)}")
+    print(f"\n\t{'Test:':<6} {format_results(results)}")
 
     # Save the run directory, splits, and metrics.
     save_settings_hash(run_dir)

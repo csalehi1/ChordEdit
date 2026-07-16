@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Sampler, TensorDataset
 
 from model_m import MetricPredictor
 from settings import (
@@ -66,6 +66,27 @@ def model_inputs(batch, device: torch.device) -> tuple[torch.Tensor, ...]:
     return tuple(x.to(device) for x in batch[MODEL_BATCH_SLICE])
 
 
+class SampleGridBatchSampler(Sampler[list[int]]):
+    """Yield one sample's full timestep grid per batch (for within-image ranking loss)."""
+
+    def __init__(self, sample_idx: torch.Tensor, shuffle: bool = True):
+        self.shuffle = shuffle
+        self.sample_to_indices: dict[int, list[int]] = {}
+        for i, sid in enumerate(sample_idx.tolist()):
+            self.sample_to_indices.setdefault(sid, []).append(i)
+        self.sample_ids = list(self.sample_to_indices.keys())
+
+    def __iter__(self):
+        ids = self.sample_ids.copy()
+        if self.shuffle:
+            ids = [ids[i] for i in torch.randperm(len(ids)).tolist()]
+        for sid in ids:
+            yield self.sample_to_indices[sid]
+
+    def __len__(self) -> int:
+        return len(self.sample_ids)
+
+
 def save_splits_df(
     train_X: pd.DataFrame,
     val_X: pd.DataFrame,
@@ -112,8 +133,10 @@ def load_df(metrics_csv: Path | None = None, inputs_csv: Path | None = None) -> 
     # Load METRICS_CSV and prepare/resolve sample_id and cell_path columns.
     metrics_csv = metrics_csv or METRICS_CSV
     metrics_df = pd.read_csv(metrics_csv)
-    if metrics_df.isna().any().any():
-        raise ValueError(f"Missing values found in {metrics_csv}")
+    n_drop = int(metrics_df.isna().any(axis=1).sum())
+    if n_drop:
+        print(f"Dropping {n_drop} rows with missing values from {metrics_csv}")
+        metrics_df = metrics_df.dropna().reset_index(drop=True)
     metrics_df[SAMPLE_ID_COL] = metrics_df[SAMPLE_ID_COL].map(prep_sample_id)
     metrics_df[CELL_PATH_COL] = metrics_df[CELL_PATH_COL].map(resolve_cell_path)
     if TARGET_T_DELTA is not None:
@@ -223,13 +246,27 @@ def create_dataloaders(
     val_y: pd.DataFrame,
     test_X: pd.DataFrame,
     test_y: pd.DataFrame,
+    *,
+    group_train_by_sample: bool = False,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Build train/val/test DataLoaders from split feature and target tables."""
     
-    def _dataloader(X: pd.DataFrame, y: pd.DataFrame, shuffle: bool) -> DataLoader:
+    def _dataloader(
+        X: pd.DataFrame,
+        y: pd.DataFrame,
+        shuffle: bool,
+        *,
+        by_sample: bool = False,
+    ) -> DataLoader:
         tensors = build_tensors(X, y, embeddings)
-        return DataLoader(TensorDataset(*tensors), batch_size=BATCH_SIZE, shuffle=shuffle)
-    
+        dataset = TensorDataset(*tensors)
+        if by_sample:
+            return DataLoader(
+                dataset,
+                batch_sampler=SampleGridBatchSampler(tensors[IX_SAMPLE_IDX], shuffle=shuffle),
+            )
+        return DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=shuffle)
+
     device = next(predictor.parameters()).device
     unique_X = (
         pd.concat([train_X, val_X, test_X], ignore_index=True)
@@ -239,7 +276,7 @@ def create_dataloaders(
     embeddings = precompute_embeddings(unique_X, predictor, device)
 
     return (
-        _dataloader(train_X, train_y, shuffle=True),
+        _dataloader(train_X, train_y, shuffle=True, by_sample=group_train_by_sample),
         _dataloader(val_X, val_y, shuffle=False),
         _dataloader(test_X, test_y, shuffle=False),
     )

@@ -78,8 +78,9 @@ def resolve_device(gpu: int | str | None = None) -> torch.device:
 
 
 def format_results(m: dict[str, float]) -> str:
-    return f"loss={m['loss']:.4f}  " + "  ".join(
-        f"{col}: MAE={m[f'mae_{col}']:.3f} R2={m[f'r2_{col}']:.3f}"
+    """Fixed-width metric line so Train/Val columns stay aligned (incl. signed R²)."""
+    return f"loss={m['loss']:7.4f}  " + "  ".join(
+        f"{col}: MAE={m[f'mae_{col}']:6.3f} R2={m[f'r2_{col}']:7.3f}"
         for col in M_TARGET_COLS
     )
 
@@ -109,6 +110,19 @@ def unnormalize_target_columns(
     return y
 
 
+def unnormalize_metric_arrays(
+    psnr: np.ndarray,
+    clip: np.ndarray,
+    bounds: dict[str, tuple[float, float]],
+) -> tuple[np.ndarray, np.ndarray]:
+    psnr_min, psnr_max = bounds[PSNR_COL]
+    clip_min, clip_max = bounds[CLIP_COL]
+    return (
+        psnr * (psnr_max - psnr_min + _EPS) + psnr_min,
+        clip * (clip_max - clip_min + _EPS) + clip_min,
+    )
+
+
 def scalarize(
     psnr: np.ndarray,
     clip: np.ndarray,
@@ -126,6 +140,23 @@ def scalarize(
         bounds[CLIP_COL][1] - bounds[CLIP_COL][0] + _EPS
     )
     return (psnr_n + clip_n) / 2.0
+
+
+def combined_score_tensor(targets: torch.Tensor) -> torch.Tensor:
+    """Scalar m from min-max normalized (psnr, clip), shape (N, 2) -> (N,)."""
+    return (targets[:, 0] + targets[:, 1]) / 2.0
+
+
+def pairwise_ranking_loss(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
+    """Logistic pairwise loss: penalize pred ordering that disagrees with true."""
+    if pred.shape[0] < 2:
+        return pred.new_zeros(())
+    diff_true = true.unsqueeze(1) - true.unsqueeze(0)
+    diff_pred = pred.unsqueeze(1) - pred.unsqueeze(0)
+    mask = diff_true > 0
+    if not mask.any():
+        return pred.new_zeros(())
+    return torch.nn.functional.softplus(-diff_pred[mask]).mean()
 
 
 def add_combined_score(

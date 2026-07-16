@@ -331,7 +331,7 @@ class MetricPredictor(nn.Module):
         t_start: list[float],
         t_end: list[float],
     ) -> torch.Tensor:
-        """Predict (psnr, clip) in raw units for raw inputs."""
+        """Predict (psnr, clip) in min-max normalized units for raw inputs."""
         training = self.training
         self.eval()
         device = self.regressor.target_mean.device
