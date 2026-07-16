@@ -24,11 +24,43 @@ sys.path.insert(0, _DIR)
 import torch
 import torch.nn as nn
 from PIL import Image
+
+# ChordEdit provides the same VAE / text stack used at edit time, so M's
+# embeddings stay consistent with the metrics collected from ChordEdit grids.
+# paths_from_model_root resolves SD-Turbo component dirs under SD_TURBO_ROOT.
 from pipeline_chord import ChordEditPipeline, DEFAULT_COMPUTE_DTYPE
 from run_pie_bench import paths_from_model_root
 
 from _helpers import combine_text_embeddings, mean_pool
 from settings import *
+
+
+def encode_text_pooled(pipeline: ChordEditPipeline, prompts: list[str]) -> torch.Tensor:
+    """
+    Mean-pool ChordEdit text-encoder outputs to (N, hidden_dim) for the MLP.
+
+    ChordEdit's encode_prompt and _encode_text return the full token sequence for
+    UNet conditioning. M needs one vector per prompt, so we tokenize once,
+    run the pipeline text encoder, and attention-mask mean-pool here instead of
+    extending pipeline_chord.py.
+    """
+    inputs = pipeline.tokenizer(
+        list(prompts),
+        padding="max_length",
+        truncation=True,
+        max_length=pipeline.tokenizer.model_max_length,
+        return_tensors="pt",
+    )
+    device = pipeline._device
+    input_ids = inputs.input_ids.to(device)
+    attn_mask = inputs.attention_mask.to(device)
+    encoder_mask = attn_mask if pipeline._use_attention_mask else None
+    outputs = pipeline.text_encoder(input_ids=input_ids, attention_mask=encoder_mask)
+    if hasattr(outputs, "last_hidden_state"):
+        hidden = outputs.last_hidden_state
+    else:
+        hidden = outputs[0]
+    return mean_pool(hidden, attn_mask).to(device=device, dtype=pipeline._compute_dtype)
 
 
 def fourier_timestep_features(t: torch.Tensor, n_freqs: int = T_FOURIER_FREQS) -> torch.Tensor:
@@ -111,15 +143,10 @@ class TextEncoder(nn.Module):
 
     @torch.no_grad()
     def forward(self, sentences: list[str]) -> torch.Tensor:
-        hidden = self._pipeline._encode_text(sentences)
-        tokens = self._pipeline.tokenizer(
-            sentences,
-            padding="max_length",
-            truncation=True,
-            max_length=self._pipeline.tokenizer.model_max_length,
-            return_tensors="pt",
-        )
-        return mean_pool(hidden, tokens.attention_mask.to(hidden.device))
+        # Reuse ChordEdit's tokenizer + CLIP text encoder, then mean-pool to a
+        # fixed vector. UNet conditioning uses the full token sequence; the MLP
+        # needs one embedding per prompt (see encode_text_pooled above).
+        return encode_text_pooled(self._pipeline, sentences)
 
 
 class VaeImageEncoder(nn.Module):
@@ -129,6 +156,8 @@ class VaeImageEncoder(nn.Module):
         super().__init__()
         self._pipeline = pipeline
         with torch.no_grad():
+            # Probe latent width via ChordEdit's own preprocess and VAE encode so
+            # img_dim matches whatever image_size / center-crop the pipeline uses.
             dummy = Image.new("RGB", (pipeline.image_size, pipeline.image_size))
             pixel_values = pipeline._prepare_image_tensor(dummy)
             latents = pipeline._encode_image_to_latent(pixel_values)
@@ -140,8 +169,9 @@ class VaeImageEncoder(nn.Module):
 
     @torch.no_grad()
     def forward(self, images: list) -> torch.Tensor:
-        # stack pixels and run one batched VAE encode instead of
-        # encoding images one-at-a-time (much faster for large sample counts).
+        # ChordEdit's _prepare_image_tensor / _encode_image_to_latent keep the
+        # same crop, normalize, and VAE scaling as real edits. Batch the VAE
+        # forward instead of encoding one image at a time.
         if not images:
             raise ValueError("images must be a non-empty list")
         pixel_values = torch.cat(
@@ -246,6 +276,7 @@ class MetricRegressor(nn.Module):
         return context, t_feat
 
     def set_target_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        """Set the mean and standard deviation of the targets."""
         self.target_mean.copy_(mean.to(self.target_mean))
         self.target_std.copy_(std.to(self.target_std).clamp(min=1e-8))
 
@@ -277,6 +308,10 @@ class MetricPredictor(nn.Module):
         device: torch.device | str | None = None,
     ):
         super().__init__()
+        # We reuse ChordEdit's VAE and text encoder (and their preprocess helpers)
+        # so their embeddings match the runs that produced (psnr, clip) labels. Full
+        # from_local_sd_weights also loads UNet/scheduler; encoder-only loading
+        # would require pipeline_chord.py changes, which we avoid here.
         self.pipeline = ChordEditPipeline.from_local_sd_weights(
             paths_from_model_root(SD_TURBO_ROOT),
             image_size=IMAGE_SIZE,
@@ -292,6 +327,7 @@ class MetricPredictor(nn.Module):
             for param in self.pipeline.text_encoder.parameters():
                 param.requires_grad = False
 
+        # Thin wrappers that call ChordEdit preprocess/encode helpers above.
         self.image_encoder = VaeImageEncoder(self.pipeline)
         self.text_encoder = TextEncoder(self.pipeline)
         self._encoder_img_dim = self.image_encoder.hidden_dim

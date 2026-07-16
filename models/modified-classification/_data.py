@@ -31,7 +31,7 @@ INPUTS_COLS = [SAMPLE_ID_COL, SOURCE_PROMPT_COL, TARGET_PROMPT_COL, IMAGE_PATH_C
 DATA_COLS = list(dict.fromkeys(METRICS_COLS + INPUTS_COLS))
 ID_TO_SPLIT_NAME = "id_to_split.csv"
 
-# EmbeddingIndexedDataset / batch layout. sample_idx is metadata only — not model input.
+# CellEmbeddingDataset / batch layout. sample_idx is metadata only — not model input.
 IX_SAMPLE_IDX = 0
 IX_IMG = 1
 IX_MASK = 2
@@ -41,9 +41,21 @@ IX_T = 5
 IX_Y = 6
 MODEL_BATCH_SLICE = slice(IX_IMG, IX_Y + 1)
 
-def model_inputs(batch, device: torch.device) -> tuple[torch.Tensor, ...]:
+# One dataset item (and collated batch).
+CellItem = tuple[
+    torch.Tensor,  # sample_idx
+    torch.Tensor,  # img
+    torch.Tensor,  # mask
+    torch.Tensor,  # src
+    torch.Tensor,  # tar
+    torch.Tensor,  # t
+    torch.Tensor,  # y
+]
+
+
+def model_inputs(batch: CellItem, device: torch.device) -> tuple[torch.Tensor, ...]:
     """Return (img, mask, src, tar, t, y) on device."""
-    # embeddings live on CPU in the dataset; move only this batch to GPU.
+    # Embeddings live on CPU in the dataset; move only this batch to GPU.
     return tuple(x.to(device) for x in batch[MODEL_BATCH_SLICE])
 
 
@@ -78,7 +90,7 @@ class EmbeddingTables:
     tar: torch.Tensor   # (n_samples, text_dim)
 
 
-class CellEmbeddingDataset(Dataset):
+class CellEmbeddingDataset(Dataset[CellItem]):
     """
     Map each grid cell to embeddings via a shared EmbeddingTables.
 
@@ -102,7 +114,7 @@ class CellEmbeddingDataset(Dataset):
     def __len__(self) -> int:
         return self.sample_idx.shape[0]
 
-    def __getitem__(self, i: int) -> tuple[torch.Tensor, ...]:
+    def __getitem__(self, i: int) -> CellItem:
         sid = int(self.sample_idx[i])
         return (
             self.sample_idx[i],
@@ -131,28 +143,30 @@ def save_splits_df(
     pd.concat(rows, ignore_index=True).sort_values(SAMPLE_ID_COL).to_csv(out, index=False)
 
 
-def load_run_splits(run_dir: Path) -> dict[str, pd.DataFrame]:
-    """Load train/val/test splits from id_to_split.csv."""
+def load_splits_df(run_dir: Path) -> dict[str, pd.DataFrame]:
+    """Load train/val/test metric tables using `id_to_split.csv` sample membership."""
     run_dir = Path(run_dir)
     splits_path = run_dir / ID_TO_SPLIT_NAME
     if not splits_path.exists():
-        raise FileNotFoundError(f"Missing splits at {splits_path}; run train_m.py first.")
+        raise FileNotFoundError(f"Missing splits at {splits_path}. Run train_m.py first.")
     splits_df = pd.read_csv(splits_path, dtype={SAMPLE_ID_COL: str, "split": str})
     df = load_df()
-    df[SAMPLE_ID_COL] = df[SAMPLE_ID_COL].astype(str)
-    return {
-        name: df[df[SAMPLE_ID_COL].isin(splits_df.loc[splits_df["split"] == name, SAMPLE_ID_COL])].reset_index(
-            drop=True
-        )
-        for name in ("train", "val", "test")
-    }
+    out: dict[str, pd.DataFrame] = {}
+    for name in ("train", "val", "test"):
+        split_ids = splits_df.loc[splits_df["split"] == name, SAMPLE_ID_COL]
+        out[name] = df.loc[df[SAMPLE_ID_COL].isin(split_ids)].reset_index(drop=True)
+    return out
 
 
 def target_bounds(df: pd.DataFrame | None = None) -> dict[str, tuple[float, float]]:
     """Per-target (min, max) from dataset metrics (via load_df / DATASET_DIR)."""
     if df is None:
         df = load_df()
-    return {col: (float(df[col].min()), float(df[col].max())) for col in M_TARGET_COLS}
+    bounds: dict[str, tuple[float, float]] = {}
+    for col in M_TARGET_COLS:
+        values = np.asarray(df[col], dtype=float)
+        bounds[col] = (float(values.min()), float(values.max()))
+    return bounds
 
 
 def load_df(metrics_csv: Path | None = None, inputs_csv: Path | None = None) -> pd.DataFrame:
@@ -170,7 +184,7 @@ def load_df(metrics_csv: Path | None = None, inputs_csv: Path | None = None) -> 
     if TARGET_T_DELTA is not None:
         if TARGET_T_DELTA not in metrics_df[T_DELTA_COL].values:
             raise ValueError(f"{TARGET_T_DELTA=} not found in {T_DELTA_COL}")
-        metrics_df = metrics_df[metrics_df[T_DELTA_COL] == TARGET_T_DELTA].copy()
+        metrics_df = metrics_df.loc[metrics_df[T_DELTA_COL] == TARGET_T_DELTA].copy()
 
     # Load INPUTS_CSV and prepare/resolve image paths and prompts.
     inputs_csv = inputs_csv or INPUTS_CSV
@@ -182,15 +196,17 @@ def load_df(metrics_csv: Path | None = None, inputs_csv: Path | None = None) -> 
     inputs_df[MASK_PATH_COL] = inputs_df[MASK_PATH_COL].map(resolve_mask_path)
 
     # Merge metrics and inputs on sample_id, keep only required columns.
-    merged_df = pd.merge(metrics_df[METRICS_COLS], inputs_df[INPUTS_COLS], on=SAMPLE_ID_COL, how="left").reset_index(drop=True)
-    return merged_df
+    metrics_part: pd.DataFrame = metrics_df.loc[:, METRICS_COLS]
+    inputs_part: pd.DataFrame = inputs_df.loc[:, INPUTS_COLS]
+    return pd.merge(metrics_part, inputs_part, on=SAMPLE_ID_COL, how="left").reset_index(drop=True)
 
 
 def prepare_df(data_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Split a loaded table into X and min-max normalized y."""
     bounds = target_bounds(data_df)
     X = data_df.drop(columns=list(M_TARGET_COLS)).copy()
-    y = normalize_target_columns(data_df[list(M_TARGET_COLS)], bounds=bounds)
+    y_raw: pd.DataFrame = data_df.loc[:, list(M_TARGET_COLS)]
+    y = normalize_target_columns(y_raw, bounds=bounds)
     return X, y
 
 
@@ -211,15 +227,18 @@ def split_df(
         train.drop(columns=target_cols),
         val.drop(columns=target_cols),
         test.drop(columns=target_cols),
-        train[target_cols],
-        val[target_cols],
-        test[target_cols],
+        train.loc[:, target_cols],
+        val.loc[:, target_cols],
+        test.loc[:, target_cols],
     )
 
 
 def grid_axes_from_df(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     """Return sorted unique (t_start, t_end) grid axes from a metrics DataFrame."""
-    return np.sort(df[T_START_COL].unique()), np.sort(df[T_END_COL].unique())
+    return (
+        np.sort(np.asarray(df[T_START_COL].unique())),
+        np.sort(np.asarray(df[T_END_COL].unique())),
+    )
 
 
 def _get_embeddings(
@@ -330,7 +349,7 @@ def create_dataloaders(
     test_y: pd.DataFrame,
     *,
     group_train_by_sample: bool = False,
-) -> tuple[DataLoader, DataLoader, DataLoader]:
+) -> tuple[DataLoader[CellItem], DataLoader[CellItem], DataLoader[CellItem]]:
     """Build train/val/test DataLoaders from split feature and target tables."""
     
     # One shared embedding table for all splits; each dataset only stores cell-level rows.
@@ -339,7 +358,7 @@ def create_dataloaders(
     emb_tables = EmbeddingTables(img=img_emb, mask=mask_emb, src=src_emb, tar=tar_emb)
     sample_id_to_idx = {sid: i for i, sid in enumerate(sample_ids)}
 
-    def _dataloader(X, y, shuffle: bool, by_sample: bool = False) -> DataLoader:
+    def _dataloader(X: pd.DataFrame, y: pd.DataFrame, shuffle: bool, by_sample: bool = False) -> DataLoader[CellItem]:
         # Make the dataset, dataloader objects for one split.
         dataset = CellEmbeddingDataset(
             torch.tensor([sample_id_to_idx[sid] for sid in X[SAMPLE_ID_COL].tolist()], dtype=torch.long),
@@ -400,14 +419,13 @@ def _split_df_by_sample(
     n_val = max(0, round(val_frac * n))
     if n_train + n_val >= n:
         n_val = max(0, min(n_val, n - n_train - 1))
-    train_ids = set(perm[:n_train])
-    val_ids = set(perm[n_train : n_train + n_val])
-    test_ids = set(perm[n_train + n_val :])
+    train_ids = list(perm[:n_train])
+    val_ids = list(perm[n_train : n_train + n_val])
+    test_ids = list(perm[n_train + n_val :])
     if not test_ids and n > 1:
-        moved = perm[n_train - 1]
-        train_ids.remove(moved)
-        test_ids.add(moved)
-    train = df[df[sample_col].isin(train_ids)].reset_index(drop=True)
-    val = df[df[sample_col].isin(val_ids)].reset_index(drop=True)
-    test = df[df[sample_col].isin(test_ids)].reset_index(drop=True)
+        moved = train_ids.pop()
+        test_ids.append(moved)
+    train = df.loc[df[sample_col].isin(train_ids)].reset_index(drop=True)
+    val = df.loc[df[sample_col].isin(val_ids)].reset_index(drop=True)
+    test = df.loc[df[sample_col].isin(test_ids)].reset_index(drop=True)
     return train, val, test

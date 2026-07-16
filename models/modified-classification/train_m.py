@@ -102,18 +102,18 @@ def train(
 
     # Create dataloaders for the train, val, and test sets.
     use_ranking = RANKING_LOSS_WEIGHT > 0
-    train_loader, val_loader, test_loader = create_dataloaders(
-        model, train_X, train_y, val_X, val_y, test_X, test_y, group_train_by_sample=use_ranking
-        )
-    # record encoder dims, then free VAE/text pipeline GPU memory for training.
+    train_loader, val_loader, test_loader = create_dataloaders(model, train_X, train_y, val_X, val_y, test_X, test_y, group_train_by_sample=use_ranking)
+
+    # Record encoder dimensions, then free VAE/text pipeline GPU memory for training.
     img_dim, text_dim = model.encoder_img_dim, model.encoder_text_dim
     model.release_encoders()
 
-    y_train = train_loader.dataset.y
-    print(f"Dataset: train={len(train_loader.dataset)} cells val={len(val_loader.dataset)} cells")
+    y_train = torch.tensor(train_y[list(M_TARGET_COLS)].values, dtype=torch.float)
+    print(f"Dataset: train={len(train_X)} cells val={len(val_X)} cells")
 
     # Normalize the targets if specified.
     if NORMALIZE_TARGETS:
+        # TODO: Describe what this does.
         model.regressor.set_target_stats(y_train.mean(0), y_train.std(0))
     print(
         "Target stats (train):  "
@@ -139,7 +139,7 @@ def train(
     for epoch in range(1, EPOCHS + 1):
         epoch_start = time.perf_counter()
         model.regressor.train()
-        # accumulate running train MSE during the epoch instead of a full
+        # Accumulate running train MSE during the epoch instead of a full
         # train-set evaluate pass every epoch (saves ~half the forward cost on large data).
         train_loss_sum, train_n = 0.0, 0
         for batch in train_loader:
@@ -158,7 +158,7 @@ def train(
             train_loss_sum += mse.detach().item() * y.numel()
             train_n += y.numel()
 
-        # full val metrics every epoch; full train MAE/R² only on the last epoch.
+        # Full val metrics every epoch; full train MAE/R² only on the last epoch.
         val_results = evaluate(model, val_loader, device)
         improved = val_results["loss"] < best_val
         if improved:
