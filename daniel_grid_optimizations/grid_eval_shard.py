@@ -25,6 +25,7 @@ LPIPS_BATCH_SIZE = 32
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--generated-root", required=True)
+    parser.add_argument("--inputs-path", default=None)
     parser.add_argument("--result-path", default=None)
     parser.add_argument("--gpus", nargs="+", type=int, default=[0])
     parser.add_argument("--max-samples", type=int, default=None)
@@ -132,11 +133,16 @@ def run_shard(
     lpips_calc = metrics_calculator.lpips_metric_calculator
     clip_model = metrics_calculator.clip_metric_calculator.model
 
-    # OPT 3: Replace the default slow processor with the fast (Rust-based) variant.
-    from transformers import AutoProcessor
-    clip_processor = AutoProcessor.from_pretrained(
-        metrics_calculator.clip_metric_calculator.model.config._name_or_path,
-        use_fast=True,
+    # OPT 3: Split text tokenization from image preprocessing so the image side can
+    # use TorchvisionBackend explicitly. `use_fast=True` on the combined AutoProcessor
+    # silently no-ops on this transformers version (both paths resolve to the same
+    # slow CPU-bound class) -- TorchvisionBackend is only actually fast when it runs
+    # on GPU-resident tensors, which requires calling it separately from tokenization.
+    from transformers import AutoTokenizer, AutoImageProcessor
+    clip_model_name = metrics_calculator.clip_metric_calculator.model.config._name_or_path
+    clip_tokenizer = AutoTokenizer.from_pretrained(clip_model_name)
+    clip_image_processor = AutoImageProcessor.from_pretrained(
+        clip_model_name, use_fast=True, backend="torchvision",
     )
 
     # Write the header to the result file.
@@ -193,8 +199,8 @@ def run_shard(
                 # for each cell, avoiding N-1 redundant text forward passes per sample.
                 if include_clip and has_edit_part:
                     target_prompt = sample_meta["target_prompt"]
-                    text_processed = clip_processor(
-                        text=[target_prompt], return_tensors="pt", padding=True, truncation=True,
+                    text_processed = clip_tokenizer(
+                        [target_prompt], return_tensors="pt", padding=True, truncation=True,
                     )
                     text_out = clip_model.get_text_features(
                         text_processed["input_ids"].to(DEVICE),
@@ -233,7 +239,11 @@ def run_shard(
 
                     if include_clip and has_edit_part:
                         target_clip_arr = np.uint8(target_arr * mask_array)
-                        clip_image_tensors.append(torch.from_numpy(target_clip_arr).permute(2, 0, 1))
+                        # Move to GPU now (not after preprocessing) so TorchvisionBackend's
+                        # resize/normalize below actually run on GPU tensors -- its fast path
+                        # only engages for GPU-resident input; on CPU tensors it's slower than
+                        # the PIL backend (measured: 2.7s vs 0.076s for a 32-image batch).
+                        clip_image_tensors.append(torch.from_numpy(target_clip_arr).permute(2, 0, 1).to(DEVICE))
 
                     cell_meta.append((t_start, t_end))
 
@@ -256,7 +266,7 @@ def run_shard(
                         lpips_scores = ["nan"] * len(cell_meta)
 
                 # OPT 9 (cont.): Batched CLIP -- run the CLIP image encoder on all collected
-                # masked cell images at once. clip_processor handles resizing and
+                # masked cell images at once. clip_image_processor handles resizing and
                 # normalization; clip_model.get_image_features encodes the whole batch
                 # in one forward pass. Cosine similarities are computed vectorially.
                 clip_scores: list = []
@@ -265,7 +275,7 @@ def run_shard(
                         clip_scores = []
                         for i in range(0, len(clip_image_tensors), CLIP_BATCH_SIZE):
                             batch_images = clip_image_tensors[i:i + CLIP_BATCH_SIZE]
-                            image_processed = clip_processor(images=batch_images, return_tensors="pt")
+                            image_processed = clip_image_processor(images=batch_images, return_tensors="pt")
                             image_out = clip_model.get_image_features(
                                 image_processed["pixel_values"].to(DEVICE)
                             )
@@ -307,8 +317,17 @@ def main() -> None:
     max_samples = args.max_samples
     gpus = args.gpus
     generated_root = Path(args.generated_root).expanduser().resolve()
-    inputs_path = generated_root / f"id_to_inputs_{generated_root.name.replace('_','').replace('-','').lower()}.csv"
-    metrics_path = generated_root / f"id_to_metrics_{generated_root.name.replace('_','').replace('-','').lower()}{f'_n{max_samples}' if max_samples else ''}.csv"
+    default_name = generated_root.name.replace('_', '').replace('-', '').lower()
+    inputs_path = (
+        Path(args.inputs_path).expanduser().resolve()
+        if args.inputs_path
+        else generated_root / f"id_to_inputs_{default_name}.csv"
+    )
+    metrics_path = (
+        Path(args.result_path).expanduser().resolve()
+        if args.result_path
+        else generated_root / f"id_to_metrics_{default_name}{f'_n{max_samples}' if max_samples else ''}.csv"
+    )
 
     include_psnr = args.include_psnr
     include_lpips = args.include_lpips
