@@ -15,12 +15,12 @@ import settings
 from _helpers import (
     SampleRecord,
     cell_filename,
-    get_output_dir_name,
     iter_cell_pairs,
     load_pipeline,
     load_samples,
     resolve_under,
     strip_brackets,
+    validate_dataset_root,
     write_id_to_inputs,
 )
 
@@ -94,7 +94,7 @@ def run_shard(
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
-    mapping_path = data_root / "mapping_file.json"
+    mapping_path = validate_dataset_root(data_root)
 
     # Only shard 0 writes the full-dataset inputs CSV (avoids races).
     if shard == 0:
@@ -117,9 +117,9 @@ def run_shard(
     # After CUDA_VISIBLE_DEVICES pinning, the only visible device is cuda:0.
     bind_pipeline(load_pipeline(model_root, "cuda:0", base_config, SD_COMPONENT_SUBDIRS))
 
-    # Generate cells for each sample.
+    # Generate cells for each sample into {output_root}/{sample_id}/cells/.
     for index, (sample_id, meta) in enumerate(samples, start=1):
-        cells_dir = output_root / sample_id / "cells"
+        cells_dir = output_root / sample_id / settings.CELLS_DIRNAME
 
         # Skip if every cell jpg is already on disk.
         expected = [
@@ -196,13 +196,15 @@ def main() -> None:
 
     args = parse_args()
     data_root = Path(args.data_root).expanduser().resolve()
+    validate_dataset_root(data_root)
     gpus = args.gpus
 
-    # Create the output root dir, <output-root>/<dataset-folder-name>[_n<max-samples>]/.
+    # Create <output-root>/<dataset-folder-name>[_n<max-samples>]/.
+    dataset_dir = data_root.name if args.max_samples is None else f"{data_root.name}_n{args.max_samples}"
     output_root = (
-        Path(args.output_root).expanduser().resolve() / get_output_dir_name(data_root.name, args.max_samples)
+        Path(args.output_root).expanduser().resolve() / dataset_dir
         if args.output_root is not None
-        else SCRIPT_DIR / "generated" / get_output_dir_name(data_root.name, args.max_samples)
+        else SCRIPT_DIR / "generated" / dataset_dir
     )
     output_root.mkdir(parents=True, exist_ok=True)
     if args.output_root is None:

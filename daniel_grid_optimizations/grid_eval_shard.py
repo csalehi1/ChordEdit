@@ -15,6 +15,9 @@ from multiprocessing import get_context
 from pathlib import Path
 from typing import List
 
+import settings
+from _helpers import cell_filename, metrics_fieldnames
+
 LOGGER = logging.getLogger("grid_eval")
 
 IMAGE_SIZE = 512
@@ -92,18 +95,25 @@ def run_shard(
     torch.backends.cudnn.benchmark = True
 
     DEVICE = torch.device("cuda:0")
+    fieldnames = metrics_fieldnames(metrics)
+    t_delta = settings.T_DELTA
 
     # Collect samples from the inputs CSV.
     all_samples: dict[str, dict[str, str]] = {}
     with open(inputs_path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
+        if reader.fieldnames != settings.ID_TO_INPUTS_FIELDS:
+            raise ValueError(
+                f"Unexpected id_to_inputs columns {reader.fieldnames}; "
+                f"expected {settings.ID_TO_INPUTS_FIELDS}"
+            )
         for row in reader:
             all_samples[row["sample_id"]] = {k: v for k, v in row.items() if k != "sample_id"}
 
-    # Collect cells from the generated root.
+    # Collect cells from {generated_root}/{sample_id}/cells/.
     all_cells: defaultdict[str, list[tuple[float, float, Path]]] = defaultdict(list)
     for sample_id in all_samples:
-        cells_dir = generated_root / sample_id / "cells"
+        cells_dir = generated_root / sample_id / settings.CELLS_DIRNAME
         if not cells_dir.is_dir():
             continue
         for path in sorted(cells_dir.iterdir()):
@@ -111,7 +121,7 @@ def run_shard(
             if match is None:
                 raise ValueError(f"Invalid cell filename: {path.name}")
             t_start, t_end = (float(x.replace("p", ".")) for x in match.groups())
-            all_cells[sample_id].append((t_start, t_end, path.absolute()))
+            all_cells[sample_id].append((t_start, t_end, path))
 
     # Apply max_samples cap, then round-robin shard.
     sample_ids = list(all_cells.keys())
@@ -147,7 +157,7 @@ def run_shard(
 
     # Write the header to the result file.
     with open(result_path, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(["sample_id", "t_start", "t_end"] + metrics)
+        csv.writer(f).writerow(fieldnames)
 
     # OPT 4: Keep the result file open for the entire evaluation instead of
     # re-opening and closing it for every single cell row, eliminating thousands
@@ -245,7 +255,9 @@ def run_shard(
                         # the PIL backend (measured: 2.7s vs 0.076s for a 32-image batch).
                         clip_image_tensors.append(torch.from_numpy(target_clip_arr).permute(2, 0, 1).to(DEVICE))
 
-                    cell_meta.append((t_start, t_end))
+                    cell_meta.append(
+                        (t_start, t_end, f"{sample_id}/{settings.CELLS_DIRNAME}/{cell_filename(t_start, t_end)}")
+                    )
 
                 # OPT 9 (cont.): Batched LPIPS -- run SqueezeNet on stacked target tensors.
                 # We call lpips_calc.net directly to get per-sample LPIPS scores;
@@ -290,14 +302,15 @@ def run_shard(
                     else:
                         clip_scores = ["nan"] * len(cell_meta)
 
-                for idx, (t_start, t_end) in enumerate(cell_meta):
-                    row: list = [sample_id, f"{t_start:.1f}", f"{t_end:.1f}"]
+                for idx, (t_start, t_end, rel_cell_path) in enumerate(cell_meta):
+                    row: list = [sample_id, f"{t_start:.1f}", f"{t_end:.1f}", f"{t_delta:.1f}"]
                     if include_psnr:
                         row.append(psnr_scores[idx])
                     if include_lpips:
                         row.append(lpips_scores[idx])
                     if include_clip:
                         row.append(clip_scores[idx])
+                    row.append(rel_cell_path)
                     result_writer.writerow(row)
                 result_file.flush()
 
@@ -317,16 +330,18 @@ def main() -> None:
     max_samples = args.max_samples
     gpus = args.gpus
     generated_root = Path(args.generated_root).expanduser().resolve()
-    default_name = generated_root.name.replace('_', '').replace('-', '').lower()
-    inputs_path = (
-        Path(args.inputs_path).expanduser().resolve()
-        if args.inputs_path
-        else generated_root / f"id_to_inputs_{default_name}.csv"
-    )
+    # Check that the generated root is a directory.
+    if not generated_root.is_dir():
+        raise FileNotFoundError(f"generated-root is not a directory: {generated_root}")
+    suffix = generated_root.name.lower().replace("_", "").replace("-", "")
+    # Check that the inputs CSV exists.
+    inputs_path = generated_root / f"id_to_inputs_{generated_root.name.lower().replace('_', '').replace('-', '')}.csv"
+    if not inputs_path.is_file():
+        raise FileNotFoundError(f"Missing inputs CSV (expected generated layout): {inputs_path}")
     metrics_path = (
         Path(args.result_path).expanduser().resolve()
         if args.result_path
-        else generated_root / f"id_to_metrics_{default_name}{f'_n{max_samples}' if max_samples else ''}.csv"
+        else generated_root / f"id_to_metrics_{suffix}{f'_n{max_samples}' if max_samples is not None else ''}.csv"
     )
 
     include_psnr = args.include_psnr
@@ -342,6 +357,7 @@ def main() -> None:
         metrics.append("lpips_unedit_part")
     if include_clip:
         metrics.append("clip_similarity_target_image_edit_part")
+    fieldnames = metrics_fieldnames(metrics)
 
     # OPT 10: Multi-GPU sharding -- distribute samples round-robin across GPUs.
     # Each GPU runs an independent spawned process with its own CUDA context,
@@ -387,12 +403,12 @@ def main() -> None:
     # Merge per-shard CSVs into the final result file.
     with open(metrics_path, "w", newline="", encoding="utf-8") as out:
         writer = csv.writer(out)
-        writer.writerow(["sample_id", "t_start", "t_end"] + metrics)
+        writer.writerow(fieldnames)
         for shard_path in shard_paths:
             with open(shard_path, encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    writer.writerow([row[col] for col in ["sample_id", "t_start", "t_end"] + metrics])
+                    writer.writerow([row[col] for col in fieldnames])
             shard_path.unlink()
 
     LOGGER.info("Done. Metrics in %s", metrics_path.absolute())

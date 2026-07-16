@@ -1,5 +1,14 @@
 """
 Evaluate the metrics of a grid of cells for every sample in a dataset.
+
+Expects:
+
+  <generated-root>/
+    id_to_inputs_<suffix>.csv
+    {sample_id}/cells/t_start_*__t_end_*.jpg
+
+Writes id_to_metrics_<suffix>.csv with columns:
+  sample_id,t_start,t_end,t_delta,<metrics...>,cell_path
 """
 
 from __future__ import annotations
@@ -20,6 +29,8 @@ from pathlib import Path
 from PIL import Image
 
 from evaluation.matrics_calculator import MetricsCalculator
+import settings
+from _helpers import cell_filename, metrics_fieldnames
 
 LOGGER = logging.getLogger("grid_eval")
 
@@ -72,8 +83,20 @@ def main() -> None:
     args = parse_args()
     max_samples = args.max_samples
     generated_root = Path(args.generated_root).expanduser().resolve()
-    inputs_path = generated_root / f"id_to_inputs_{generated_root.name.replace('_','').replace('-','').lower()}.csv"
-    result_path = generated_root / f"id_to_metrics_{generated_root.name.replace('_','').replace('-','').lower()}{f'_n{max_samples}' if max_samples else ''}.csv"
+    # Check that the generated root is a directory.
+    if not generated_root.is_dir():
+        raise FileNotFoundError(f"generated-root is not a directory: {generated_root}")
+    # Check that the inputs CSV exists.
+    inputs_path = generated_root / f"id_to_inputs_{generated_root.name.lower().replace('_', '').replace('-', '')}.csv"
+    if not inputs_path.is_file():
+        raise FileNotFoundError(f"Missing inputs CSV (expected generated layout): {inputs_path}")
+    # Resolve the result path for the generated root.
+    suffix = generated_root.name.lower().replace("_", "").replace("-", "")
+    result_path = (
+        Path(args.result_path).expanduser().resolve()
+        if args.result_path
+        else generated_root / f"id_to_metrics_{suffix}{f'_n{max_samples}' if max_samples is not None else ''}.csv"
+    )
 
     # Build the list of metrics to evaluate. If no --include-* flags are
     # specified, all metrics are included (the default behavior).
@@ -90,18 +113,25 @@ def main() -> None:
         metrics.append("lpips_unedit_part")
     if include_clip:
         metrics.append("clip_similarity_target_image_edit_part")
+    fieldnames = metrics_fieldnames(metrics)
+    t_delta = settings.T_DELTA
 
     # Collect samples from the inputs CSV.
     samples: dict[str, dict[str, str]] = {}
     with open(inputs_path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
+        if reader.fieldnames != settings.ID_TO_INPUTS_FIELDS:
+            raise ValueError(
+                f"Unexpected id_to_inputs columns {reader.fieldnames}; "
+                f"expected {settings.ID_TO_INPUTS_FIELDS}"
+            )
         for row in reader: # type: ignore
             samples[row["sample_id"]] = {k: v for k, v in row.items() if k != "sample_id"} # type: ignore[index]
 
-    # Collect cells from the generated root.
+    # Collect cells from {generated_root}/{sample_id}/cells/.
     cells: defaultdict[str, list[tuple[float, float, Path]]] = defaultdict(list)
     for sample_id in samples:
-        cells_dir = generated_root / sample_id / "cells"
+        cells_dir = generated_root / sample_id / settings.CELLS_DIRNAME
         if not cells_dir.is_dir():
             continue
         for path in sorted(cells_dir.iterdir()):
@@ -109,7 +139,7 @@ def main() -> None:
             if match is None:
                 raise ValueError(f"Invalid cell filename: {path.name}")
             t_start, t_end = (float(x.replace("p", ".")) for x in match.groups())
-            cells[sample_id].append((t_start, t_end, path.absolute()))
+            cells[sample_id].append((t_start, t_end, path))
 
     if max_samples is not None:
         sample_ids_to_keep = list(cells.keys())[:max_samples]
@@ -125,7 +155,7 @@ def main() -> None:
     psnr_calc = metrics_calculator.psnr_metric_calculator
     lpips_calc = metrics_calculator.lpips_metric_calculator
     clip_model = metrics_calculator.clip_metric_calculator.model
-   
+
     # OPT 3: Replace the default slow processor with the fast (Rust-based) variant.
     from transformers import AutoProcessor
     clip_processor = AutoProcessor.from_pretrained(
@@ -135,7 +165,7 @@ def main() -> None:
 
     # Write the header to the result file.
     with open(result_path, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(["sample_id", "t_start", "t_end"] + metrics)
+        csv.writer(f).writerow(fieldnames)
 
     # OPT 4: Keep the result file open for the entire evaluation instead of
     # re-opening and closing it for every single cell row, eliminating thousands
@@ -229,7 +259,9 @@ def main() -> None:
                         target_clip_arr = np.uint8(target_arr * mask_array)
                         clip_image_tensors.append(torch.from_numpy(target_clip_arr).permute(2, 0, 1))
 
-                    cell_meta.append((t_start, t_end))
+                    cell_meta.append(
+                        (t_start, t_end, f"{sample_id}/{settings.CELLS_DIRNAME}/{cell_filename(t_start, t_end)}")
+                    )
 
                 # OPT 9 (cont.): Batched LPIPS -- run SqueezeNet on stacked target tensors.
                 # We call lpips_calc.net directly to get per-sample LPIPS scores;
@@ -274,14 +306,15 @@ def main() -> None:
                     else:
                         clip_scores = ["nan"] * len(cell_meta)
 
-                for idx, (t_start, t_end) in enumerate(cell_meta):
-                    row: list = [sample_id, f"{t_start:.1f}", f"{t_end:.1f}"]
+                for idx, (t_start, t_end, rel_cell_path) in enumerate(cell_meta):
+                    row: list = [sample_id, f"{t_start:.1f}", f"{t_end:.1f}", f"{t_delta:.1f}"]
                     if include_psnr:
                         row.append(psnr_scores[idx])
                     if include_lpips:
                         row.append(lpips_scores[idx])
                     if include_clip:
                         row.append(clip_scores[idx])
+                    row.append(rel_cell_path)
                     result_writer.writerow(row)
                 result_file.flush()
 

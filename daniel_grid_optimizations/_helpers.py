@@ -42,15 +42,41 @@ def cell_filename(t_start: float, t_end: float) -> str:
     return f"{start}__{end}{settings.CELL_EXTENSION}"
 
 
+def metrics_fieldnames(metrics: List[str]) -> List[str]:
+    """Header for id_to_metrics CSV (metric columns may be a subset)."""
+    return ["sample_id", "t_start", "t_end", "t_delta", *metrics, "cell_path"]
+
+
 def strip_brackets(text: str) -> str:
-    """Drop PIE/UltraEdit [bracket] markers from prompts."""
+    """Drop [bracket] markers from prompts."""
     return text.replace("[", "").replace("]", "").strip()
 
 
 def resolve_under(root: Path, relative: str) -> Path:
-    """Resolve a mapping path under root, or under root/annotation_images/."""
+    """Resolve a mapping path under root (absolute paths pass through)."""
+    path = Path(relative)
+    if path.is_absolute():
+        return path
     direct = root / relative
     return direct if direct.exists() else root / "annotation_images" / relative
+
+
+def validate_dataset_root(data_root: Path) -> Path:
+    """
+    Require mapping_file.json, annotation_images/, annotation_masks/.
+    Optional when present: annotation_masks_downloaded/, annotation_edits/.
+    """
+    if not data_root.is_dir():
+        raise FileNotFoundError(f"data-root is not a directory: {data_root}")
+    mapping_path = data_root / settings.MAPPING_FILENAME
+    if not mapping_path.is_file():
+        raise FileNotFoundError(f"Missing {settings.MAPPING_FILENAME} under {data_root}")
+    missing = [name for name in settings.DATASET_REQUIRED_SUBDIRS if not (data_root / name).is_dir()]
+    if missing:
+        raise FileNotFoundError(
+            f"data-root missing required folders {missing}: {data_root}"
+        )
+    return mapping_path
 
 
 def load_samples(
@@ -73,10 +99,14 @@ def load_samples(
 
 
 def write_id_to_inputs(output_root: Path, data_root: Path, mapping_path: Path) -> Path:
-    """Write id_to_inputs_<suffix>.csv for the whole mapping (all samples)."""
+    """
+    Write id_to_inputs_<suffix>.csv with absolute image/mask paths.
+    downloaded_mask_image_path is filled only when that optional folder/field is present.
+    """
     mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
     suffix = output_root.name.lower().replace("_", "").replace("-", "")
     dest = output_root / f"id_to_inputs_{suffix}.csv"
+    has_downloaded_masks = (data_root / "annotation_masks_downloaded").is_dir()
 
     with dest.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=settings.ID_TO_INPUTS_FIELDS)
@@ -87,23 +117,24 @@ def write_id_to_inputs(output_root: Path, data_root: Path, mapping_path: Path) -
             if not image_rel:
                 continue
             mask_rel = meta.get(settings.FIELD_MASK_IMAGE_PATH, "")
+            downloaded_mask_rel = (
+                meta.get(settings.FIELD_DOWNLOADED_MASK_IMAGE_PATH, "")
+                if has_downloaded_masks
+                else ""
+            )
             writer.writerow(
                 {
                     "sample_id": str(sample_id).zfill(settings.SAMPLE_ID_WIDTH),
                     "source_prompt": meta.get(settings.FIELD_SOURCE_PROMPT, ""),
                     "target_prompt": meta.get(settings.FIELD_TARGET_PROMPT, ""),
-                    "image_path": image_rel,
-                    "mask_image_path": mask_rel,
+                    "image_path": str(resolve_under(data_root, image_rel)),
+                    "mask_image_path": str(resolve_under(data_root, mask_rel)) if mask_rel else "",
+                    "downloaded_mask_image_path": (
+                        str(resolve_under(data_root, downloaded_mask_rel)) if downloaded_mask_rel else ""
+                    ),
                 }
             )
     return dest
-
-
-def get_output_dir_name(dataset_name: str, max_samples: int | None) -> str:
-    """Dataset folder name under the output root; appends _n<max_samples> when capped."""
-    if max_samples is not None:
-        return f"{dataset_name}_n{max_samples}"
-    return dataset_name
 
 
 def iter_cell_pairs(
@@ -114,7 +145,6 @@ def iter_cell_pairs(
     """Yield (t_start, t_end) pairs to generate."""
     for t_start in grid_values:
         for t_end in grid_values:
-            # Support for diagonal optimization, exclude t_start <= t_end.
             if diagonal_optimization and t_start <= t_end:
                 continue
             yield t_start, t_end
