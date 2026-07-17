@@ -3,6 +3,8 @@ from functools import partial
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
+
 from models.classification.scores import (
     compute_weighted_combined_score,
     compute_agreement_score,
@@ -10,140 +12,76 @@ from models.classification.scores import (
     compute_softplus_score,
 )
 
-"""
-Paths. Root directories and CSV inputs derived from the location of this
-file. The outputs subdirectory is named after the metrics CSV stem so
-that different datasets write to isolated folders automatically.
-"""
-
-_PARENT_DIR = Path(__file__).resolve().parent
-DATA_DIR = _PARENT_DIR / "data"
-
-# NOTE: Adjust METRICS_CSV dependent on the data
-METRICS_CSV = DATA_DIR / "id_to_metrics_sdturbo-tstart.csv"
-STRINGS_CSV = DATA_DIR / "id_to_string_pair.csv"
-
-# Files for image data should be named `id_to_metrics_*`
-_OUTPUTS_SUBDIR = METRICS_CSV.stem.removeprefix("id_to_metrics_")
-OUTPUTS_DIR = _PARENT_DIR / "outputs" / _OUTPUTS_SUBDIR
-
 
 """
-Parameters that describe the shape and structure of the training data.
-N_BUCKETS_* defines the expected number of distinct timestep levels; the
-loader raises at import time if the data does not match. The PAPER_T_*
-constants reproduce the baseline timestep bounds from the original paper
-and are used by the Pareto score functions to identify the reference row
-within each sample group.
+Data settings.
 """
 
-# NOTE: May be "weighted_combined_score", "agreement_score",
-# "naive_pareto_score", or "softplus_score". Choose one.
-TARGET_METRIC = "softplus_score"
+# NOTE: Set this to the directory containing the generated metrics and inputs CSV files.
+DIR_NAME = "UltraEdit_Region_1000"
+GENERATED_DIR = Path(f"/shared/ssd_30T/mirick/generated/ultra_edit/{DIR_NAME}")
+DATASET_DIR = Path(f"/shared/ssd_30T/mirick/datasets/ultra_edit/{DIR_NAME}")
+# Precomputed embeddings (used when FREEZE_ENCODERS is True). Set to None to force on-the-fly encode.
+# EMBEDDINGS_DIR = Path(f"/shared/ssd_30T/mirick/embeddings/ultraedit/{DIR_NAME}")
 
-# NOTE: Must match number of distinct `t_start`, `t_end` values in METRICS_CSV
-N_BUCKETS_START = 11
-N_BUCKETS_END = 1
+INPUTS_CSV = GENERATED_DIR / f"id_to_inputs_{DIR_NAME.replace('_', '').lower()}.csv"
+METRICS_CSV = GENERATED_DIR / f"id_to_metrics_{DIR_NAME.replace('_', '').lower()}.csv"
 
-# Value in `t_delta` column to select data from 
-TARGET_T_DELTA = 0.0
+# NOTE: Set this to the directory where the model outputs will be saved.
+OUTPUTS_DIR = Path(__file__).resolve().parent / "outputs" / DIR_NAME
+if not OUTPUTS_DIR.exists():
+    OUTPUTS_DIR.mkdir(parents=True)
 
-# By default, use DEFAULT_T_START = PAPER_T_START - (PAPER_T_DELTA - TARGET_T_DELTA)
-DEFAULT_T_START = 0.9
-DEFAULT_T_END = 0.3
+# Column names in the id_to_inputs_*.csv file.
+SAMPLE_ID_COL = "sample_id"
+SOURCE_PROMPT_COL = "source_prompt"
+TARGET_PROMPT_COL = "target_prompt"
+IMAGE_PATH_COL = "image_path"
+MASK_PATH_COL = "mask_image_path"
 
-# Values from the original paper, should *not* be modified
+# Column names in the id_to_metrics_*.csv file.
+SAMPLE_ID_COL = "sample_id"
+CATEGORY_COL = "category"
+T_START_COL = "t_start"
+T_END_COL = "t_end"
+T_DELTA_COL = "t_delta"
+PSNR_COL = "psnr_unedit_part"
+LPIPS_COL = "lpips_unedit_part"
+CLIP_COL = "clip_similarity_target_image_edit_part"
+CELL_PATH_COL = "cell_path"
+
+C_TARGET_COLS = (PSNR_COL, CLIP_COL)
+C_TARGET_LABELS = {PSNR_COL: "Whole PSNR", CLIP_COL: "CLIP-Edited"}
+
+# Baseline timestep bounds from the original ChordEdit paper.
 PAPER_T_START = 0.9
 PAPER_T_END = 0.3
 PAPER_T_DELTA = 0.15
 
+GRID_VALUES = np.linspace(0.0, 1.0, 11)
+GRID_T_START = GRID_VALUES
+GRID_T_END = GRID_VALUES
 
-"""
-Computed metrics. Set TARGET_METRIC to one of the keys in _METRIC_REGISTRY.
-TARGET_METRIC_COL is the column name for the active metric.
-"""
+# Account for the paper's finding by using the nearest grid value.
+DEFAULT_T_START = 0.8
+DEFAULT_T_END = PAPER_T_END
 
+# Value in `t_delta` column to select data from.
+TARGET_T_DELTA = 0.0
 
-@dataclass(frozen=True)
-class MetricOption:
-    fn: Callable
-    col: str
-    label: str
-
-
-# Data to connect TARGET_METRIC to the appropriate metric function and label.
-_LAMBDA_PSNR, _LAMBDA_CLIP = 0.5, 0.5
-_PARETO_BIAS_ALPHA = 2.0
-_SOFTPLUS_ALPHA, _SOFTPLUS_BETA = 1.0, 2.0
-_NORMALIZE = True
-_METRIC_REGISTRY: dict[str, MetricOption] = {
-    "weighted_combined_score": MetricOption(
-        fn=partial(compute_weighted_combined_score, lambda_psnr=_LAMBDA_PSNR, lambda_clip=_LAMBDA_CLIP),
-        col=f"weighted_combined_score_lc{_LAMBDA_CLIP:g}-lp{_LAMBDA_PSNR:g}",
-        label=f"Combined Score (\\lambda_{{\\text{{PSNR}}}}={_LAMBDA_PSNR}, \\lambda_{{\\text{{CLIP}}}}={_LAMBDA_CLIP})",
-    ),
-    "agreement_score": MetricOption(
-        fn=compute_agreement_score,
-        col="agreement_score",
-        label="Agreement Score",
-    ),
-    "naive_pareto_score": MetricOption(
-        fn=partial(compute_naive_pareto_score, normalize=_NORMALIZE),
-        col=f"naive_pareto_score_n{_NORMALIZE:d}",
-        label=f"Naive Pareto Score (n={_NORMALIZE:d})",
-    ),
-    "softplus_score": MetricOption(
-        fn=partial(compute_softplus_score, alpha=_SOFTPLUS_ALPHA, beta=_SOFTPLUS_BETA, normalize=_NORMALIZE),
-        col=f"softplus_score_a{_SOFTPLUS_ALPHA:g}-b{_SOFTPLUS_BETA:g}-n{_NORMALIZE:d}",
-        label=f"Softplus Score ($\\alpha={_SOFTPLUS_ALPHA}$, $\\beta={_SOFTPLUS_BETA}$, n={_NORMALIZE:d})",
-    ),
-}
-
-if TARGET_METRIC not in _METRIC_REGISTRY:
-    raise ValueError(
-        f"Unknown TARGET_METRIC={TARGET_METRIC!r}; "
-        f"choose from {sorted(_METRIC_REGISTRY)}"
-    )
-
-_active = _METRIC_REGISTRY[TARGET_METRIC]
-TARGET_METRIC_COL = _active.col
-TARGET_METRIC_COL_FN = _active.fn
-TARGET_METRIC_COL_LABEL = _active.label
-METRIC_REGISTRY = _METRIC_REGISTRY
+_FUNC_ALPHA, _FUNC_BETA, _FUNC_NORM = 1.0, 2.0, True
+T_TARGET_FUNC = lambda df: compute_softplus_score(df, *C_TARGET_COLS, alpha=_FUNC_ALPHA, beta=_FUNC_BETA, normalize=_FUNC_NORM)
+T_TARGET_COL = f"softplus_score_a{_FUNC_ALPHA:g}-b{_FUNC_BETA:g}-n{_FUNC_NORM:d}"
+T_TARGET_LABEL = f"Softplus Score ($\\alpha={_FUNC_ALPHA}$, $\\beta={_FUNC_BETA}$, $n={_FUNC_NORM:d}$)",
 
 
 """
-Metric columns. _METRICS maps the base signal column names to their
-display labels. METRIC_LABELS extends that mapping with the active
-computed metric so any plot or table that iterates over all tracked
-columns can use a single dict.
-"""
-
-_METRICS = {
-    "psnr": "Whole PSNR",
-    "clip_edited": "CLIP-Edited",
-}
-
-METRIC_COLS = list(_METRICS.keys())
-METRIC_LABELS = {
-    **_METRICS,
-    TARGET_METRIC_COL: TARGET_METRIC_COL_LABEL,
-}
-
-
-"""
-Model architecture. ENCODER_MODEL names the HuggingFace checkpoint
-used as the Siamese backbone. FREEZE_ENCODER prevents its weights from
-updating during training; set to False to fine-tune end-to-end.
-HEAD_TYPE selects between ordinal regression ("CORAL"), plain
-mean-squared-error ("MSE"), and cost-sensitive multiclass CE ("CE").
-When HEAD_TYPE is "CE", CE_LOSS_TYPE selects the CE loss function.
-USE_CLASS_WEIGHTS re-weights the loss by inverse class frequency to
-counteract label imbalance in the training split.
+Model architecture.
 """
 
 # Name of HuggingFace checkpoint for text-encoder
-ENCODER_MODEL = "sentence-transformers/Qwen3-VL-Embedding-2B"
+# TODO: Use "sentence-transformers/Qwen3-VL-Embedding-2B"
+ENCODER_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 # Prevent encoder weights from updating during training
 FREEZE_ENCODER = True
 # NOTE: Select head type to use for last step of model, 
@@ -153,15 +91,12 @@ HEAD_TYPE = "CE"
 # "cost_sensitive_ce_loss" or "one_hot_ce_loss". Choose one.
 CE_LOSS_TYPE = "one_hot_ce_loss"
 # Counteract label imbalance in the training split.
-USE_CLASS_WEIGHTS = False
+USE_CLASS_WEIGHTS = True
 # Softens overconfident majority-class collapse in CE training.
 LABEL_SMOOTHING = 0.15
 
 """
-Training hyperparameters. ENCODER_LR and MLP_LR are kept separate because
-the encoder backbone and the MLP head typically benefit from different
-learning rates. MLP_WIDE / MLP_HIDDEN / MLP_INNER define the three hidden
-layer widths of the head network.
+Training hyperparameters.
 """
 
 SEED = 42
