@@ -10,7 +10,15 @@ Expected dataset layout under --data-root:
     annotation_masks_downloaded/{id}.*   # optional
     annotation_edits/{id}.*              # optional
 
-Expected generated layout under --output-root/<dataset-name>/:
+Expected embeddings layout under --embeddings-root/<dataset-name>/:
+
+  id_to_embeddings_<suffix>.csv
+  {id}/source.pt
+  {id}/target.pt
+  {id}/image.pt
+  {id}/mask.pt
+
+Expected generated layout under --generated-root/<dataset-name>/:
 
   id_to_inputs_<suffix>.csv
   id_to_metrics_<suffix>.csv
@@ -44,8 +52,18 @@ MAPPING_FILENAME = "mapping_file.json"
 # Per-sample generated layout under the output dataset folder.
 CELLS_DIRNAME = "cells"
 
+# Per-sample embedding filenames under --embeddings-root/<dataset-name>/{id}/.
+EMBEDDING_FILENAMES: Tuple[str, ...] = ("source.pt", "target.pt", "image.pt", "mask.pt")
+
 # CSV schemas.
 SAMPLE_ID_WIDTH = 8
+ID_TO_EMBEDDINGS_FIELDS = [
+    "sample_id",
+    "source_embedding",
+    "target_embedding",
+    "image_embedding",
+    "mask_embedding",
+]
 ID_TO_INPUTS_FIELDS = [
     "sample_id",
     "source_prompt",

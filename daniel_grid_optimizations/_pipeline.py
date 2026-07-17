@@ -5,6 +5,7 @@ pipeline.py
 from __future__ import annotations
 
 import sys
+from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Tuple, Union
 import torch
@@ -113,18 +114,26 @@ def _cleanup_decode_row(x_transport, edit_embed, noise, t_end_values, cleanup: b
     return [pil_images[i * batch] for i in range(n)]
 
 
+def _cpu_tensor(embed: Any) -> torch.Tensor:
+    """Detach a prompt embed or latent to CPU for torch.save."""
+    if torch.is_tensor(embed):
+        return embed.detach().cpu()
+    return embed.hidden_states.detach().cpu()
+
+
 def run_factorized_grid(
     *,
     source_image: Image.Image,
     record: SampleRecord,
     base_config: Dict[str, Any],
-    t_start_values: List[float],
-    t_end_values: List[float],
+    cell_pairs: List[Tuple[float, float]],
     t_delta: float,
     seed: int,
-    diagonal_optimization: bool = False,
-) -> Dict[Tuple[float, float], "Image.Image"]:
-    """Generate every (t_start, t_end) cell for one source image."""
+    embeddings_dir: Path | None = None,
+    mask_image: Image.Image | None = None,
+    skip_grids: bool = False,
+) -> Dict[Tuple[float, float], Image.Image]:
+    """Generate the given (t_start, t_end) cells for one source image."""
     pipeline = _get_pipeline()
     with torch.no_grad():
         shared_params = pipeline._prepare_edit_params({**base_config, "t_delta": t_delta})
@@ -134,36 +143,40 @@ def run_factorized_grid(
         latents = pipeline._encode_image_to_latent(pixel_values)
         src_embed = pipeline.encode_prompt([record.source_prompt])
         tgt_embed = pipeline.encode_prompt([record.target_prompt])
+        if embeddings_dir is not None:
+            embeddings_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(_cpu_tensor(src_embed), embeddings_dir / "source.pt")
+            torch.save(_cpu_tensor(tgt_embed), embeddings_dir / "target.pt")
+            torch.save(_cpu_tensor(latents), embeddings_dir / "image.pt")
+            if mask_image is not None:
+                image_tensor = pipeline._prepare_image_tensor(mask_image)
+                mask_latents = pipeline._encode_image_to_latent(image_tensor)
+                torch.save(_cpu_tensor(mask_latents), embeddings_dir / "mask.pt")
+        if skip_grids:
+            # If we are skipping grids, return an empty dictionary.
+            return {}
+
         noise_list = pipeline._prepare_noise_list(
             latents=latents,
             seed_value=seed,
             num_noises=shared_params["noise_samples"],
         )
 
+        # Group pairs into rows so transport stays one-per-t_start.
+        rows: OrderedDict[float, List[float]] = OrderedDict()
+        for t_start, t_end in cell_pairs:
+            rows.setdefault(t_start, []).append(t_end)
+
         # One transport per t_start (the dominant cost).
         transport: Dict[float, torch.Tensor] = {}
-        for t_start in t_start_values:
-            row_t_end_values = (
-                [t_end for t_end in t_end_values if t_end < t_start]
-                if diagonal_optimization
-                else t_end_values
-            )
-            if diagonal_optimization and not row_t_end_values:
-                continue
+        for t_start, row_t_end_values in rows.items():
             params = pipeline._prepare_edit_params({**base_config, "t_start": t_start, "t_delta": t_delta})
             u_hat = _u_estimate(latents, src_embed, tgt_embed, noise_list, params["t_start"], params["t_delta"])
             transport[t_start] = (latents + params["step_scale"] * u_hat).detach()
 
         # Cleanup/decode one t_start row at a time (batched across t_end).
         results: Dict[Tuple[float, float], "Image.Image"] = {}
-        for t_start in t_start_values:
-            row_t_end_values = (
-                [t_end for t_end in t_end_values if t_end < t_start]
-                if diagonal_optimization
-                else t_end_values
-            )
-            if diagonal_optimization and not row_t_end_values:
-                continue
+        for t_start, row_t_end_values in rows.items():
             row_images = _cleanup_decode_row(
                 transport[t_start],
                 tgt_embed,

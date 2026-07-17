@@ -31,7 +31,7 @@ class SampleRecord:
     image_path: Path
     source_prompt: str
     target_prompt: str
-    edit_prompt: str
+    edit_instruction: str
     sample_id: str
 
 
@@ -98,14 +98,42 @@ def load_samples(
     return [(sid, mapping[sid]) for sid in sample_ids]
 
 
-def write_id_to_inputs(output_root: Path, data_root: Path, mapping_path: Path) -> Path:
+def write_id_to_embeddings(embeddings_root: Path, mapping_path: Path) -> Path:
+    """Write id_to_embeddings_<suffix>.csv with absolute paths to per-sample .pt files."""
+    mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+    suffix = embeddings_root.name.lower().replace("_", "").replace("-", "")
+    dest = embeddings_root / f"id_to_embeddings_{suffix}.csv"
+    embeddings_root.mkdir(parents=True, exist_ok=True)
+
+    with dest.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=settings.ID_TO_EMBEDDINGS_FIELDS)
+        writer.writeheader()
+        for sample_id in sorted(mapping):
+            meta = mapping[sample_id]
+            if not meta.get(settings.FIELD_IMAGE_PATH):
+                continue
+            sid = str(sample_id).zfill(settings.SAMPLE_ID_WIDTH)
+            sample_dir = embeddings_root / sid
+            writer.writerow(
+                {
+                    "sample_id": sid,
+                    "source_embedding": str(sample_dir / "source.pt"),
+                    "target_embedding": str(sample_dir / "target.pt"),
+                    "image_embedding": str(sample_dir / "image.pt"),
+                    "mask_embedding": str(sample_dir / "mask.pt"),
+                }
+            )
+    return dest
+
+
+def write_id_to_inputs(generated_root: Path, data_root: Path, mapping_path: Path) -> Path:
     """
     Write id_to_inputs_<suffix>.csv with absolute image/mask paths.
     downloaded_mask_image_path is filled only when that optional folder/field is present.
     """
     mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
-    suffix = output_root.name.lower().replace("_", "").replace("-", "")
-    dest = output_root / f"id_to_inputs_{suffix}.csv"
+    suffix = generated_root.name.lower().replace("_", "").replace("-", "")
+    dest = generated_root / f"id_to_inputs_{suffix}.csv"
     has_downloaded_masks = (data_root / "annotation_masks_downloaded").is_dir()
 
     with dest.open("w", encoding="utf-8", newline="") as handle:
@@ -138,13 +166,15 @@ def write_id_to_inputs(output_root: Path, data_root: Path, mapping_path: Path) -
 
 
 def iter_cell_pairs(
-    grid_values: list[float],
+    t_start_values: list[float],
+    t_end_values: list[float] | None = None,
     *,
     diagonal_optimization: bool,
 ) -> Iterable[Tuple[float, float]]:
-    """Yield (t_start, t_end) pairs to generate."""
-    for t_start in grid_values:
-        for t_end in grid_values:
+    """Yield (t_start, t_end) pairs to generate. Defaults to a square grid."""
+    ends = t_start_values if t_end_values is None else t_end_values
+    for t_start in t_start_values:
+        for t_end in ends:
             if diagonal_optimization and t_start <= t_end:
                 continue
             yield t_start, t_end

@@ -21,6 +21,7 @@ from _helpers import (
     resolve_under,
     strip_brackets,
     validate_dataset_root,
+    write_id_to_embeddings,
     write_id_to_inputs,
 )
 
@@ -54,12 +55,15 @@ SD_COMPONENT_SUBDIRS = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", required=True)
-    parser.add_argument("--output-root", default=None)
     parser.add_argument("--model-root", required=True)
+    parser.add_argument("--embeddings-root", default=None)
+    parser.add_argument("--generated-root", default=None)
     parser.add_argument("--gpus", nargs="+", type=int, default=[0])
     parser.add_argument("--max-samples", type=int, default=None)
-    # Optional arguments: also write grid_clean.png overviews and only generate cells where t_start > t_end.
-    parser.add_argument("--add-grids", action="store_true")
+    # Optional flags: --add-plots, --skip-embeddings, --skip-grids, --diagonal-optimization.
+    parser.add_argument("--add-plots", action="store_true")
+    parser.add_argument("--skip-embeddings", action="store_true")
+    parser.add_argument("--skip-grids", action="store_true")
     parser.add_argument("--diagonal-optimization", action="store_true")
     return parser.parse_args()
 
@@ -67,13 +71,16 @@ def parse_args() -> argparse.Namespace:
 def run_shard(
     *,
     data_root: Path,
-    output_root: Path,
+    embeddings_root: Path,
+    generated_root: Path,
     model_root: str,
     max_samples: int | None,
-    write_grids: bool,
+    write_plots: bool,
     diagonal_optimization: bool,
-    shard: int,
+    skip_embeddings: bool,
+    skip_grids: bool,
     num_shards: int,
+    shard: int,
     gpu: int,
 ) -> None:
     """Generate one round-robin shard of samples on a single GPU."""
@@ -96,10 +103,14 @@ def run_shard(
 
     mapping_path = validate_dataset_root(data_root)
 
-    # Only shard 0 writes the full-dataset inputs CSV (avoids races).
+    # Only shard 0 writes the full-dataset embeddings/inputs CSVs (avoids races).
     if shard == 0:
-        dest = write_id_to_inputs(output_root, data_root, mapping_path)
-        LOGGER.info("Wrote %s", dest)
+        if not skip_embeddings:
+            emb_dest = write_id_to_embeddings(embeddings_root, mapping_path)
+            LOGGER.info("Wrote %s", emb_dest)
+        if not skip_grids:
+            dest = write_id_to_inputs(generated_root, data_root, mapping_path)
+            LOGGER.info("Wrote %s", dest)
 
     grid_values = list(settings.GRID_VALUES)
     base_config = dict(DEFAULT_EDIT_CONFIG)
@@ -117,16 +128,31 @@ def run_shard(
     # After CUDA_VISIBLE_DEVICES pinning, the only visible device is cuda:0.
     bind_pipeline(load_pipeline(model_root, "cuda:0", base_config, SD_COMPONENT_SUBDIRS))
 
-    # Generate cells for each sample into {output_root}/{sample_id}/cells/.
-    for index, (sample_id, meta) in enumerate(samples, start=1):
-        cells_dir = output_root / sample_id / settings.CELLS_DIRNAME
+    # Select (t_start, t_end) pairs, including filters for diagonal optimization.
+    cell_pairs = list(iter_cell_pairs(grid_values, diagonal_optimization=diagonal_optimization))
 
-        # Skip if every cell jpg is already on disk.
-        expected = [
-            cells_dir / cell_filename(ts, te)
-            for ts, te in iter_cell_pairs(grid_values, diagonal_optimization=diagonal_optimization)
-        ]
-        if expected and all(path.exists() for path in expected):
+    # Generate embeddings and/or cells for each sample.
+    for index, (sample_id, meta) in enumerate(samples, start=1):
+        emb_dir = embeddings_root / sample_id
+        cells_dir = generated_root / sample_id / settings.CELLS_DIRNAME
+        mask_rel = meta.get(settings.FIELD_MASK_IMAGE_PATH, "")
+
+        # Determine if sample embeddings are already complete (i.e., partially generated).
+        need_embeddings = False
+        if not skip_embeddings:
+            emb_paths = [emb_dir / name for name in ("source.pt", "target.pt", "image.pt")]
+            # Masks are optional, but if present they are expected under the sample embeddings dir.
+            if mask_rel:
+                emb_paths.append(emb_dir / "mask.pt")
+            need_embeddings = not all(path.exists() for path in emb_paths)
+
+        # Determine if sample cells are already complete (i.e., partially generated).
+        need_cells = False
+        if not skip_grids:
+            cell_paths = [cells_dir / cell_filename(ts, te) for ts, te in cell_pairs]
+            need_cells = not cell_paths or not all(path.exists() for path in cell_paths)
+
+        if not need_embeddings and not need_cells:
             LOGGER.info("GPU %d: [%d/%d] Skipped %s, already generated.", gpu, index, len(samples), sample_id)
             continue
 
@@ -137,9 +163,16 @@ def run_shard(
         # TODO: Bracket stripping may not be necessary. Investigate.
         source_prompt = strip_brackets(meta.get(settings.FIELD_SOURCE_PROMPT, ""))
         target_prompt = strip_brackets(meta.get(settings.FIELD_TARGET_PROMPT, ""))
+        edit_instruction = strip_brackets(meta.get(settings.FIELD_EDIT_INSTRUCTION, ""))
+        mask_path = resolve_under(data_root, mask_rel) if (mask_rel and need_embeddings) else None
 
         with Image.open(image_path) as img:
             source_image = img.convert("RGB")
+        mask_image = None
+        if mask_path is not None:
+            with Image.open(mask_path) as mask_img:
+                # Masks are expected to be in RGB, not L, format for encoding.
+                mask_image = mask_img.convert("RGB")
 
         # Bundle this sample's metadata for the grid pipeline.
         record = SampleRecord(
@@ -147,23 +180,31 @@ def run_shard(
             image_path=image_path,
             source_prompt=source_prompt,
             target_prompt=target_prompt,
-            edit_prompt=strip_brackets(meta.get(settings.FIELD_EDIT_INSTRUCTION, "")),
+            edit_instruction=edit_instruction,
             sample_id=sample_id,
         )
 
+        encode_only = skip_grids or not need_cells
+        # Generate cells if they are needed, otherwise only encode the embeddings.
         cells = run_factorized_grid(
             source_image=source_image,
             record=record,
             base_config=base_config,
-            t_start_values=grid_values,
-            t_end_values=grid_values,
+            cell_pairs=cell_pairs,
             t_delta=t_delta,
             seed=SEED,
-            diagonal_optimization=diagonal_optimization,
+            embeddings_dir=emb_dir if need_embeddings else None,
+            mask_image=mask_image,
+            skip_grids=encode_only,
         )
 
+        if encode_only:
+            elapsed = time.perf_counter() - sample_start
+            LOGGER.info("GPU %d: [%d/%d] Saved embeddings for %s (%.2fs)", gpu, index, len(samples), sample_id, elapsed)
+            continue
+
         cells_dir.mkdir(parents=True, exist_ok=True)
-        for t_start, t_end in iter_cell_pairs(grid_values, diagonal_optimization=diagonal_optimization):
+        for t_start, t_end in cell_pairs:
             # Resize the cell to the desired image size and save it.
             cell = cells[(t_start, t_end)].convert("RGB").resize((settings.IMAGE_SIZE, settings.IMAGE_SIZE))
             cell_path = cells_dir / cell_filename(t_start, t_end)
@@ -174,16 +215,15 @@ def run_shard(
                 # Save as .jpg at the specified quality or will save .png without compression.
                 cell.save(cell_path, quality=settings.JPEG_QUALITY)
 
-        if write_grids:
+        if write_plots:
             # Write a grid overview image for each sample.
             title = f'{sample_id} ({category})\nSource: "{source_prompt}"\nTarget: "{target_prompt}"'
-            save_clean_grid(cells_dir, output_root / sample_id / "grid_clean.png", grid_values, t_delta, title)
+            save_clean_grid(cells_dir, generated_root / sample_id / "grid_clean.png", grid_values, t_delta, title)
 
-        cell_count = sum(1 for _ in iter_cell_pairs(grid_values, diagonal_optimization=diagonal_optimization))
         elapsed = time.perf_counter() - sample_start
         LOGGER.info(
             "GPU %d: [%d/%d] Generated %s (%d cells in %.2fs)",
-            gpu, index, len(samples), sample_id, cell_count, elapsed,
+            gpu, index, len(samples), sample_id, len(cell_pairs), elapsed,
         )
 
     LOGGER.info("GPU %d: Finished shard %d/%d.", gpu, shard + 1, num_shards)
@@ -195,30 +235,49 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
     args = parse_args()
+    if args.skip_grids and args.add_plots:
+        raise SystemExit("--skip-grids cannot be combined with --add-plots")
+    if args.skip_embeddings and args.skip_grids:
+        raise SystemExit("--skip-embeddings cannot be combined with --skip-grids")
     data_root = Path(args.data_root).expanduser().resolve()
     validate_dataset_root(data_root)
     gpus = args.gpus
 
-    # Create <output-root>/<dataset-folder-name>[_n<max-samples>]/.
+    # Create embeddings and generated dirs under <root>/<dataset-folder-name>[_n<max-samples>]/.
     dataset_dir = data_root.name if args.max_samples is None else f"{data_root.name}_n{args.max_samples}"
-    output_root = (
-        Path(args.output_root).expanduser().resolve() / dataset_dir
-        if args.output_root is not None
+    embeddings_root = (
+        Path(args.embeddings_root).expanduser().resolve() / dataset_dir
+        if args.embeddings_root is not None
+        else SCRIPT_DIR / "embeddings" / dataset_dir
+    )
+    generated_root = (
+        Path(args.generated_root).expanduser().resolve() / dataset_dir
+        if args.generated_root is not None
         else SCRIPT_DIR / "generated" / dataset_dir
     )
-    output_root.mkdir(parents=True, exist_ok=True)
-    if args.output_root is None:
-        generated_gitignore = output_root.parent / ".gitignore"
-        if not generated_gitignore.exists():
-            generated_gitignore.write_text("*\n!.gitignore\n", encoding="utf-8")
+    if not args.skip_embeddings:
+        embeddings_root.mkdir(parents=True, exist_ok=True)
+        if args.embeddings_root is None:
+            embeddings_gitignore = embeddings_root.parent / ".gitignore"
+            if not embeddings_gitignore.exists():
+                embeddings_gitignore.write_text("*\n!.gitignore\n", encoding="utf-8")
+    if not args.skip_grids:
+        generated_root.mkdir(parents=True, exist_ok=True)
+        if args.generated_root is None:
+            generated_gitignore = generated_root.parent / ".gitignore"
+            if not generated_gitignore.exists():
+                generated_gitignore.write_text("*\n!.gitignore\n", encoding="utf-8")
 
     kwargs = dict(
         data_root=data_root,
-        output_root=output_root,
+        embeddings_root=embeddings_root,
+        generated_root=generated_root,
         model_root=args.model_root,
         max_samples=args.max_samples,
-        write_grids=args.add_grids,
+        write_plots=args.add_plots,
         diagonal_optimization=args.diagonal_optimization,
+        skip_embeddings=args.skip_embeddings,
+        skip_grids=args.skip_grids,
         num_shards=len(gpus),
     )
 
@@ -235,7 +294,7 @@ def main() -> None:
         ]
         for process in processes:
             process.start()
-            # Stagger by a second so shard 0 can write id_to_inputs first.
+            # Stagger by a second so shard 0 can write id_to_embeddings first.
             time.sleep(1.0)
         failed = False
         for process in processes:
@@ -245,7 +304,11 @@ def main() -> None:
         if failed:
             raise SystemExit("One or more generate shards failed.")
 
-    LOGGER.info("Done. Images in %s", output_root)
+    LOGGER.info("Done.")
+    if not args.skip_embeddings:
+        LOGGER.info("Embeddings in %s", embeddings_root)
+    if not args.skip_grids:
+        LOGGER.info("Images in %s", generated_root)
 
 
 if __name__ == "__main__":

@@ -18,11 +18,17 @@ The evaluation metrics come from [PnPInversion](https://github.com/cure-lab/PnPI
 | Flag | Meaning |
 | --- | --- |
 | `--data-root` | |
-| `--output-root` | |
 | `--model-root` | |
+| `--embeddings-root` | |
+| `--generated-root` | |
 | `--gpus` | |
 | `--max-samples` | |
-| `--add-grids` | |
+
+| Flag | Meaning |
+| --- | --- |
+| `--add-plots` | |
+| `--skip-embeddings` | |
+| `--skip-grids` | |
 | `--diagonal-optimization` | |
 
 ### Generation Usage
@@ -31,8 +37,10 @@ Runs are resumable. One process is spawned per GPU in `--gpus`.
 
 ```bash
 python daniel_create/grid_generate.py --data-root ... --model-root ... --gpus 0
-python daniel_create/grid_generate.py --data-root ... --output-root ./results --gpus 0
-python daniel_create/grid_generate.py --add-grids --gpus 0 1
+python daniel_create/grid_generate.py --data-root ... --generated-root ./results --gpus 0
+python daniel_create/grid_generate.py --add-plots --gpus 0 1
+python daniel_create/grid_generate.py --skip-embeddings --gpus 0
+python daniel_create/grid_generate.py --skip-grids --gpus 0
 python daniel_create/grid_generate.py --diagonal-optimization --gpus 0
 ```
 
