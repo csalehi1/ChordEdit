@@ -1,190 +1,168 @@
-import pandas as pd
+"""Scalar quality scores for T selection and M ranking loss.
+
+Torch cores are the source of truth for ranking-relevant scores so the same
+function can score true labels and differentiable predictions. DataFrame
+wrappers match the scores.py.new call style (*cols, weights, ...).
+"""
+
+from __future__ import annotations
+
+import math
+
 import numpy as np
+import pandas as pd
+import torch
+
+_EPS = 1e-8
 
 
-def compute_weighted_combined_score(
-    df: pd.DataFrame,
-    psnr_col: str,
-    clip_col: str,
+def weighted_combined_score(
+    values: torch.Tensor,
     *,
-    lambda_psnr: float = 0.5,
-    lambda_clip: float = 0.5,
+    weights: torch.Tensor | None = None,
+    normalize: bool = True,
+) -> torch.Tensor:
+    """
+    Weight-blend metric columns. values shape (N, C) -> scores (N,).
+
+    When normalize is True, each row is min-max scaled across columns before
+    blending (same as scores.py.new).
+    """
+    n_weights = weights.shape[-1] if weights is not None else values.shape[-1]
+    weights = weights if weights is not None else torch.ones(n_weights, device=values.device, dtype=values.dtype)
+
+    # Normalize values within each sample_id group.
+    def _normalize_values(values: torch.Tensor) -> torch.Tensor:
+        min_values = values.amin(dim=0, keepdim=True)
+        max_values = values.amax(dim=0, keepdim=True)
+        return (values - min_values) / (max_values - min_values + _EPS)
+    
+    values = _normalize_values(values) if normalize else values
+    return (values * weights).sum(dim=-1) / (weights.sum() + _EPS)
+
+
+def agreement_score(
+    values: torch.Tensor,
+    *,
+    normalize: bool = True,
+) -> torch.Tensor:
+    """Agreement in [0, 1] from per-row metric spread. values (N, C) -> (N,)."""
+    raise NotImplementedError()
+
+
+def naive_pareto_score(
+    values: torch.Tensor,
+    *,
+    normalize: bool = True,
+) -> torch.Tensor:
+    raise NotImplementedError()
+
+
+def softplus_score(
+    values: torch.Tensor,
+    *,
+    baseline_idx: int,
+    alpha: float = 1.0,
+    beta: float = 2.0,
+    normalize: bool = True,
+) -> torch.Tensor:
+    """
+    Return a smooth score for each row relative to the baseline row in its
+    sample_id group. When normalize is True, each metric is min-max scaled
+    within each sample_id group before deltas are taken. With softplus
+    transforms s_i = sp(delta_i) of the (possibly normalized) metric deltas:
+
+        sp(x) = (1/beta)*(ln(1+e^{beta*x})-ln(2))
+        m     = sum_i s_i + alpha * prod_i s_i
+
+    The baseline scores 0. Rows that also score 0 but differ from the baseline
+    on every metric are shifted down by epsilon. Improvements are rewarded
+    smoothly and regressions are penalized.
+
+    Plot of the score surface (2 metrics):
+    https://www.desmos.com/3d/9slzoluqbd
+    """
+
+    # Normalize values within each sample_id group.
+    def _normalize_values(values: torch.Tensor) -> torch.Tensor:
+        min_values = values.amin(dim=0, keepdim=True)
+        max_values = values.amax(dim=0, keepdim=True)
+        return (values - min_values) / (max_values - min_values + _EPS)
+
+    # Calculate the shifted softplus score.
+    def _shifted_softplus(values: torch.Tensor, beta: float) -> torch.Tensor:
+        if beta == 0:
+            return values / 2.0
+        zero = torch.zeros((), device=values.device, dtype=values.dtype)
+        return torch.logaddexp(zero, beta * values) / beta - math.log(2) / beta
+
+    # Penalize rows where the score is 0 but it is not the baseline.
+    def _penalize_zeros(values: torch.Tensor, deltas: torch.Tensor) -> torch.Tensor:
+        mask = (values == 0) & (deltas != 0).all(dim=-1)
+        return values - _EPS * mask.to(dtype=values.dtype)
+
+    values = _normalize_values(values) if normalize else values
+    deltas = values - values[baseline_idx]
+    s = _shifted_softplus(deltas, beta)
+    scores = s.sum(dim=-1) + alpha * s.prod(dim=-1)
+    return _penalize_zeros(scores, deltas)
+
+
+def weighted_combined_score_df(
+    df: pd.DataFrame,
+    *cols: str,
+    weights: np.ndarray | list[float] | torch.Tensor | None = None,
     normalize: bool = True,
 ) -> pd.Series:
-    """
-    Return a combined quality score that weights PSNR and CLIP similarity.
-
-    When normalize is True (default), each metric is min-max scaled to [0, 1]
-    before blending; the result is also in [0, 1]. When normalize is False,
-    raw metric values are blended directly. The weights need not sum to 1.
-    """
-    psnr = df[psnr_col].to_numpy(dtype=float)
-    clip = df[clip_col].to_numpy(dtype=float)
-
-    eps = 1e-8
-    if normalize:
-        p_min, p_max = np.nanmin(psnr), np.nanmax(psnr)
-        c_min, c_max = np.nanmin(clip), np.nanmax(clip)
-        psnr = (psnr - p_min) / (p_max - p_min + eps)
-        clip = (clip - c_min) / (c_max - c_min + eps)
-
-    weight_sum = lambda_psnr + lambda_clip
-    combined = (lambda_psnr * psnr + lambda_clip * clip) / (weight_sum + eps)
-    return pd.Series(combined, index=df.index, name=f"weighted_score_p{lambda_psnr}-c{lambda_clip}")
+    """Wrapper for weighted_combined_score that takes a DataFrame and returns a Series."""
+    values = torch.as_tensor(
+        df.loc[:, list(cols)].to_numpy(dtype=np.float64, copy=True),
+        dtype=torch.float64,
+    )
+    weights = None if weights is None else torch.as_tensor(weights, dtype=values.dtype)
+    out = weighted_combined_score(values, weights=weights, normalize=normalize)
+    weights_tag = "-".join(f"{float(v):g}" for v in weights.tolist()) if weights is not None else "-".join("1" for _ in cols)
+    return pd.Series(out.detach().cpu().numpy(), index=df.index, name=f"weighted_score_{weights_tag}")
 
 
-def compute_agreement_score(
+def agreement_score_df(
     df: pd.DataFrame,
-    psnr_col: str = "whole_psnr",
-    clip_col: str = "clip_edited",
+    *cols: str,
+    normalize: bool = True,
 ) -> pd.Series:
-    """
-    Return a score in [0, 1] measuring how closely PSNR and CLIP similarity
-    agree on raw values.
-
-    Returns a score of 1 when the two metrics are equal, 0 at the point of 
-    maximum disagreement in the population.
-    """
-    psnr = df[psnr_col].to_numpy(dtype=float)
-    clip = df[clip_col].to_numpy(dtype=float)
-
-    diff = np.abs(psnr - clip)
-    return pd.Series(1.0 - diff / (diff.max() + 1e-8), index=df.index, name="agreement_score")
+    """Wrapper for agreement_score that takes a DataFrame and returns a Series."""
+    raise NotImplementedError()
 
 
-def _find_baseline_idx(
-    group: pd.DataFrame,
-    base_t_start: float,
-    base_t_end: float,
-    sample_id,
-) -> int:
-    """Return the index of the baseline row for the given sample_id."""
-    base_mask = (np.isclose(group["t_start"], base_t_start) & np.isclose(group["t_end"], base_t_end))
-    if base_mask.sum() == 0:
-        # No exact match, find the closest row
-        dist = np.abs(group["t_start"] - base_t_start) + np.abs(group["t_end"] - base_t_end)
-        base_idx = dist.idxmin()
-        base_row = group.loc[base_idx]
-        print(
-            f"Baseline ({base_t_start}, {base_t_end}) not found for sample_id={sample_id!r}; "
-            f"using ({base_row['t_start']}, {base_row['t_end']})."
-        )
-        return base_idx
-    if base_mask.sum() != 1:
-        raise ValueError(f"Expected exactly one base row, found {base_mask.sum()}")
-    return group.index[base_mask][0]
-
-
-def _minmax_normalize(series: pd.Series) -> pd.Series:
-    """Min-max scale a series to [0, 1]. Constant columns map to 0."""
-    lo, hi = series.min(), series.max()
-    return (series - lo) / (hi - lo + 1e-6)
-
-
-def _group_deltas(
-    group: pd.DataFrame,
-    psnr_col: str,
-    clip_col: str,
-    base_idx,
-    normalized: bool,
-) -> tuple[np.ndarray, np.ndarray]:
-    psnr = _minmax_normalize(group[psnr_col]) if normalized else group[psnr_col].astype(float)
-    clip = _minmax_normalize(group[clip_col]) if normalized else group[clip_col].astype(float)
-    delta_psnr = (psnr - psnr.loc[base_idx]).to_numpy(dtype=float)
-    delta_clip = (clip - clip.loc[base_idx]).to_numpy(dtype=float)
-    return delta_psnr, delta_clip
-
-
-def compute_naive_pareto_score(
+def naive_pareto_score_df(
     df: pd.DataFrame,
-    psnr_col: str = "whole_psnr",
-    clip_col: str = "clip_edited",
+    *cols: str,
     sample_id_col: str = "sample_id",
     base_t_start: float | None = None,
     base_t_end: float | None = None,
     normalize: bool = False,
 ) -> pd.Series:
-    """
-    Return a Pareto improvement score for each row relative to the
-    baseline row in its sample_id group.
-
-    The baseline is the row at (DEFAULT_T_START, DEFAULT_T_END). When
-    normalized is True, PSNR and CLIP are min-max scaled within each
-    sample_id group before deltas are taken. Each row's score is
-    max(0, delta_psnr) * max(0, delta_clip) relative to that baseline
-    (the baseline itself scores 0).
-    """
-    from settings import DEFAULT_T_END, DEFAULT_T_START
-
-    base_t_start = DEFAULT_T_START if base_t_start is None else base_t_start
-    base_t_end = DEFAULT_T_END if base_t_end is None else base_t_end
-
-    scores = pd.Series(0.0, index=df.index, name="naive_pareto_score")
-
-    for sample_id, group in df.groupby(sample_id_col):
-        base_idx = _find_baseline_idx(group, base_t_start, base_t_end, sample_id)
-        delta_psnr, delta_clip = _group_deltas(group, psnr_col, clip_col, base_idx, normalize)
-        row_scores = np.maximum(0, delta_psnr) * np.maximum(0, delta_clip)
-        scores.loc[group.index] = row_scores
-
-    return scores
+    """Wrapper for naive_pareto_score that takes a DataFrame and returns a Series."""
+    raise NotImplementedError()
 
 
-def compute_softplus_score(
+def softplus_score_df(
     df: pd.DataFrame,
-    psnr_col: str = "whole_psnr",
-    clip_col: str = "clip_edited",
-    sample_id_col: str = "sample_id",
-    base_t_start: float | None = None,
-    base_t_end: float | None = None,
+    *cols: str,
     alpha: float = 1.0,
     beta: float = 2.0,
-    epsilon: float = 1e-6,
     normalize: bool = True,
 ) -> pd.Series:
-    """
-    Return a smooth score for each row relative to the baseline row in its
-    sample_id group. When normalized is True, PSNR and CLIP are min-max
-    scaled within each sample_id group before deltas are taken. With a, b
-    the (possibly normalized) metrics and A, B the baseline values:
-
-        sp(x)   = (1/beta)*(ln(1+e^{beta*x})-ln(2))
-        m(a, b) = sp(a-A) + sp(b-B)
-                
-            Optional (alpha > 0): Bias towards Pareto improvement.
-            + alpha*sp(a-A)*sp(b-B)
-
-    The baseline scores 0. Rows that also score 0 but differ from the baseline
-    on both metrics are shifted down by epsilon. Improvements are rewarded
-    smoothly and regressions are penalized.
-
-    Plot of the score surface:
-    https://www.desmos.com/3d/9slzoluqbd
-    """
-    from settings import DEFAULT_T_END, DEFAULT_T_START
-
-    # Calculate the shifted softplus score.
-    def _shifted_softplus(x: np.ndarray, beta: float) -> np.ndarray:
-        """Calculate (1/beta)*(ln(1+e^{beta*x})-ln(2))"""
-        return np.logaddexp(0, beta * x) / beta - np.log(2) / beta
-
-    # Penalize rows where the score is 0 but it is not the baseline.
-    def _penalize_zeros(scores, delta_psnr, delta_clip):
-        """Zero out rows where the score is 0 but it is not the baseline."""
-        mask = (scores == 0) & (delta_psnr != 0) & (delta_clip != 0)
-        return scores - epsilon * mask
-
-    base_t_start = DEFAULT_T_START if base_t_start is None else base_t_start
-    base_t_end = DEFAULT_T_END if base_t_end is None else base_t_end
+    """Wrapper for softplus_score that takes a DataFrame and returns a Series."""
+    from settings import DEFAULT_T_END, DEFAULT_T_START, SAMPLE_ID_COL
 
     scores = pd.Series(0.0, index=df.index, name="softplus_score")
-    for sample_id, group in df.groupby(sample_id_col):
-        base_idx = _find_baseline_idx(group, base_t_start, base_t_end, sample_id)
-        delta_psnr, delta_clip = _group_deltas(group, psnr_col, clip_col, base_idx, normalize)
-        s_psnr = _shifted_softplus(delta_psnr, beta)
-        s_clip = _shifted_softplus(delta_clip, beta)
-        row_scores = s_psnr + s_clip + alpha * s_psnr * s_clip
-        row_scores = _penalize_zeros(row_scores, delta_psnr, delta_clip)
-        scores.loc[group.index] = row_scores
-
+    for _, group in df.groupby(SAMPLE_ID_COL):
+        values = torch.as_tensor(group.loc[:, list(cols)].to_numpy(dtype=np.float64, copy=True), dtype=torch.float64)
+        base_mask = np.isclose(group["t_start"], DEFAULT_T_START) & np.isclose(group["t_end"], DEFAULT_T_END)
+        if int(base_mask.sum()) != 1:
+            raise ValueError(f"Expected exactly one base row, found {int(base_mask.sum())}")
+        baseline_idx = int(np.flatnonzero(np.asarray(base_mask))[0])
+        out = softplus_score(values, baseline_idx=baseline_idx, alpha=alpha, beta=beta, normalize=normalize)
+        scores.loc[group.index] = out.detach().cpu().numpy()
     return scores

@@ -147,34 +147,6 @@ def combined_score_tensor(targets: torch.Tensor) -> torch.Tensor:
     return (targets[:, 0] + targets[:, 1]) / 2.0
 
 
-def t_target_scores(targets: torch.Tensor) -> torch.Tensor:
-    """Apply T_TARGET_FUNC to (N, 2) min-max [psnr, clip] columns; shape (N,).
-
-    Detaches from the autograd graph (T_TARGET_FUNC is pandas/numpy). Use this
-    for true pairwise ranking preferences.
-    """
-    df = pd.DataFrame(
-        {
-            PSNR_COL: targets[:, 0].detach().cpu().numpy(),
-            CLIP_COL: targets[:, 1].detach().cpu().numpy(),
-        }
-    )
-    scores = np.asarray(T_TARGET_FUNC(df), dtype=np.float64).reshape(-1)
-    return torch.as_tensor(scores, device=targets.device, dtype=targets.dtype)
-
-
-def t_target_scores_torch(targets: torch.Tensor) -> torch.Tensor:
-    """Differentiable stand-in for the default T_TARGET_FUNC (weighted PSNR/CLIP).
-
-    Batch min-max then equal-weight blend — matches
-    compute_weighted_combined_score(..., normalize=True) with default lambdas.
-    """
-    psnr, clip = targets[:, 0], targets[:, 1]
-    psnr = (psnr - psnr.amin()) / (psnr.amax() - psnr.amin() + _EPS)
-    clip = (clip - clip.amin()) / (clip.amax() - clip.amin() + _EPS)
-    return 0.5 * (psnr + clip)
-
-
 def pairwise_ranking_loss(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
     """Logistic pairwise loss: penalize pred ordering that disagrees with true."""
     if pred.shape[0] < 2:

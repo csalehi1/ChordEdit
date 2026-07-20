@@ -36,13 +36,7 @@ from _data import (
     save_splits_df,
     split_df,
 )
-from _helpers import (
-    format_results,
-    pairwise_ranking_loss,
-    save_settings_hash,
-    t_target_scores,
-    t_target_scores_torch,
-)
+from _helpers import format_results, pairwise_ranking_loss, save_settings_hash
 from model_m import MetricPredictor
 from settings import *
 
@@ -156,10 +150,10 @@ def train(
             mse = torch.nn.functional.mse_loss(out, (y - mean) / std)
             loss = mse
             if use_ranking:
-                # Pairwise order from T_TARGET_FUNC; torch scores keep ranking grads.
+                # Same T_TARGET_SCORE for true order and differentiable pred scores.
                 y_hat = model.regressor.denormalize(out)
-                true_m = t_target_scores(y)
-                pred_m = t_target_scores_torch(y_hat)
+                true_m = T_TARGET_SCORE(y)
+                pred_m = T_TARGET_SCORE(y_hat)
                 loss = loss + RANKING_LOSS_WEIGHT * pairwise_ranking_loss(pred_m, true_m)
             # Backpropagate the training loss.
             optimizer.zero_grad()
@@ -169,7 +163,7 @@ def train(
             train_loss_sum += mse.detach().item() * y.numel()
             train_n += y.numel()
 
-        # Full val metrics every epoch; full train MAE/R² only on the last epoch.
+        # Find val metrics every epoch and save best weights.
         val_results = evaluate(model, val_loader, device)
         improved = val_results["loss"] < best_val
         if improved:
@@ -186,6 +180,7 @@ def train(
                 weights_out,
             )
         elapsed = time.perf_counter() - epoch_start
+        # Find test metrics only on the last epoch.
         if epoch == EPOCHS:
             train_results = evaluate(model, train_loader, device)
             train_line = format_results(train_results)
