@@ -2,19 +2,26 @@
 Train OrdinalPairClassifier to predict t_start and t_end
 from (source_prompt, target_prompt) pairs.
 
-Rows are filtered to those matching T_DELTA_TARGET for t_delta, then for each
-sample_id the row with the highest TARGET_METRIC_COL is selected. The resulting
-t_start and t_end values are quantile-binned into N_BINS ordinal buckets
-passed to OrdinalPairClassifier.
+Rows are filtered to those matching TARGET_T_DELTA for t_delta, then for each
+sample_id the row with the highest C_TARGET_COL is selected. The resulting
+t_start and t_end values are mapped to ordinal buckets for OrdinalPairClassifier.
 """
 
 from __future__ import annotations
 
+import sys
 from datetime import datetime
 from functools import partial
 from pathlib import Path
 
+# Allow `python train.py` from this directory (or elsewhere) to resolve the package.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+import numpy as np
 import pandas as pd
+import time
 import torch
 from torch.utils.data import Dataset, DataLoader
 
@@ -22,30 +29,9 @@ from models.classification.model import OrdinalPairClassifier, mae_buckets
 from models.classification.head_coral import ordinal_loss
 from models.classification.head_mse import regression_loss
 from models.classification.head_ce import cost_sensitive_ce_loss, one_hot_ce_loss
+from models.classification._helpers import load_inputs_df
 import models.classification.settings as _settings
-from models.classification.settings import (
-    BATCH_SIZE,
-    DATA_DIR,
-    TARGET_T_DELTA,
-    EPOCHS,
-    ENCODER_LR,
-    FREEZE_ENCODER,
-    MLP_LR,
-    HEAD_TYPE,
-    CE_LOSS_TYPE,
-    USE_CLASS_WEIGHTS,
-    LABEL_SMOOTHING,
-    WEIGHT_DECAY,
-    METRICS_CSV,
-    N_BUCKETS_END,
-    N_BUCKETS_START,
-    OUTPUTS_DIR,
-    SEED,
-    STRINGS_CSV,
-    TARGET_METRIC_COL,
-    TARGET_METRIC_COL_FN,
-)
-
+from models.classification.settings import *
 
 def _serialize_setting(v):
     if isinstance(v, Path):
@@ -53,7 +39,7 @@ def _serialize_setting(v):
     if isinstance(v, partial):
         return v.func.__name__
     if callable(v):
-        return v.__name__
+        return getattr(v, "__name__", repr(v))
     return v
 
 
@@ -61,8 +47,8 @@ class PairDataset(Dataset):
     """Wraps (source_prompt, target_prompt, t_start_idx, t_end_idx) rows."""
 
     def __init__(self, df: pd.DataFrame):
-        self.src = df["source_prompt"].tolist()
-        self.tgt = df["target_prompt"].tolist()
+        self.src = df[SOURCE_PROMPT_COL].tolist()
+        self.tgt = df[TARGET_PROMPT_COL].tolist()
         self.y1 = torch.tensor(df["t_start_idx"].values, dtype=torch.long)
         self.y2 = torch.tensor(df["t_end_idx"].values, dtype=torch.long)
 
@@ -73,44 +59,52 @@ class PairDataset(Dataset):
         return self.src[idx], self.tgt[idx], self.y1[idx], self.y2[idx]
 
 
+def _normalize_sample_id(series: pd.Series) -> pd.Series:
+    """Canonical string IDs so zero-padded and integer forms merge reliably."""
+    return series.map(lambda x: str(int(x)))
+
+
+def _map_to_bucket_idx(series: pd.Series, buckets) -> pd.Series:
+    """Map float timestep values to ordinal indices into buckets (float-safe)."""
+    bucket_arr = np.asarray(buckets, dtype=float)
+
+    def _index(v: float) -> int:
+        matches = np.flatnonzero(np.isclose(float(v), bucket_arr))
+        if len(matches) != 1:
+            raise ValueError(f"Value {v} does not uniquely match buckets {bucket_arr.tolist()}.")
+        return int(matches[0])
+
+    return series.map(_index)
+
+
 def load_data() -> pd.DataFrame:
-    """Filter metrics to T_DELTA_TARGET rows, pick the highest TARGET_METRIC_COL row per id,
-    and join with prompt strings. Maps discrete t_start/t_end values to ordinal indices."""
-    metrics = pd.read_csv(METRICS_CSV, dtype={"sample_id": str})
-    strings = pd.read_csv(STRINGS_CSV, dtype={"id": str})
+    """Filter metrics to TARGET_T_DELTA rows, pick the highest C_TARGET_COL row per id,
+    and join with prompt strings. Maps t_start/t_end onto indices in GRID_T_*.
+    """
+    metrics = pd.read_csv(METRICS_CSV, dtype={SAMPLE_ID_COL: str})
+    metrics[SAMPLE_ID_COL] = _normalize_sample_id(metrics[SAMPLE_ID_COL])
 
-    # Validate bucket counts on the original data
-    for col, expected in (("t_start", N_BUCKETS_START), ("t_end", N_BUCKETS_END)):
-        sorted_levels = sorted(metrics[col].unique())
-        if len(sorted_levels) != expected:
-            raise ValueError(
-                f"{col} has {len(sorted_levels)} distinct values {sorted_levels}, "
-                f"but expected {expected} from settings.py."
-            )
+    strings = load_inputs_df()
+    strings["id"] = strings[SAMPLE_ID_COL].astype(str)
 
-    # Validate that T_DELTA_TARGET exists in the data
-    if TARGET_T_DELTA not in metrics["t_delta"].values:
+    # Validate that TARGET_T_DELTA exists in the data
+    if TARGET_T_DELTA not in metrics[T_DELTA_COL].values:
         raise ValueError(
-            f"{TARGET_T_DELTA=} not found in t_delta column "
-            f"(distinct values: {sorted(metrics['t_delta'].unique())})."
+            f"{TARGET_T_DELTA=} not found in {T_DELTA_COL} column "
+            f"(distinct values: {sorted(metrics[T_DELTA_COL].unique())})."
         )
 
-    filtered = metrics[metrics["t_delta"] == TARGET_T_DELTA]
-    if TARGET_METRIC_COL not in filtered.columns:
-        filtered[TARGET_METRIC_COL] = TARGET_METRIC_COL_FN(filtered)
-    # Rows with default t-values will score 1 on Pareto Score so that
-    # a maximum value will always exist.
-    best_idx = filtered.groupby("sample_id")[TARGET_METRIC_COL].idxmax()
-    best = filtered.loc[best_idx, ["sample_id", "t_start", "t_end"]].reset_index(drop=True)
+    filtered = metrics[metrics[T_DELTA_COL] == TARGET_T_DELTA].copy()
+    if C_TARGET_COL not in filtered.columns:
+        filtered[C_TARGET_COL] = C_TARGET_FUNC(filtered)
+    # Rows with default t-values will score 0 on softplus so that
+    # a maximum value will always exist among improving rows.
+    best_idx = filtered.groupby(SAMPLE_ID_COL)[C_TARGET_COL].idxmax()
+    best = filtered.loc[best_idx, [SAMPLE_ID_COL, T_START_COL, T_END_COL]].reset_index(drop=True)
 
-    df = pd.merge(best, strings, left_on="sample_id", right_on="id")
-
-    # Build ordinal mappings from the full dataset, not the filtered one
-    for col in ("t_start", "t_end"):
-        sorted_levels = sorted(metrics[col].unique())
-        level_to_index = {v: i for i, v in enumerate(sorted_levels)}
-        df[f"{col}_idx"] = df[col].map(level_to_index)
-
+    df = pd.merge(best, strings, left_on=SAMPLE_ID_COL, right_on="id")
+    df["t_start_idx"] = _map_to_bucket_idx(df[T_START_COL], GRID_T_START)
+    df["t_end_idx"] = _map_to_bucket_idx(df[T_END_COL], GRID_T_END)
     return df
 
 
@@ -129,14 +123,14 @@ def save_splits(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     test_df: pd.DataFrame,
-    data_dir: Path = DATA_DIR,
+    data_dir: Path = OUTPUTS_DIR,
 ) -> None:
     """Save train/val/test splits as gzip-compressed Parquet files in data_dir."""
     data_dir.mkdir(exist_ok=True)
     for name, df in (("train", train_df), ("val", val_df), ("test", test_df)):
         out = data_dir / f"{name}.parquet.gz"
         df.to_parquet(out, compression="gzip", index=False)
-        print(f"Saved {out} ({out.stat().st_size / 1024:.1f} KB)")
+    print(f"Saved Splits: {data_dir} ({data_dir.stat().st_size / 1024:.1f} KB)")
 
 
 def collate(batch):
@@ -318,7 +312,7 @@ def train() -> OrdinalPairClassifier:
 
     save_splits(train_df, val_df, test_df, data_dir=run_dir)
     print(
-        f"Dataset: {len(df)} samples  (t_delta={TARGET_T_DELTA}, target={TARGET_METRIC_COL})"
+        f"Dataset: {len(df)} samples  (t_delta={TARGET_T_DELTA}, target={C_TARGET_COL})"
         f"  split: train={len(train_df)} / val={len(val_df)} / test={len(test_df)}"
     )
 
@@ -326,16 +320,21 @@ def train() -> OrdinalPairClassifier:
     val_loader = DataLoader(PairDataset(val_df), batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate)
     test_loader = DataLoader(PairDataset(test_df), batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate)
 
-    # Distinct ordered float values for each target, may differ between t_start and t_end
-    buckets_start = torch.tensor(sorted(df["t_start"].unique()), dtype=torch.float)
-    buckets_end = torch.tensor(sorted(df["t_end"].unique()), dtype=torch.float)
+    buckets_start = torch.tensor(np.asarray(GRID_T_START, dtype=float), dtype=torch.float)
+    buckets_end = torch.tensor(np.asarray(GRID_T_END, dtype=float), dtype=torch.float)
     n_buckets_start = len(buckets_start)
     n_buckets_end = len(buckets_end)
     if n_buckets_start <= 1 and n_buckets_end <= 1:
         raise ValueError("At least one of t_start or t_end must have >1 bucket to train.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = OrdinalPairClassifier(buckets1=buckets_start, buckets2=buckets_end, freeze_encoder=FREEZE_ENCODER, head_type=HEAD_TYPE).to(device)
+    model = OrdinalPairClassifier(
+        buckets1=buckets_start,
+        buckets2=buckets_end,
+        freeze_encoder=FREEZE_ENCODER,
+        head_type=HEAD_TYPE,
+    )
+    model = model.to(device)
     active_heads = [name for name, on in (("t_start", model.predict_start), ("t_end", model.predict_end)) if on]
     print(f"Training heads: {', '.join(active_heads)}")
     if FREEZE_ENCODER:
@@ -357,20 +356,22 @@ def train() -> OrdinalPairClassifier:
             class_w_start = _class_weights(
                 torch.tensor(train_df["t_start_idx"].values), n_buckets_start
             ).to(device)
-            print(f"Class weights  t_start: {class_w_start.tolist()}")
+            print(f"Class weights  t_start: {[f'{w:.2f}' for w in class_w_start.tolist()]}")
         if model.predict_end:
             class_w_end = _class_weights(
                 torch.tensor(train_df["t_end_idx"].values), n_buckets_end
             ).to(device)
-            print(f"Class weights  t_end:   {class_w_end.tolist()}")
+            print(f"Class weights  t_end:   {[f'{w:.2f}' for w in class_w_end.tolist()]}")
     else:
         class_w_start = class_w_end = None
 
     weights_out = run_dir / "classifier_weights.pt"
-    best_val_score = 0.0
+    # -inf so the first epoch always writes a checkpoint even when the metric is 0.0
+    best_val_score = float("-inf")
     checkpoint_metric = "bal_acc_t_start" if model.predict_start else "bal_acc_t_end"
 
     for epoch in range(1, EPOCHS + 1):
+        epoch_start = time.perf_counter()
         model.train()
         epoch_loss = 0.0
         for srcs, tgts, y1, y2 in train_loader:
@@ -424,13 +425,16 @@ def train() -> OrdinalPairClassifier:
                 },
                 weights_out,
             )
+        elapsed = time.perf_counter() - epoch_start
         print(
-            f"Epoch {epoch:02d}  train: {_fmt_split_metrics(train_metrics)}"
-            f"  val: {_fmt_split_metrics(val_metrics)}"
+            f"Epoch {epoch:02d} ({elapsed:.2f}s)  Train: {_fmt_split_metrics(train_metrics)}"
+            f"  Val: {_fmt_split_metrics(val_metrics)}"
             + ("  *" if improved else "")
         )
 
     print(f"Saved {weights_out}  (best val {checkpoint_metric}={best_val_score:.3f})")
+    if not weights_out.exists():
+        raise RuntimeError(f"No checkpoint was written to {weights_out}")
     model.load_state_dict(
         torch.load(weights_out, map_location=device, weights_only=False)["state_dict"],
         strict=False,

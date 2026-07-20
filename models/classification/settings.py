@@ -18,11 +18,11 @@ Data settings.
 """
 
 # NOTE: Set this to the directory containing the generated metrics and inputs CSV files.
-DIR_NAME = "UltraEdit_Region_1000"
+DIR_NAME = "UltraEdit_Region_10"
 GENERATED_DIR = Path(f"/shared/ssd_30T/mirick/generated/ultra_edit/{DIR_NAME}")
 DATASET_DIR = Path(f"/shared/ssd_30T/mirick/datasets/ultra_edit/{DIR_NAME}")
 # Precomputed embeddings (used when FREEZE_ENCODERS is True). Set to None to force on-the-fly encode.
-# EMBEDDINGS_DIR = Path(f"/shared/ssd_30T/mirick/embeddings/ultraedit/{DIR_NAME}")
+# EMBEDDINGS_DIR = Path(f"/shared/ssd_30T/mirick/embeddings/ultraedit/annotation_embeddings/{DIR_NAME}")
 
 INPUTS_CSV = GENERATED_DIR / f"id_to_inputs_{DIR_NAME.replace('_', '').lower()}.csv"
 METRICS_CSV = GENERATED_DIR / f"id_to_metrics_{DIR_NAME.replace('_', '').lower()}.csv"
@@ -32,15 +32,16 @@ OUTPUTS_DIR = Path(__file__).resolve().parent / "outputs" / DIR_NAME
 if not OUTPUTS_DIR.exists():
     OUTPUTS_DIR.mkdir(parents=True)
 
-# Column names in the id_to_inputs_*.csv file.
+# Shared column name for sample IDs.
 SAMPLE_ID_COL = "sample_id"
+
+# Column names in the id_to_inputs_*.csv file.
 SOURCE_PROMPT_COL = "source_prompt"
 TARGET_PROMPT_COL = "target_prompt"
 IMAGE_PATH_COL = "image_path"
 MASK_PATH_COL = "mask_image_path"
 
 # Column names in the id_to_metrics_*.csv file.
-SAMPLE_ID_COL = "sample_id"
 CATEGORY_COL = "category"
 T_START_COL = "t_start"
 T_END_COL = "t_end"
@@ -58,10 +59,6 @@ PAPER_T_START = 0.9
 PAPER_T_END = 0.3
 PAPER_T_DELTA = 0.15
 
-GRID_VALUES = np.linspace(0.0, 1.0, 11)
-GRID_T_START = GRID_VALUES
-GRID_T_END = GRID_VALUES
-
 # Account for the paper's finding by using the nearest grid value.
 DEFAULT_T_START = 0.8
 DEFAULT_T_END = PAPER_T_END
@@ -69,10 +66,14 @@ DEFAULT_T_END = PAPER_T_END
 # Value in `t_delta` column to select data from.
 TARGET_T_DELTA = 0.0
 
+GRID_VALUES = np.linspace(0.0, 1.0, 11)
+GRID_T_START = GRID_VALUES
+GRID_T_END = GRID_VALUES
+
 _FUNC_ALPHA, _FUNC_BETA, _FUNC_NORM = 1.0, 2.0, True
-T_TARGET_FUNC = lambda df: compute_softplus_score(df, *C_TARGET_COLS, alpha=_FUNC_ALPHA, beta=_FUNC_BETA, normalize=_FUNC_NORM)
-T_TARGET_COL = f"softplus_score_a{_FUNC_ALPHA:g}-b{_FUNC_BETA:g}-n{_FUNC_NORM:d}"
-T_TARGET_LABEL = f"Softplus Score ($\\alpha={_FUNC_ALPHA}$, $\\beta={_FUNC_BETA}$, $n={_FUNC_NORM:d}$)",
+C_TARGET_FUNC = lambda df: compute_softplus_score(df, *C_TARGET_COLS, alpha=_FUNC_ALPHA, beta=_FUNC_BETA, normalize=_FUNC_NORM)
+C_TARGET_COL = f"softplus_score_a{_FUNC_ALPHA:g}-b{_FUNC_BETA:g}-n{_FUNC_NORM:d}"
+C_TARGET_LABEL = f"Softplus Score ($\\alpha={_FUNC_ALPHA}$, $\\beta={_FUNC_BETA}$, $n={_FUNC_NORM:d}$)"
 
 
 """

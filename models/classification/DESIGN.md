@@ -36,20 +36,20 @@ flowchart TD
     COMB --> MLP1
 
     subgraph BODY ["MLP Body"]
-        MLP1["`**Linear(4h, mlp_wide=512)**
+        MLP1["`**Linear(4h, mlp_wide=256)**
         Expands the combiner vector into a wider representation to learn cross-modal interactions before compression.`"]
-        LN1["`**LayerNorm(mlp_wide=512)**
+        LN1["`**LayerNorm(mlp_wide=256)**
         Stabilize training when the encoder is fine-tuned.`"]
         ACT1["`**ReLU()**
         Introduce nonlinearity after the first compression.`"]
-        DROP1["`**Dropout(dropout=0.1)**`"]
-        MLP2["`**Linear(mlp_wide=512, mlp_hidden=256)**
+        DROP1["`**Dropout(dropout=0.2)**`"]
+        MLP2["`**Linear(mlp_wide=256, mlp_hidden=128)**
         Force the network to retain the most discriminative features with progressive compression.`"]
         ACT2["`**ReLU()**
         No LayerNorm because the distribution is already
         well-conditioned.`"]
-        DROP2["`**Dropout(dropout=0.1)**`"]
-        MLP3["`**Linear(mlp_hidden=256, mlp_inner=128)**
+        DROP2["`**Dropout(dropout=0.2)**`"]
+        MLP3["`**Linear(mlp_hidden=128, mlp_inner=64)**
         Final shared representation before the task-specific heads. Both heads read from the same feature vector with independent weights.`"]
         MLP1 --> LN1 --> ACT1 --> DROP1 --> MLP2 --> ACT2 --> DROP2 --> MLP3
     end
@@ -94,7 +94,7 @@ flowchart TD
 
 Strings `source_prompt` and `target_prompt` are fed into `SiameseEncoder` which outputs the concatenated embedded vector $\langle A \mid B \mid A - B \mid A \odot B \rangle$ where $\odot$ is the Hadamard product, element-wise multiplication. This output vector has size $4 \times 384 = 1536$.
 
-The $1536$-dimensional vector is passed through an MLP body of `Linear` with $1536 \rightarrow 512$, `LayerNorm`, `ReLU`, `Dropout` with $0.1$, `Linear` with $512 \rightarrow 256$, `ReLU`, `Dropout` with $0.1$, and `Linear` with $256 \rightarrow 128$. The $128$-dimensional output is then routed to two parallel heads with `head1` for `t_start` and `head2` for `t_end`.
+The $1536$-dimensional vector is passed through an MLP body of `Linear` with $1536 \rightarrow 256$, `LayerNorm`, `ReLU`, `Dropout` with $0.2$, `Linear` with $256 \rightarrow 128$, `ReLU`, `Dropout` with $0.2$, and `Linear` with $128 \rightarrow 64$. The $64$-dimensional output is then routed to two parallel heads with `head1` for `t_start` and `head2` for `t_end`.
 
 `HEAD_TYPE` selects which head implementation is wired in at construction time. The default is `"CE"`: each head outputs $K_i$ logits, training minimises cross-entropy against one-hot bucket labels (with optional label smoothing), and inference takes the argmax class. Alternative types are `CORAL` (ordinal thresholds) and `MSE` (scalar regression snapped to the nearest bucket). Each decoded index lies in $\{0, \dots, k_i-1\}$ and maps to a float value in $[0.0, 1.0]$ via the ordered `buckets1` / `buckets2` tensors.
 
@@ -102,7 +102,7 @@ The $1536$-dimensional vector is passed through an MLP body of `Linear` with $15
 
 Uses `sentence-transformers/all-MiniLM-L6-v2` that outputs a hidden dimension of $384$. Both strings are encoded with *shared weights* in a single-batched forward pass. Token embeddings are reduced to a fixed-size sentence vector via mask-weighted mean pooling, which is more robust than the `[CLS]` token for sentence-level tasks.
 
-The encoder is fine-tuned by default (`FREEZE_ENCODER = False`). When the encoder is frozen, only the MLP and heads learn. When fine-tuning is enabled, the optimizer assigns a lower learning rate to the encoder ($2 \times 10^{-5}$) than to the MLP ($10^{-3}$) to avoid destabilising the pretrained representations early in training.
+The encoder is frozen by default (`FREEZE_ENCODER = True`). When the encoder is frozen, only the MLP and heads learn. When fine-tuning is enabled, the optimizer assigns a lower learning rate to the encoder ($2 \times 10^{-5}$) than to the MLP ($10^{-4}$) to avoid destabilising the pretrained representations early in training.
 
 ### Combiner: `OrdinalPairClassifier._combine`
 
@@ -144,34 +144,34 @@ At inference, the continuous prediction is snapped to the nearest bucket index. 
 
 ## Data Pipeline
 
-1. Load `id_to_metrics_*.csv` and filter to rows where `t_delta == T_DELTA_TARGET`
-2. Compute the configured target score (default: `naive_pareto_score`) and pick the row with the highest score per `sample_id`
-3. Join with `id_to_string_pair.csv` to get `(source_prompt, target_prompt)`
-4. Map discrete `t_start` / `t_end` float values to ordinal indices $0, 1, 2, \ldots$ using the sorted levels from the full (unfiltered) metrics CSV
+1. Load `id_to_metrics_*.csv` (`METRICS_CSV`) and filter to rows where `t_delta == TARGET_T_DELTA`
+2. Compute the configured target score via `C_TARGET_FUNC` (default: `compute_softplus_score` over `C_TARGET_COLS`) and pick the row with the highest `C_TARGET_COL` per `sample_id`
+3. Join with `id_to_inputs_*.csv` (`INPUTS_CSV`) to get `(source_prompt, target_prompt)`
+4. Map discrete `t_start` / `t_end` float values to ordinal indices $0, 1, 2, \ldots$ into the fixed grids `GRID_T_START` / `GRID_T_END` (missing cells in the CSV are fine; those classes simply receive no labels)
 5. Random split 80/10/10 for train/val/test
 
 ### Target Score Options
 
-The score used to select the best row per `sample_id` is configurable in `settings.py` via `TARGET_METRIC`.
+The score used to select the best row per `sample_id` is configured in `settings.py` by setting `C_TARGET_FUNC`, `C_TARGET_COL`, and `C_TARGET_LABEL` together. `C_TARGET_COLS` names the raw metric columns passed into the score function (default: PSNR and CLIP).
 
-- **`weighted_combined_score`**: $\lambda_{\text{PSNR}} \cdot \hat{p} + \lambda_{\text{CLIP}} \cdot \hat{c}$, where $\hat{p}$ and $\hat{c}$ are min-max normalised PSNR and CLIP similarity, with $\lambda_{\text{PSNR}} = \lambda_{\text{CLIP}} = 0.5$ by default.
+- **`compute_weighted_combined_score`**: Weighted blend of the configured columns (optionally min-max normalised per row).
 
-- **`agreement_score`**: $1 - \lvert p - c \rvert \,/\, \max(\lvert p - c \rvert)$, measuring how closely PSNR and CLIP agree on raw values.
+- **`compute_agreement_score`**: $1$ when all configured metrics agree on a row, decreasing with per-row spread.
 
-- **`naive_pareto_score`** (active default): For each `sample_id` group, the baseline row is identified at $t_{\text{start}} = \text{PAPER\_T\_START} - \text{PAPER\_T\_DELTA}$, $t_{\text{end}} = \text{PAPER\_T\_END}$ (defaults $(0.75, 0.3)$). Each row receives score $\max(0, \Delta\text{PSNR}) \cdot \max(0, \Delta\text{CLIP})$ relative to that baseline; the baseline itself scores $0$.
+- **`compute_naive_pareto_score`**: For each `sample_id` group, the baseline row is identified at $(\text{DEFAULT\_T\_START}, \text{DEFAULT\_T\_END})$. Each row receives the product of $\max(0, \Delta m_i)$ over metrics relative to that baseline; the baseline itself scores $0$.
 
-- **`pareto_biased_score`**: Uses the same baseline as `naive_pareto_score`. With $s(t) = \operatorname{softplus}(t) - \log 2$, each row receives $m(a,b) = s(a-A) + s(b-B) + \alpha\, s(a-A)\, s(b-B)$ where $a$, $b$ are PSNR and CLIP and $A$, $B$ are the baseline values. Default $\alpha = 2$ (`_PARETO_BIAS_ALPHA` in `settings.py`). The baseline scores $0$; improvements are rewarded smoothly and regressions penalised.
+- **`compute_softplus_score`** (active default): Uses the same baseline as above. With $s(t) = \operatorname{softplus}_\beta(t) - \log 2 / \beta$, each row receives $m = \sum_i s_i + \alpha \prod_i s_i$ on (optionally normalised) metric deltas. Default $\alpha = 1$, $\beta = 2$ (`_FUNC_ALPHA`, `_FUNC_BETA` in `settings.py`). The baseline scores $0$; improvements are rewarded smoothly and regressions penalised.
 
 ## Training
 
 | Hyperparameter | Value |
 |---|---|
-| Encoder | `all-MiniLM-L6-v2` (fine-tuned by default) |
+| Encoder | `all-MiniLM-L6-v2` (frozen by default) |
 | Head type | `CE` (default), `CORAL`, or `MSE` |
-| CE loss | Standard cross-entropy with `LABEL_SMOOTHING = 0.1` |
-| Optimizer | AdamW with `WEIGHT_DECAY = 0.01`; encoder lr $= 2 \times 10^{-5}$, MLP lr $= 10^{-3}$ |
+| CE loss | Standard cross-entropy with `LABEL_SMOOTHING = 0.15` |
+| Optimizer | AdamW with `WEIGHT_DECAY = 0.05`; encoder lr $= 2 \times 10^{-5}$, MLP lr $= 10^{-4}$ |
 | Epochs | $20$ |
-| Batch size | $32$ |
-| Dropout | $0.1$ |
-| Class weights | Off by default (`USE_CLASS_WEIGHTS = False`) |
+| Batch size | $64$ |
+| Dropout | $0.2$ |
+| Class weights | On by default (`USE_CLASS_WEIGHTS = True`) |
 | Checkpoint | Best model by validation balanced accuracy on `t_start` |
