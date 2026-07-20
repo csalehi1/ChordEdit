@@ -332,10 +332,7 @@ class MetricPredictor(nn.Module):
         self.text_encoder = TextEncoder(self.pipeline)
         self._encoder_img_dim = self.image_encoder.hidden_dim
         self._encoder_text_dim = self.text_encoder.hidden_dim
-        self.regressor = MetricRegressor(
-            img_dim=self._encoder_img_dim,
-            text_dim=self._encoder_text_dim,
-        )
+        self.regressor = MetricRegressor(self._encoder_img_dim, self._encoder_text_dim, n_targets=len(M_TARGET_COLS))
 
     @property
     def encoder_img_dim(self) -> int:
@@ -347,7 +344,7 @@ class MetricPredictor(nn.Module):
 
     def release_encoders(self) -> None:
         """Free VAE/text pipeline after embeddings are precomputed."""
-        # drop frozen SD encoders from GPU once embeddings exist so
+        # Drop frozen SD encoders from GPU once embeddings exist so
         # training only keeps the small regressor on device.
         import gc
 

@@ -151,8 +151,8 @@ def compute_softplus_score(
         sp(x)   = (1/beta)*(ln(1+e^{beta*x})-ln(2))
         m(a, b) = sp(a-A) + sp(b-B)
                 
-                Optional (alpha > 0): Bias towards Pareto improvement.
-                + alpha*sp(a-A)*sp(b-B)
+            Optional (alpha > 0): Bias towards Pareto improvement.
+            + alpha*sp(a-A)*sp(b-B)
 
     The baseline scores 0. Rows that also score 0 but differ from the baseline
     on both metrics are shifted down by epsilon. Improvements are rewarded

@@ -36,7 +36,13 @@ from _data import (
     save_splits_df,
     split_df,
 )
-from _helpers import combined_score_tensor, format_results, pairwise_ranking_loss, save_settings_hash
+from _helpers import (
+    format_results,
+    pairwise_ranking_loss,
+    save_settings_hash,
+    t_target_scores,
+    t_target_scores_torch,
+)
 from model_m import MetricPredictor
 from settings import *
 
@@ -99,26 +105,30 @@ def train(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = OUTPUTS_DIR / timestamp
     run_dir.mkdir(parents=True, exist_ok=True)
+    save_settings_hash(run_dir)
 
     # Create dataloaders for the train, val, and test sets.
     use_ranking = RANKING_LOSS_WEIGHT > 0
     train_loader, val_loader, test_loader = create_dataloaders(model, train_X, train_y, val_X, val_y, test_X, test_y, group_train_by_sample=use_ranking)
 
-    # Record encoder dimensions, then free VAE/text pipeline GPU memory for training.
+    # Record encoder dimensions, then free VAE/text pipeline GPU memory when frozen.
     img_dim, text_dim = model.encoder_img_dim, model.encoder_text_dim
-    model.release_encoders()
+    if FREEZE_ENCODERS:
+        model.release_encoders()
 
-    y_train = torch.tensor(train_y[list(M_TARGET_COLS)].values, dtype=torch.float)
+    target_cols = list(M_TARGET_COLS)
+    y_train = torch.tensor(train_y[target_cols].values, dtype=torch.float)
     print(f"Dataset: train={len(train_X)} cells val={len(val_X)} cells")
 
     # Normalize the targets if specified.
     if NORMALIZE_TARGETS:
-        # TODO: Describe what this does.
+        # Store train mean/std so MSE is computed in z-scored space.
+        # Will map predictions back to min-max [0,1] units for ranking/eval.
         model.regressor.set_target_stats(y_train.mean(0), y_train.std(0))
     print(
-        "Target stats (train):  "
+        "Target columns (train):  "
         + "  ".join(
-            f"{M_TARGET_LABELS[c]}: mean={model.regressor.target_mean[i]:.3f} "
+            f"{c}: mean={model.regressor.target_mean[i]:.3f} "
             f"std={model.regressor.target_std[i]:.3f}"
             for i, c in enumerate(M_TARGET_COLS)
         )
@@ -133,28 +143,29 @@ def train(
     best_val = float("inf")
     device = next(model.regressor.parameters()).device
     n_cells, n_samples = len(train_X), train_X[SAMPLE_ID_COL].nunique()
-    print(f"\nTraining for {EPOCHS} epochs...")
-    if use_ranking:
-        print(f"Ranking loss weight: {RANKING_LOSS_WEIGHT} (sample-grouped train batches)")
+    # Iterate over the epochs.
     for epoch in range(1, EPOCHS + 1):
         epoch_start = time.perf_counter()
         model.regressor.train()
-        # Accumulate running train MSE during the epoch instead of a full
-        # train-set evaluate pass every epoch (saves ~half the forward cost on large data).
         train_loss_sum, train_n = 0.0, 0
+        # Iterate over the train loader.
         for batch in train_loader:
             img, mask, src, tar, t, y = model_inputs(batch, device)
             out = model.regressor(img, mask, src, tar, t)
-            y_std = (y - mean) / std
-            mse = torch.nn.functional.mse_loss(out, y_std)
+            # Standardize targets in z-scored space for MSE loss.
+            mse = torch.nn.functional.mse_loss(out, (y - mean) / std)
             loss = mse
             if use_ranking:
-                pred_m = combined_score_tensor(model.regressor.denormalize(out))
-                true_m = combined_score_tensor(y)
+                # Pairwise order from T_TARGET_FUNC; torch scores keep ranking grads.
+                y_hat = model.regressor.denormalize(out)
+                true_m = t_target_scores(y)
+                pred_m = t_target_scores_torch(y_hat)
                 loss = loss + RANKING_LOSS_WEIGHT * pairwise_ranking_loss(pred_m, true_m)
+            # Backpropagate the training loss.
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            # Accumulate the training loss for the epoch.
             train_loss_sum += mse.detach().item() * y.numel()
             train_n += y.numel()
 
@@ -193,8 +204,7 @@ def train(
     results = evaluate(model, test_loader, device)
     print(f"\n    {'Test:':<6} {format_results(results)}")
 
-    # Save the run directory, splits, and metrics.
-    save_settings_hash(run_dir)
+    # Save the splits and metrics.
     save_splits_df(train_X, val_X, test_X, run_dir)
     metrics_out = run_dir / "m_train_metrics.json"
     with open(metrics_out, "w") as f:

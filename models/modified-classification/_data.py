@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,15 +13,18 @@ import torch
 import time
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Sampler
+from tqdm import tqdm
 
 from model_m import MetricPredictor
 from settings import *
 
 
 from _helpers import (
+    mean_pool,
     normalize_target_columns,
     prep_sample_id,
     resolve_cell_path,
+    resolve_embedding_path,
     resolve_image_path,
     resolve_mask_path,
 )
@@ -206,6 +210,10 @@ def prepare_df(data_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     bounds = target_bounds(data_df)
     X = data_df.drop(columns=list(M_TARGET_COLS)).copy()
     y_raw: pd.DataFrame = data_df.loc[:, list(M_TARGET_COLS)]
+    # Min-max scale PSNR and CLIP to [0, 1] so they share a common range.
+    # Raw scales differ (PSNR ~dB, CLIP ~cosine), so averaging/ranking them
+    # into combined_score only makes sense after both are commensurate.
+    # Training still z-scores these [0, 1] labels in the MSE loss separately.
     y = normalize_target_columns(y_raw, bounds=bounds)
     return X, y
 
@@ -220,13 +228,37 @@ def split_df(
 
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Split X and y by sample_id into train/val/test sets."""
+    
+    def split_df_by_sample(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Split by sample_id so each edit triple stays wholly in one split."""
+        sample_ids = np.sort(np.asarray(df[SAMPLE_ID_COL].unique()))
+        n_samples = len(sample_ids)
+        rng = np.random.default_rng(seed)
+        perm = rng.permutation(sample_ids)
+        n_train = max(1, round(train_frac * n_samples))
+        n_val = max(0, min(round(val_frac * n_samples), n_samples - n_train - 1))
+        train_ids = perm[:n_train]
+        val_ids = perm[n_train : n_train + n_val]
+        test_ids = perm[n_train + n_val :]
+        # Ensure there is always at least one test sample when possible.
+        if test_ids.size == 0 and n_samples > 1:
+            test_ids = train_ids[-1:]
+            train_ids = train_ids[:-1]
+        sample_col = df[SAMPLE_ID_COL].to_numpy()
+        train = df.loc[np.isin(sample_col, train_ids)].reset_index(drop=True)
+        val = df.loc[np.isin(sample_col, val_ids)].reset_index(drop=True)
+        test = df.loc[np.isin(sample_col, test_ids)].reset_index(drop=True)
+        return train, val, test
+    
     combined = pd.concat([X.reset_index(drop=True), y.reset_index(drop=True)], axis=1)
-    train, val, test = _split_df_by_sample(combined, seed=seed, train_frac=train_frac, val_frac=val_frac)
+    train, val, test = split_df_by_sample(combined)
     target_cols = list(M_TARGET_COLS)
     return (
+        # X_train, X_val, X_test
         train.drop(columns=target_cols),
         val.drop(columns=target_cols),
         test.drop(columns=target_cols),
+        # y_train, y_val, y_test
         train.loc[:, target_cols],
         val.loc[:, target_cols],
         test.loc[:, target_cols],
@@ -241,20 +273,206 @@ def grid_axes_from_df(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     )
 
 
-def _get_embeddings(
+def timestep_pairs_from_df(df: pd.DataFrame) -> np.ndarray:
+    """Return unique (t_start, t_end) pairs present in df, shape (N, 2), sorted."""
+    return df.loc[:, [T_START_COL,T_END_COL]].drop_duplicates().sort_values([T_START_COL,T_END_COL]).to_numpy(dtype=np.float64)
+
+
+def _latent_to_vector(t: torch.Tensor) -> torch.Tensor:
+    """Flatten a VAE latent (B, C, H, W) or already-flat vector to (D,)."""
+    return t.detach().float().reshape(-1).contiguous()
+
+
+def _text_seq_to_vector(
+    t: torch.Tensor,
+    prompt: str,
+    tokenizer,
+    attn_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Mean-pool a saved token sequence to match on-the-fly TextEncoder output.
+
+    grid_generate saves CLIP hidden states as (1, seq, dim). MetricPredictor
+    mean-pools with the attention mask; reproduce that here so text_proj dims match.
+    Pass attn_mask to skip re-tokenizing when masks were batched upstream.
+    """
+    t = t.detach().float()
+    if t.ndim == 1:
+        return t.contiguous()
+    if t.ndim == 2 and t.shape[0] == 1:
+        # Already pooled (1, dim).
+        return t.reshape(-1).contiguous()
+    if t.ndim == 2:
+        # (seq, dim) without batch dim.
+        hidden = t.unsqueeze(0)
+    elif t.ndim == 3:
+        hidden = t
+    else:
+        raise ValueError(f"Unexpected text embedding shape: {tuple(t.shape)}")
+
+    if attn_mask is None:
+        inputs = tokenizer(
+            prompt,
+            padding="max_length",
+            truncation=True,
+            max_length=tokenizer.model_max_length,
+            return_tensors="pt",
+        )
+        attn_mask = inputs.attention_mask
+    if attn_mask.shape[-1] != hidden.shape[1]:
+        pooled = hidden.mean(dim=1)
+    else:
+        pooled = mean_pool(hidden, attn_mask)
+    return pooled.reshape(-1).contiguous()
+
+
+def _load_embeddings_from_csv(
+    samples: pd.DataFrame,
+    predictor: MetricPredictor,
+) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Load CPU embedding tables from M_EMBEDDINGS_PATH or per-sample .pt files.
+
+    Prefers M_EMBEDDINGS_PATH (pooled/flattened tables under outputs/.cache).
+    On miss, packs from annotation_embeddings/{id}/*.pt (parallel load + batch
+    tokenize), writes M_EMBEDDINGS_PATH atomically, and returns the tables.
+    """
+    if EMBEDDINGS_CSV is None:
+        raise ValueError("EMBEDDINGS_CSV is None; cannot load precomputed embeddings")
+    if not Path(EMBEDDINGS_CSV).exists():
+        raise FileNotFoundError(f"Embeddings CSV not found: {EMBEDDINGS_CSV}")
+    if predictor.pipeline is None:
+        raise RuntimeError("MetricPredictor.pipeline is required to tokenize prompts when loading embeddings")
+    tokenizer = predictor.pipeline.tokenizer
+
+    sample_ids = samples[SAMPLE_ID_COL].tolist()
+
+    # Fast path: consolidated training-ready tables.
+    if Path(M_EMBEDDINGS_PATH).exists():
+        data = torch.load(M_EMBEDDINGS_PATH, map_location="cpu", weights_only=False)
+        id_to_i = {sid: i for i, sid in enumerate(data["sample_ids"])}
+        if all(sid in id_to_i for sid in sample_ids):
+            idxs = [id_to_i[sid] for sid in sample_ids]
+            print(f"Loaded embeddings from {M_EMBEDDINGS_PATH} ({len(sample_ids)} samples)")
+            return (
+                sample_ids,
+                data["img"][idxs].contiguous(),
+                data["mask"][idxs].contiguous(),
+                data["src"][idxs].contiguous(),
+                data["tar"][idxs].contiguous(),
+            )
+        print(f"{M_EMBEDDINGS_PATH} incomplete for requested samples; rebuilding from per-sample files")
+
+    emb_df = pd.read_csv(EMBEDDINGS_CSV)
+    if emb_df.isna().any().any():
+        raise ValueError(f"Missing values found in {EMBEDDINGS_CSV}")
+    emb_df[SAMPLE_ID_COL] = emb_df[SAMPLE_ID_COL].map(prep_sample_id)
+    for col in (SOURCE_EMB_COL, TARGET_EMB_COL, IMAGE_EMB_COL, MASK_EMB_COL):
+        if col not in emb_df.columns:
+            raise ValueError(f"Missing column {col!r} in {EMBEDDINGS_CSV}")
+        emb_df[col] = emb_df[col].map(resolve_embedding_path)
+
+    id_to_row = emb_df.set_index(SAMPLE_ID_COL)
+    if id_to_row.index.has_duplicates:
+        dupes = id_to_row.index[id_to_row.index.duplicated()].unique().tolist()
+        preview = ", ".join(str(s) for s in dupes[:5])
+        raise ValueError(f"Duplicate sample_id(s) in {EMBEDDINGS_CSV}: {preview}")
+
+    missing = [sid for sid in sample_ids if sid not in id_to_row.index]
+    if missing:
+        preview = ", ".join(missing[:5])
+        more = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
+        raise KeyError(f"Missing embeddings for {len(missing)} sample_id(s): {preview}{more}")
+
+    id_to_prompts = samples.set_index(SAMPLE_ID_COL).loc[:, [SOURCE_PROMPT_COL, TARGET_PROMPT_COL]]
+    src_prompts = [str(id_to_prompts.loc[sid, SOURCE_PROMPT_COL]) for sid in sample_ids]
+    tar_prompts = [str(id_to_prompts.loc[sid, TARGET_PROMPT_COL]) for sid in sample_ids]
+    src_masks = tokenizer(
+        src_prompts,
+        padding="max_length",
+        truncation=True,
+        max_length=tokenizer.model_max_length,
+        return_tensors="pt",
+    ).attention_mask
+    tar_masks = tokenizer(
+        tar_prompts,
+        padding="max_length",
+        truncation=True,
+        max_length=tokenizer.model_max_length,
+        return_tensors="pt",
+    ).attention_mask
+
+    path_rows = [
+        (
+            sid,
+            str(id_to_row.loc[sid, IMAGE_EMB_COL]),
+            str(id_to_row.loc[sid, MASK_EMB_COL]),
+            str(id_to_row.loc[sid, SOURCE_EMB_COL]),
+            str(id_to_row.loc[sid, TARGET_EMB_COL]),
+        )
+        for sid in sample_ids
+    ]
+
+    def _load_pt(path: str) -> torch.Tensor:
+        if not Path(path).exists():
+            raise FileNotFoundError(f"Missing embedding file: {path}")
+        t = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(t, torch.Tensor):
+            raise TypeError(f"Expected Tensor in {path}, got {type(t)}")
+        return t
+
+    def _load_sample(row: tuple[str, str, str, str, str]) -> tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        sid, img_p, mask_p, src_p, tar_p = row
+        return sid, _load_pt(img_p), _load_pt(mask_p), _load_pt(src_p), _load_pt(tar_p)
+
+    print(f"Packing embeddings from {EMBEDDINGS_CSV} ({len(sample_ids)} samples) -> {M_EMBEDDINGS_PATH}")
+    img_rows: list[torch.Tensor] = []
+    mask_rows: list[torch.Tensor] = []
+    src_rows: list[torch.Tensor] = []
+    tar_rows: list[torch.Tensor] = []
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        for i, (sid, img_t, mask_t, src_t, tar_t) in enumerate(
+            tqdm(pool.map(_load_sample, path_rows), total=len(path_rows), desc="Loading embeddings", unit="sample")
+        ):
+            img_rows.append(_latent_to_vector(img_t))
+            mask_rows.append(_latent_to_vector(mask_t))
+            src_rows.append(_text_seq_to_vector(src_t, src_prompts[i], tokenizer, attn_mask=src_masks[i : i + 1]))
+            tar_rows.append(_text_seq_to_vector(tar_t, tar_prompts[i], tokenizer, attn_mask=tar_masks[i : i + 1]))
+
+    img_emb = torch.stack(img_rows, dim=0)
+    mask_emb = torch.stack(mask_rows, dim=0)
+    src_emb = torch.stack(src_rows, dim=0)
+    tar_emb = torch.stack(tar_rows, dim=0)
+
+    Path(M_EMBEDDINGS_PATH).parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = Path(str(M_EMBEDDINGS_PATH) + ".tmp")
+    torch.save(
+        {
+            "sample_ids": list(sample_ids),
+            "img": img_emb,
+            "mask": mask_emb,
+            "src": src_emb,
+            "tar": tar_emb,
+        },
+        tmp_path,
+    )
+    tmp_path.replace(M_EMBEDDINGS_PATH)
+    print(f"Saved {M_EMBEDDINGS_PATH}")
+
+    return sample_ids, img_emb, mask_emb, src_emb, tar_emb
+
+
+def _encode_embeddings(
     samples: pd.DataFrame,
     predictor: MetricPredictor,
     *,
     use_cache: bool = True,
     batch_size: int = EMBED_BATCH_SIZE,
 ) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return CPU embedding tables for unique samples, using disk cache when possible."""
-    
+    """Encode embeddings with ChordEdit encoders, using disk cache when possible."""
     # Disk cache keyed by encoder and inputs CSV so re-runs skip VAE/text encode.
     # NOTE: May be a source of future issues if the inputs CSV changes or new models are added.
     cache_key = hashlib.sha256(f"{INPUTS_CSV}|{SD_TURBO_ROOT}".encode()).hexdigest()[:12]
     cache_path = Path(OUTPUTS_DIR.parent / ".cache" / "embeddings" / f"{cache_key}.pt").resolve()
-    
+
     sample_ids = samples[SAMPLE_ID_COL].tolist()
 
     # Try to load embeddings from cache if it exists and is complete.
@@ -299,7 +517,6 @@ def _get_embeddings(
         elapsed = time.perf_counter() - batch_start
         print(f"    Encoded [{end}/{n_samples}] ({end - start} samples in {elapsed:.2f}s)", flush=True)
 
-    # TODO: What is the size of the embeddings? Update this comment.
     img_emb = torch.cat(img_chunks, dim=0)
     mask_emb = torch.cat(mask_chunks, dim=0)
     src_emb = torch.cat(src_chunks, dim=0)
@@ -317,6 +534,23 @@ def _get_embeddings(
         print(f"Saved embedding cache: {cache_path}")
 
     return sample_ids, img_emb, mask_emb, src_emb, tar_emb
+
+
+def _get_embeddings(
+    samples: pd.DataFrame,
+    predictor: MetricPredictor,
+    *,
+    use_cache: bool = True,
+    batch_size: int = EMBED_BATCH_SIZE,
+) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return CPU embedding tables for unique samples.
+
+    When FREEZE_ENCODERS is True and EMBEDDINGS_CSV is set, load from disk.
+    Otherwise encode with ChordEdit encoders (optional disk cache).
+    """
+    if FREEZE_ENCODERS and EMBEDDINGS_CSV is not None:
+        return _load_embeddings_from_csv(samples, predictor)
+    return _encode_embeddings(samples, predictor, use_cache=use_cache, batch_size=batch_size)
 
 
 def get_embeddings_by_sample(
@@ -374,11 +608,8 @@ def create_dataloaders(
         return DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=shuffle)
 
     return (
-        # Train dataloader.
         _dataloader(train_X, train_y, shuffle=True, by_sample=group_train_by_sample),
-        # Val dataloader.
         _dataloader(val_X, val_y, shuffle=False),
-        # Test dataloader
         _dataloader(test_X, test_y, shuffle=False),
     )
 
@@ -402,30 +633,3 @@ def df_to_metric_grids(
     for row in df.itertuples():
         out[sid_to_k[getattr(row, SAMPLE_ID_COL)], i_of[getattr(row, T_START_COL)], j_of[getattr(row, T_END_COL)]] = getattr(row, col)
     return out, {"sid_to_k": sid_to_k, "i_of": i_of, "j_of": j_of}
-
-def _split_df_by_sample(
-    df: pd.DataFrame,
-    seed: int = SEED,
-    train_frac: float = TRAIN_FRAC,
-    val_frac: float = VAL_FRAC,
-    sample_col: str = SAMPLE_ID_COL,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Split by sample_id so each edit triple stays wholly in one split."""
-    sample_ids = sorted(df[sample_col].unique())
-    n = len(sample_ids)
-    rng = np.random.default_rng(seed)
-    perm = list(rng.permutation(sample_ids))
-    n_train = max(1, round(train_frac * n))
-    n_val = max(0, round(val_frac * n))
-    if n_train + n_val >= n:
-        n_val = max(0, min(n_val, n - n_train - 1))
-    train_ids = list(perm[:n_train])
-    val_ids = list(perm[n_train : n_train + n_val])
-    test_ids = list(perm[n_train + n_val :])
-    if not test_ids and n > 1:
-        moved = train_ids.pop()
-        test_ids.append(moved)
-    train = df.loc[df[sample_col].isin(train_ids)].reset_index(drop=True)
-    val = df.loc[df[sample_col].isin(val_ids)].reset_index(drop=True)
-    test = df.loc[df[sample_col].isin(test_ids)].reset_index(drop=True)
-    return train, val, test
