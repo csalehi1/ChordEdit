@@ -113,7 +113,7 @@ def write_id_to_embeddings(embeddings_root: Path, mapping_path: Path) -> Path:
             if not meta.get(settings.FIELD_IMAGE_PATH):
                 continue
             sid = str(sample_id).zfill(settings.SAMPLE_ID_WIDTH)
-            sample_dir = embeddings_root / sid
+            sample_dir = embeddings_root / settings.SAMPLES_DIRNAME / sid
             writer.writerow(
                 {
                     "sample_id": sid,
@@ -170,10 +170,13 @@ def iter_cell_pairs(
     t_end_values: list[float] | None = None,
     *,
     diagonal_optimization: bool,
+    t_delta: float = 0.0,
 ) -> Iterable[Tuple[float, float]]:
     """Yield (t_start, t_end) pairs to generate. Defaults to a square grid."""
     ends = t_start_values if t_end_values is None else t_end_values
     for t_start in t_start_values:
+        if t_start - t_delta < 0:
+            continue
         for t_end in ends:
             if diagonal_optimization and t_start <= t_end:
                 continue

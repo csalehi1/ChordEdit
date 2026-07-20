@@ -110,10 +110,10 @@ def run_shard(
         for row in reader:
             all_samples[row["sample_id"]] = {k: v for k, v in row.items() if k != "sample_id"}
 
-    # Collect cells from {generated_root}/{sample_id}/cells/.
+    # Collect cells from {generated_root}/grids/{sample_id}/cells/.
     all_cells: defaultdict[str, list[tuple[float, float, Path]]] = defaultdict(list)
     for sample_id in all_samples:
-        cells_dir = generated_root / sample_id / settings.CELLS_DIRNAME
+        cells_dir = generated_root / settings.GRIDS_DIRNAME / sample_id / settings.CELLS_DIRNAME
         if not cells_dir.is_dir():
             continue
         for path in sorted(cells_dir.iterdir()):
@@ -256,7 +256,11 @@ def run_shard(
                         clip_image_tensors.append(torch.from_numpy(target_clip_arr).permute(2, 0, 1).to(DEVICE))
 
                     cell_meta.append(
-                        (t_start, t_end, f"{sample_id}/{settings.CELLS_DIRNAME}/{cell_filename(t_start, t_end)}")
+                        (
+                            t_start,
+                            t_end,
+                            f"{settings.GRIDS_DIRNAME}/{sample_id}/{settings.CELLS_DIRNAME}/{cell_filename(t_start, t_end)}",
+                        )
                     )
 
                 # OPT 9 (cont.): Batched LPIPS -- run SqueezeNet on stacked target tensors.

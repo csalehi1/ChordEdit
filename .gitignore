@@ -2,3 +2,4 @@
 scripts/
 outputs/
 *__pycache__*
+*/*.bak

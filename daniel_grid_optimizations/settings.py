@@ -13,16 +13,16 @@ Expected dataset layout under --data-root:
 Expected embeddings layout under --embeddings-root/<dataset-name>/:
 
   id_to_embeddings_<suffix>.csv
-  {id}/source.pt
-  {id}/target.pt
-  {id}/image.pt
-  {id}/mask.pt
+  annotation_embeddings/{id}/source.pt
+  annotation_embeddings/{id}/target.pt
+  annotation_embeddings/{id}/image.pt
+  annotation_embeddings/{id}/mask.pt
 
 Expected generated layout under --generated-root/<dataset-name>/:
 
   id_to_inputs_<suffix>.csv
   id_to_metrics_<suffix>.csv
-  {id}/cells/t_start_{X}p{Y}__t_end_{A}p{B}.jpg
+  grids/{id}/cells/t_start_{X}p{Y}__t_end_{A}p{B}.jpg
 """
 
 from __future__ import annotations
@@ -50,9 +50,11 @@ DATASET_OPTIONAL_SUBDIRS: Tuple[str, ...] = (
 MAPPING_FILENAME = "mapping_file.json"
 
 # Per-sample generated layout under the output dataset folder.
+GRIDS_DIRNAME = "grids"
 CELLS_DIRNAME = "cells"
 
-# Per-sample embedding filenames under --embeddings-root/<dataset-name>/{id}/.
+# Per-sample embedding layout under --embeddings-root/<dataset-name>/.
+SAMPLES_DIRNAME = "annotation_embeddings"
 EMBEDDING_FILENAMES: Tuple[str, ...] = ("source.pt", "target.pt", "image.pt", "mask.pt")
 
 # CSV schemas.
@@ -85,7 +87,7 @@ ID_TO_METRICS_FIELDS = [
 
 # Generation sweep (default ChordEdit mode only).
 IMAGE_SIZE = 512
-T_DELTA = 0.0
+T_DELTA = 0.15
 GRID_VALUES: List[float] = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 
 # JPEG quality for generated images to save space.

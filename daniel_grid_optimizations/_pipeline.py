@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import sys
 from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -121,6 +122,36 @@ def _cpu_tensor(embed: Any) -> torch.Tensor:
     return embed.hidden_states.detach().cpu()
 
 
+def _split_prompt_batch(embeds: Any, index: int) -> Any:
+    """Split one row out of a batched encode_prompt result (enables a single text forward)."""
+    if torch.is_tensor(embeds):
+        return embeds[index : index + 1]
+    from pipeline_chord import _PromptCondition
+
+    return _PromptCondition(
+        hidden_states=embeds.hidden_states[index : index + 1],
+        pooled_embeds=(None if embeds.pooled_embeds is None else embeds.pooled_embeds[index : index + 1]),
+        time_ids=None if embeds.time_ids is None else embeds.time_ids[index : index + 1],
+    )
+
+
+def _save_sample_embeddings(
+    embeddings_dir: Path,
+    *,
+    src_cpu: torch.Tensor,
+    tgt_cpu: torch.Tensor,
+    image_cpu: torch.Tensor,
+    mask_cpu: Optional[torch.Tensor],
+) -> None:
+    """Write per-sample .pt files from host tensors (safe to call from a background thread)."""
+    embeddings_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(src_cpu, embeddings_dir / "source.pt")
+    torch.save(tgt_cpu, embeddings_dir / "target.pt")
+    torch.save(image_cpu, embeddings_dir / "image.pt")
+    if mask_cpu is not None:
+        torch.save(mask_cpu, embeddings_dir / "mask.pt")
+
+
 def run_factorized_grid(
     *,
     source_image: Image.Image,
@@ -131,60 +162,99 @@ def run_factorized_grid(
     seed: int,
     embeddings_dir: Path | None = None,
     mask_image: Image.Image | None = None,
-    skip_grids: bool = False,
+    skip_generated: bool = False,
 ) -> Dict[Tuple[float, float], Image.Image]:
     """Generate the given (t_start, t_end) cells for one source image."""
     pipeline = _get_pipeline()
-    with torch.no_grad():
-        shared_params = pipeline._prepare_edit_params({**base_config, "t_delta": t_delta})
+    save_executor: ThreadPoolExecutor | None = None
+    save_future: Future[None] | None = None
+    # Ensure that we wait for the background save to complete, even if UNet work fails.
+    # Wait for (or surface errors from) that writer, then shut down the executor.
+    # This ensures that we don't leak resources if UNet work fails.
+    try:
+        with torch.no_grad():
+            shared_params = pipeline._prepare_edit_params({**base_config, "t_delta": t_delta})
 
-        # Shared preamble: encode image + prompts + noise once.
-        pixel_values = pipeline._prepare_image_tensor(source_image)
-        latents = pipeline._encode_image_to_latent(pixel_values)
-        src_embed = pipeline.encode_prompt([record.source_prompt])
-        tgt_embed = pipeline.encode_prompt([record.target_prompt])
-        if embeddings_dir is not None:
-            embeddings_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(_cpu_tensor(src_embed), embeddings_dir / "source.pt")
-            torch.save(_cpu_tensor(tgt_embed), embeddings_dir / "target.pt")
-            torch.save(_cpu_tensor(latents), embeddings_dir / "image.pt")
-            if mask_image is not None:
-                image_tensor = pipeline._prepare_image_tensor(mask_image)
-                mask_latents = pipeline._encode_image_to_latent(image_tensor)
-                torch.save(_cpu_tensor(mask_latents), embeddings_dir / "mask.pt")
-        if skip_grids:
-            # If we are skipping grids, return an empty dictionary.
-            return {}
+            # Batch image and mask through one VAE forward, avoiding a second encode when saving mask.pt.
+            # Batch source and target prompts through one text-encoder forward, avoiding a second CLIP pass.
+            # Meanwhile, torch.save runs on a background thread so disk I/O overlaps UNet transport/decode instead of blocking the GPU beforehand.
+            image_pixels = pipeline._prepare_image_tensor(source_image)
+            if embeddings_dir is not None and mask_image is not None:
+                # Perform a single VAE encode with batch=2, then split latents.
+                mask_pixels = pipeline._prepare_image_tensor(mask_image)
+                latents_batch = pipeline._encode_image_to_latent(
+                    torch.cat([image_pixels, mask_pixels], dim=0)
+                )
+                latents = latents_batch[0:1]
+                mask_latents = latents_batch[1:2]
+            else:
+                latents = pipeline._encode_image_to_latent(image_pixels)
+                mask_latents = None
 
-        noise_list = pipeline._prepare_noise_list(
-            latents=latents,
-            seed_value=seed,
-            num_noises=shared_params["noise_samples"],
-        )
+            # Perform a single text-encoder call for both prompts, then split batch dim.
+            prompt_batch = pipeline.encode_prompt([record.source_prompt, record.target_prompt])
+            src_embed = _split_prompt_batch(prompt_batch, 0)
+            tgt_embed = _split_prompt_batch(prompt_batch, 1)
 
-        # Group pairs into rows so transport stays one-per-t_start.
-        rows: OrderedDict[float, List[float]] = OrderedDict()
-        for t_start, t_end in cell_pairs:
-            rows.setdefault(t_start, []).append(t_end)
+            if embeddings_dir is not None:
+                # Copy to CPU before save so the background writer does not touch GPU tensors.
+                src_cpu = _cpu_tensor(src_embed)
+                tgt_cpu = _cpu_tensor(tgt_embed)
+                image_cpu = _cpu_tensor(latents)
+                mask_cpu = _cpu_tensor(mask_latents) if mask_latents is not None else None
+                save_kwargs = dict(
+                    embeddings_dir=embeddings_dir,
+                    src_cpu=src_cpu,
+                    tgt_cpu=tgt_cpu,
+                    image_cpu=image_cpu,
+                    mask_cpu=mask_cpu,
+                )
+                if skip_generated:
+                    # Encode-only (--skip-generated): nothing to overlap with, write synchronously.
+                    _save_sample_embeddings(**save_kwargs)
+                else:
+                    # Overlap .pt writes with UNet work below.
+                    save_executor = ThreadPoolExecutor(max_workers=1)
+                    save_future = save_executor.submit(_save_sample_embeddings, **save_kwargs)
 
-        # One transport per t_start (the dominant cost).
-        transport: Dict[float, torch.Tensor] = {}
-        for t_start, row_t_end_values in rows.items():
-            params = pipeline._prepare_edit_params({**base_config, "t_start": t_start, "t_delta": t_delta})
-            u_hat = _u_estimate(latents, src_embed, tgt_embed, noise_list, params["t_start"], params["t_delta"])
-            transport[t_start] = (latents + params["step_scale"] * u_hat).detach()
+            if skip_generated:
+                return {}
 
-        # Cleanup/decode one t_start row at a time (batched across t_end).
-        results: Dict[Tuple[float, float], "Image.Image"] = {}
-        for t_start, row_t_end_values in rows.items():
-            row_images = _cleanup_decode_row(
-                transport[t_start],
-                tgt_embed,
-                noise_list[0],
-                row_t_end_values,
-                bool(shared_params["cleanup"]),
+            noise_list = pipeline._prepare_noise_list(
+                latents=latents,
+                seed_value=seed,
+                num_noises=shared_params["noise_samples"],
             )
-            for t_end, image in zip(row_t_end_values, row_images):
-                results[(t_start, t_end)] = image
+
+            # Group pairs into rows so transport stays one-per-t_start.
+            rows: OrderedDict[float, List[float]] = OrderedDict()
+            for t_start, t_end in cell_pairs:
+                rows.setdefault(t_start, []).append(t_end)
+
+            # One transport per t_start (the dominant cost).
+            transport: Dict[float, torch.Tensor] = {}
+            for t_start, row_t_end_values in rows.items():
+                params = pipeline._prepare_edit_params({**base_config, "t_start": t_start, "t_delta": t_delta})
+                u_hat = _u_estimate(latents, src_embed, tgt_embed, noise_list, params["t_start"], params["t_delta"])
+                transport[t_start] = (latents + params["step_scale"] * u_hat).detach()
+
+            # Cleanup/decode one t_start row at a time (batched across t_end).
+            results: Dict[Tuple[float, float], "Image.Image"] = {}
+            for t_start, row_t_end_values in rows.items():
+                row_images = _cleanup_decode_row(
+                    transport[t_start],
+                    tgt_embed,
+                    noise_list[0],
+                    row_t_end_values,
+                    bool(shared_params["cleanup"]),
+                )
+                for t_end, image in zip(row_t_end_values, row_images):
+                    results[(t_start, t_end)] = image
+    finally:
+        # Wait for the background save to complete, then shut down the executor.
+        if save_future is not None:
+            save_future.result()
+        if save_executor is not None:
+            save_executor.shutdown(wait=False)
 
     return results
