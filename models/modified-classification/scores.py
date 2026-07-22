@@ -62,6 +62,7 @@ def softplus_score(
     values: torch.Tensor,
     *,
     baseline_idx: int,
+    enforce_deltas: bool = False,
     alpha: float = 1.0,
     beta: float = 2.0,
     normalize: bool = True,
@@ -71,6 +72,11 @@ def softplus_score(
     sample_id group. When normalize is True, each metric is min-max scaled
     within each sample_id group before deltas are taken. With softplus
     transforms s_i = sp(delta_i) of the (possibly normalized) metric deltas:
+
+    For n=2, the score meets our 4 properties if Deltas in [0, inf)^2 with
+    alpha >= beta. For beta  > 0, contributions are unbounded. When 
+    enforce_deltas is True, any row whose delta is outside [0, inf)^2 scores
+    -EPS instead.
 
         sp(x) = (1/beta)*(ln(1+e^{beta*x})-ln(2))
         m     = sum_i s_i + alpha * prod_i s_i
@@ -83,11 +89,24 @@ def softplus_score(
     https://www.desmos.com/3d/9slzoluqbd
     """
 
+    # Last dim is the metric axis (N, C); require C == 2.
+    if values.ndim < 1 or values.shape[-1] != 2:
+        raise ValueError("softplus_score only supports n=2 metrics (values shape (..., 2))")
+    if alpha < beta:
+        raise ValueError("alpha must be greater than or equal to beta")
+    if beta <= 0:
+        raise ValueError("beta must be greater than 0")
+
     # Normalize values within each sample_id group.
     def _normalize_values(values: torch.Tensor) -> torch.Tensor:
         min_values = values.amin(dim=0, keepdim=True)
         max_values = values.amax(dim=0, keepdim=True)
         return (values - min_values) / (max_values - min_values + _EPS)
+
+    def _enforce_deltas(scores: torch.Tensor, deltas: torch.Tensor) -> torch.Tensor:
+        # [0, inf)^2: every metric delta must be >= 0.
+        outside = (deltas < 0).any(dim=-1)
+        return torch.where(outside, torch.full_like(scores, -_EPS), scores)
 
     # Calculate the shifted softplus score.
     def _shifted_softplus(values: torch.Tensor, beta: float) -> torch.Tensor:
@@ -105,6 +124,62 @@ def softplus_score(
     deltas = values - values[baseline_idx]
     s = _shifted_softplus(deltas, beta)
     scores = s.sum(dim=-1) + alpha * s.prod(dim=-1)
+    scores = _penalize_zeros(scores, deltas)
+    scores = _enforce_deltas(scores, deltas) if enforce_deltas else scores
+    return scores
+
+
+def cara_score(
+    values: torch.Tensor,
+    *,
+    baseline_idx: int,
+    alpha: float = 1.0,
+    beta: float = 2.0,
+    normalize: bool = True,
+) -> torch.Tensor:
+    """
+    Return a smooth score for each row relative to the baseline row in its
+    sample_id group. When normalize is True, each metric is min-max scaled
+    within each sample_id group before deltas are taken.
+
+    The CARA score meets our 4 properties for all n in N, Delta in R^n with
+    alpha, beta > 0. Contributions are bounded by 1/alpha for Delta_i. No
+    single metric can contribute more than 1/alpha to the score.
+
+        cara(x)   = (1 - e^{-beta * x}) / alpha
+        m(Delta) = sum_i cara(Delta_i)
+
+    The baseline scores 0. Rows that also score 0 but differ from the baseline
+    on every metric are shifted down by epsilon.
+
+    Plot of the score surface (2 metrics):
+    https://www.desmos.com/3d/ytebfhjou2
+    """
+
+    if alpha <= 0:
+        raise ValueError("alpha must be greater than 0")
+    if beta <= 0:
+        raise ValueError("beta must be greater than 0")
+
+    # Normalize values within each sample_id group.
+    def _normalize_values(values: torch.Tensor) -> torch.Tensor:
+        min_values = values.amin(dim=0, keepdim=True)
+        max_values = values.amax(dim=0, keepdim=True)
+        return (values - min_values) / (max_values - min_values + _EPS)
+
+    # Calculate the CARA score for each metric.
+    def _cara(values: torch.Tensor, alpha: float, beta: float) -> torch.Tensor:
+        return (1 - torch.exp(-beta * values)) / alpha
+
+    # Penalize rows where the score is 0 but it is not the baseline.
+    def _penalize_zeros(values: torch.Tensor, deltas: torch.Tensor) -> torch.Tensor:
+        mask = (values == 0) & (deltas != 0).all(dim=-1)
+        return values - _EPS * mask.to(dtype=values.dtype)
+
+    values = _normalize_values(values) if normalize else values
+    deltas = values - values[baseline_idx]
+    c = _cara(deltas, alpha, beta)
+    scores = c.sum(dim=-1)
     return _penalize_zeros(scores, deltas)
 
 
@@ -149,6 +224,7 @@ def naive_pareto_score_df(
 def softplus_score_df(
     df: pd.DataFrame,
     *cols: str,
+    enforce_deltas: bool = False,
     alpha: float = 1.0,
     beta: float = 2.0,
     normalize: bool = True,
@@ -163,6 +239,28 @@ def softplus_score_df(
         if int(base_mask.sum()) != 1:
             raise ValueError(f"Expected exactly one base row, found {int(base_mask.sum())}")
         baseline_idx = int(np.flatnonzero(np.asarray(base_mask))[0])
-        out = softplus_score(values, baseline_idx=baseline_idx, alpha=alpha, beta=beta, normalize=normalize)
+        out = softplus_score(values, baseline_idx=baseline_idx, enforce_deltas=enforce_deltas, alpha=alpha, beta=beta, normalize=normalize)
+        scores.loc[group.index] = out.detach().cpu().numpy()
+    return scores
+
+
+def cara_score_df(
+    df: pd.DataFrame,
+    *cols: str,
+    alpha: float = 1.0,
+    beta: float = 2.0,
+    normalize: bool = True,
+) -> pd.Series:
+    """Wrapper for cara_score that takes a DataFrame and returns a Series."""
+    from settings import DEFAULT_T_END, DEFAULT_T_START, SAMPLE_ID_COL
+
+    scores = pd.Series(0.0, index=df.index, name="cara_score")
+    for _, group in df.groupby(SAMPLE_ID_COL):
+        values = torch.as_tensor(group.loc[:, list(cols)].to_numpy(dtype=np.float64, copy=True), dtype=torch.float64)
+        base_mask = np.isclose(group["t_start"], DEFAULT_T_START) & np.isclose(group["t_end"], DEFAULT_T_END)
+        if int(base_mask.sum()) != 1:
+            raise ValueError(f"Expected exactly one base row, found {int(base_mask.sum())}")
+        baseline_idx = int(np.flatnonzero(np.asarray(base_mask))[0])
+        out = cara_score(values, baseline_idx=baseline_idx, alpha=alpha, beta=beta, normalize=normalize)
         scores.loc[group.index] = out.detach().cpu().numpy()
     return scores
