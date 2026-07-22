@@ -1,45 +1,69 @@
-"""Shared helpers for model M training and inference."""
+"""Shared helpers for model M training and inference.
+
+Run-directory helpers (save/load settings, resolve run dir) do not bind settings
+at import time. Call load_run_settings(RUN_DIR) before importing _data / models
+(or using other helpers here) so those bind constants from the per-run snapshot.
+"""
 
 from __future__ import annotations
 
-import hashlib
+import importlib.util
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
 
-from settings import *
+SETTINGS_FILENAME = "settings.py"
+_PACKAGE_DIR = Path(__file__).resolve().parent
+_LIVE_SETTINGS = _PACKAGE_DIR / SETTINGS_FILENAME
 
 _EPS = 1e-8
 
 
-def settings_hash(path: Path | None = None) -> str:
-    path = path or Path(__file__).resolve().parent / "settings.py"
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def _s():
+    """Current settings module (live or per-run snapshot in sys.modules)."""
+    import settings
+
+    return settings
 
 
-def save_settings_hash(run_dir: Path) -> Path:
+def save_run_settings(run_dir: Path) -> Path:
     run_dir = Path(run_dir)
-    out = run_dir / "settings_hash.txt"
-    out.write_text(settings_hash() + "\n", encoding="utf-8")
-    return out
+    run_dir.mkdir(parents=True, exist_ok=True)
+    dst = run_dir / SETTINGS_FILENAME
+    dst.write_bytes(_LIVE_SETTINGS.read_bytes())
+    return dst
 
 
-def check_settings_hash(run_dir: Path) -> None:
-    run_dir = Path(run_dir)
-    path = run_dir / "settings_hash.txt"
+def load_run_settings(run_dir: Path):
+    path = Path(run_dir) / SETTINGS_FILENAME
     if not path.exists():
-        raise FileNotFoundError(
-            f"Missing {path}. Re-run train_m.py to record settings hash for this run."
-        )
-    saved = path.read_text(encoding="utf-8").strip()
-    live = settings_hash()
-    if saved != live:
+        raise FileNotFoundError(f"Missing {path}. Re-run train_m.py to snapshot settings.py for this run.")
+    already = [n for n in ("_data", "model_m", "model_t") if n in sys.modules]
+    if already:
         raise RuntimeError(
-            f"settings.py changed since this run (saved {saved[:12]}…, live {live[:12]}…). "
-            "Re-run train_m.py or revert settings.py."
+            f"load_run_settings() must be called before importing modules that bind settings "
+            f"(already imported: {', '.join(already)})."
         )
+    spec = importlib.util.spec_from_file_location("settings", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load settings from {path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["settings"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def load_live_settings():
+    """Load package settings.py under a private module name (for OUTPUTS_DIR bootstrap)."""
+    spec = importlib.util.spec_from_file_location("_live_settings", _LIVE_SETTINGS)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load live settings from {_LIVE_SETTINGS}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def resolve_run_dir(outputs_dir: Path, run_dir: Path | None = None) -> Path:
@@ -81,7 +105,7 @@ def format_results(m: dict[str, float]) -> str:
     """Fixed-width metric line so Train/Val columns stay aligned (incl. signed R²)."""
     return f"loss={m['loss']:7.4f}  " + "  ".join(
         f"{col}: MAE={m[f'mae_{col}']:6.3f} R2={m[f'r2_{col}']:7.3f}"
-        for col in M_TARGET_COLS
+        for col in _s().M_TARGET_COLS
     )
 
 
@@ -90,7 +114,7 @@ def normalize_target_columns(
     bounds: dict[str, tuple[float, float]] | None = None,
 ) -> pd.DataFrame:
     y = y.copy()
-    for col in M_TARGET_COLS:
+    for col in _s().M_TARGET_COLS:
         if bounds is None:
             col_min, col_max = np.nanmin(y[col]), np.nanmax(y[col])
         else:
@@ -104,7 +128,7 @@ def unnormalize_target_columns(
     bounds: dict[str, tuple[float, float]],
 ) -> pd.DataFrame:
     y = y.copy()
-    for col in M_TARGET_COLS:
+    for col in _s().M_TARGET_COLS:
         col_min, col_max = bounds[col]
         y[col] = y[col] * (col_max - col_min + _EPS) + col_min
     return y
@@ -115,8 +139,9 @@ def unnormalize_metric_arrays(
     clip: np.ndarray,
     bounds: dict[str, tuple[float, float]],
 ) -> tuple[np.ndarray, np.ndarray]:
-    psnr_min, psnr_max = bounds[PSNR_COL]
-    clip_min, clip_max = bounds[CLIP_COL]
+    s = _s()
+    psnr_min, psnr_max = bounds[s.PSNR_COL]
+    clip_min, clip_max = bounds[s.CLIP_COL]
     return (
         psnr * (psnr_max - psnr_min + _EPS) + psnr_min,
         clip * (clip_max - clip_min + _EPS) + clip_min,
@@ -133,11 +158,12 @@ def scalarize(
     """Combine PSNR and CLIP into scalar m using dataset min-max bounds."""
     if already_normalized:
         return (np.asarray(psnr, dtype=float) + np.asarray(clip, dtype=float)) / 2.0
-    psnr_n = (np.asarray(psnr, dtype=float) - bounds[PSNR_COL][0]) / (
-        bounds[PSNR_COL][1] - bounds[PSNR_COL][0] + _EPS
+    s = _s()
+    psnr_n = (np.asarray(psnr, dtype=float) - bounds[s.PSNR_COL][0]) / (
+        bounds[s.PSNR_COL][1] - bounds[s.PSNR_COL][0] + _EPS
     )
-    clip_n = (np.asarray(clip, dtype=float) - bounds[CLIP_COL][0]) / (
-        bounds[CLIP_COL][1] - bounds[CLIP_COL][0] + _EPS
+    clip_n = (np.asarray(clip, dtype=float) - bounds[s.CLIP_COL][0]) / (
+        bounds[s.CLIP_COL][1] - bounds[s.CLIP_COL][0] + _EPS
     )
     return (psnr_n + clip_n) / 2.0
 
@@ -163,11 +189,18 @@ def add_combined_score(
     df: pd.DataFrame,
     bounds: dict[str, tuple[float, float]],
     *,
-    psnr_col: str = PSNR_COL,
-    clip_col: str = CLIP_COL,
-    out_col: str = T_TARGET_COL,
+    psnr_col: str | None = None,
+    clip_col: str | None = None,
+    out_col: str | None = None,
     already_normalized: bool = False,
 ) -> pd.Series:
+    s = _s()
+    if psnr_col is None:
+        psnr_col = s.PSNR_COL
+    if clip_col is None:
+        clip_col = s.CLIP_COL
+    if out_col is None:
+        out_col = s.T_TARGET_COL
     score = scalarize(
         df[psnr_col].to_numpy(dtype=float),
         df[clip_col].to_numpy(dtype=float),
@@ -185,21 +218,21 @@ def resolve_cell_path(cell_path: str) -> str:
     path = Path(cell_path)
     if path.is_absolute():
         return str(path)
-    return str(GENERATED_DIR / cell_path.lstrip("/"))
+    return str(_s().GENERATED_DIR / cell_path.lstrip("/"))
 
 
 def resolve_image_path(image_path: str) -> str:
     path = Path(image_path)
     if path.is_absolute():
         return str(path)
-    return str(DATASET_DIR / image_path)
+    return str(_s().DATASET_DIR / image_path)
 
 
 def resolve_mask_path(mask_path: str) -> str:
     path = Path(mask_path)
     if path.is_absolute():
         return str(path)
-    return str(DATASET_DIR / mask_path)
+    return str(_s().DATASET_DIR / mask_path)
 
 
 def resolve_embedding_path(embedding_path: str) -> str:
@@ -209,10 +242,11 @@ def resolve_embedding_path(embedding_path: str) -> str:
     EMBEDDINGS_DIR/annotation_embeddings/ (matching grid_generate layout),
     whether written as `{id}/source.pt` or `annotation_embeddings/{id}/source.pt`.
     """
+    s = _s()
     path = Path(embedding_path)
     if path.is_absolute():
         return str(path)
     path = Path(str(embedding_path).lstrip("/"))
-    if path.parts and path.parts[0] == EMBEDDINGS_SAMPLES_DIRNAME:
-        return str(EMBEDDINGS_DIR / path)
-    return str(EMBEDDINGS_DIR / EMBEDDINGS_SAMPLES_DIRNAME / path)
+    if path.parts and path.parts[0] == s.EMBEDDINGS_SAMPLES_DIRNAME:
+        return str(s.EMBEDDINGS_DIR / path)
+    return str(s.EMBEDDINGS_DIR / s.EMBEDDINGS_SAMPLES_DIRNAME / path)

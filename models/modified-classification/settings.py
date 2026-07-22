@@ -15,7 +15,6 @@ DIR_NAME = "UltraEdit_Region_1000"
 GENERATED_DIR = Path(f"/shared/ssd_30T/mirick/generated/ultra_edit/{DIR_NAME}")
 DATASET_DIR = Path(f"/shared/ssd_30T/mirick/datasets/ultra_edit/{DIR_NAME}")
 # Precomputed embeddings (used when FREEZE_ENCODERS is True). 
-# Set to None for on-the-fly encode. Will pack into cache dir.
 EMBEDDINGS_DIR = Path(f"/shared/ssd_30T/mirick/embeddings/ultraedit/{DIR_NAME}")
 EMBEDDINGS_SAMPLES_DIRNAME = "annotation_embeddings"
 
@@ -23,8 +22,13 @@ INPUTS_CSV = GENERATED_DIR / f"id_to_inputs_{DIR_NAME.replace('_', '').lower()}.
 METRICS_CSV = GENERATED_DIR / f"id_to_metrics_{DIR_NAME.replace('_', '').lower()}.csv"
 EMBEDDINGS_CSV = EMBEDDINGS_DIR / f"id_to_embeddings_{DIR_NAME.replace('_', '').lower()}.csv"
 
+# Package root: live settings.py sits next to model_m.py; run copies live under
+# outputs/<DIR_NAME>/<timestamp>/settings.py (parents[2] == package dir).
+_HERE = Path(__file__).resolve().parent
+_PACKAGE_DIR = _HERE if (_HERE / "model_m.py").exists() else _HERE.parents[2]
+
 # NOTE: Set this to the directory where the model outputs will be saved.
-OUTPUTS_DIR = Path(__file__).resolve().parent / "outputs" / DIR_NAME
+OUTPUTS_DIR = _PACKAGE_DIR / "outputs" / DIR_NAME
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 _outputs_gitignore = OUTPUTS_DIR.parent / ".gitignore"
 if not _outputs_gitignore.exists():

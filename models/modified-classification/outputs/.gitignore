@@ -1,2 +1,2 @@
-# Ignore all saves in generated subdirs
-*/*
+*
+!.gitignore

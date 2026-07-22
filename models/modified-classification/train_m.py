@@ -36,7 +36,7 @@ from _data import (
     save_splits_df,
     split_df,
 )
-from _helpers import format_results, pairwise_ranking_loss, save_settings_hash
+from _helpers import format_results, pairwise_ranking_loss, save_run_settings
 from model_m import MetricPredictor
 from settings import *
 
@@ -44,6 +44,7 @@ from settings import *
 def parse_args() -> argparse.Namespace:
     # Argument parser for the command line.
     parser = argparse.ArgumentParser(description="Train metric surrogate M")
+    parser.add_argument("--skip-model", action="store_true")
     return parser.parse_args()
 
 
@@ -94,12 +95,12 @@ def train(
     test_y: pd.DataFrame,
 ) -> Path:
     """Train the metric surrogate model and save run artifacts."""
-    
+
     # Create run directory to save information to.
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = OUTPUTS_DIR / timestamp
     run_dir.mkdir(parents=True, exist_ok=True)
-    save_settings_hash(run_dir)
+    save_run_settings(run_dir)
 
     # Create dataloaders for the train, val, and test sets.
     use_ranking = RANKING_LOSS_WEIGHT > 0
@@ -112,7 +113,6 @@ def train(
 
     target_cols = list(M_TARGET_COLS)
     y_train = torch.tensor(train_y[target_cols].values, dtype=torch.float)
-    print(f"Dataset: train={len(train_X)} cells val={len(val_X)} cells")
 
     # Normalize the targets if specified.
     if NORMALIZE_TARGETS:
@@ -137,11 +137,12 @@ def train(
     best_val = float("inf")
     device = next(model.regressor.parameters()).device
     n_cells, n_samples = len(train_X), train_X[SAMPLE_ID_COL].nunique()
+    
     # Iterate over the epochs.
+    print("\n")
     for epoch in range(1, EPOCHS + 1):
         epoch_start = time.perf_counter()
         model.regressor.train()
-        train_loss_sum, train_n = 0.0, 0
         # Iterate over the train loader.
         for batch in train_loader:
             img, mask, src, tar, t, y = model_inputs(batch, device)
@@ -159,9 +160,6 @@ def train(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            # Accumulate the training loss for the epoch.
-            train_loss_sum += mse.detach().item() * y.numel()
-            train_n += y.numel()
 
         # Find val metrics every epoch and save best weights.
         val_results = evaluate(model, val_loader, device)
@@ -180,15 +178,10 @@ def train(
                 weights_out,
             )
         elapsed = time.perf_counter() - epoch_start
-        # Find test metrics only on the last epoch.
-        if epoch == EPOCHS:
-            train_results = evaluate(model, train_loader, device)
-            train_line = format_results(train_results)
-        else:
-            train_line = f"loss={train_loss_sum / max(train_n, 1):7.4f}  (running MSE)"
+        train_results = evaluate(model, train_loader, device)
         print(
             f"Epoch [{epoch:03d}/{EPOCHS:03d}] | {n_cells} cells ({n_samples} samples) in {elapsed:.2f}s"
-            f"\n    {'Train:':<6} {train_line}"
+            f"\n    {'Train:':<6} {format_results(train_results)}"
             f"\n    {'Val:':<6} {format_results(val_results)}"
             + ("  *" if improved else "")
         )
@@ -211,9 +204,20 @@ def main() -> None:
 
     # Parse arguments. NOTE: Currently unused.
     args = parse_args()
+    skip_model = args.skip_model
     
     torch.manual_seed(SEED)
     np.random.seed(SEED)
+
+    # # Create run directory to save information to.
+    # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # run_dir = OUTPUTS_DIR / timestamp
+    # run_dir.mkdir(parents=True, exist_ok=True)
+    # save_run_settings(run_dir)
+
+    if skip_model:
+        print("Skipping model training.")
+        return
 
     # For data: load, prepare, and split into train/val/test sets.
     data_df = load_df()
