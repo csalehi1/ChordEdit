@@ -1,8 +1,7 @@
-"""Shared helpers for model M training and inference.
+"""Run settings, model tensors, and training/score helpers.
 
-Run-directory helpers (save/load settings, resolve run dir) do not bind settings
-at import time. Call load_run_settings(RUN_DIR) before importing _data / models
-(or using other helpers here) so those bind constants from the per-run snapshot.
+Call load_run_settings(RUN_DIR) before importing _data / models so those modules
+bind constants from the per-run settings snapshot.
 """
 
 from __future__ import annotations
@@ -22,10 +21,11 @@ _LIVE_SETTINGS = _PACKAGE_DIR / SETTINGS_FILENAME
 _EPS = 1e-8
 
 
+# --- Run settings -----------------------------------------------------------------
+
 def _s():
     """Current settings module (live or per-run snapshot in sys.modules)."""
     import settings
-
     return settings
 
 
@@ -78,6 +78,8 @@ def resolve_run_dir(outputs_dir: Path, run_dir: Path | None = None) -> Path:
     return candidates[-1]
 
 
+# --- Model tensors ----------------------------------------------------------------
+
 def mean_pool(last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
     """Mask-weighted mean over the token dimension."""
     mask = attention_mask.unsqueeze(-1).expand_as(last_hidden).float()
@@ -89,11 +91,10 @@ def combine_text_embeddings(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.cat([a, b, a - b, a * b], dim=-1)
 
 
-def resolve_device(gpu: int | str | None = None) -> torch.device:
-    """Pick torch device for inference.
+# --- Device / reporting / loss ----------------------------------------------------
 
-    gpu: None -> cuda:0 if available else cpu; int -> cuda:N; "cpu" -> cpu.
-    """
+def resolve_device(gpu: int | str | None = None) -> torch.device:
+    """None -> cuda:0 if available else cpu; int -> cuda:N; \"cpu\" -> cpu."""
     if gpu is None:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if isinstance(gpu, str) and gpu.lower() == "cpu":
@@ -102,12 +103,26 @@ def resolve_device(gpu: int | str | None = None) -> torch.device:
 
 
 def format_results(m: dict[str, float]) -> str:
-    """Fixed-width metric line so Train/Val columns stay aligned (incl. signed R²)."""
+    """Fixed-width metric line so Train/Val columns stay aligned."""
     return f"loss={m['loss']:7.4f}  " + "  ".join(
         f"{col}: MAE={m[f'mae_{col}']:6.3f} R2={m[f'r2_{col}']:7.3f}"
         for col in _s().M_TARGET_COLS
     )
 
+
+def pairwise_ranking_loss(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
+    """Logistic pairwise loss: penalize pred ordering that disagrees with true."""
+    if pred.shape[0] < 2:
+        return pred.new_zeros(())
+    diff_true = true.unsqueeze(1) - true.unsqueeze(0)
+    diff_pred = pred.unsqueeze(1) - pred.unsqueeze(0)
+    mask = diff_true > 0
+    if not mask.any():
+        return pred.new_zeros(())
+    return torch.nn.functional.softplus(-diff_pred[mask]).mean()
+
+
+# --- Targets + T score ------------------------------------------------------------
 
 def normalize_target_columns(
     y: pd.DataFrame,
@@ -120,17 +135,6 @@ def normalize_target_columns(
         else:
             col_min, col_max = bounds[col]
         y[col] = (y[col] - col_min) / (col_max - col_min + _EPS)
-    return y
-
-
-def unnormalize_target_columns(
-    y: pd.DataFrame,
-    bounds: dict[str, tuple[float, float]],
-) -> pd.DataFrame:
-    y = y.copy()
-    for col in _s().M_TARGET_COLS:
-        col_min, col_max = bounds[col]
-        y[col] = y[col] * (col_max - col_min + _EPS) + col_min
     return y
 
 
@@ -148,17 +152,15 @@ def unnormalize_metric_arrays(
     )
 
 
-def apply_t_score(
+def t_target_score_values(
     values: torch.Tensor,
     baseline_idx: int | torch.Tensor,
 ) -> torch.Tensor:
     """Per-sample normalized deltas then settings.T_TARGET_SCORE (phi on Delta).
 
     values: (..., N, C). Returns scores shaped (..., N).
-    baseline_idx: int, or LongTensor matching values.shape[:-2].
     """
     from scores import normalize_score_deltas
-
     deltas = normalize_score_deltas(values, baseline_idx)
     return _s().T_TARGET_SCORE(deltas)
 
@@ -171,12 +173,7 @@ def scalarize(
     already_normalized: bool = False,
     baseline_idx: int,
 ) -> np.ndarray:
-    """Combine PSNR and CLIP via apply_t_score (preserves input shape).
-
-    For 3D (B, n1, n2) grids, scores each image independently as (B, N, C).
-    When already_normalized is False and bounds are given, applies dataset
-    min-max before scoring.
-    """
+    """Combine PSNR and CLIP via apply_t_score (preserves input shape)."""
     psnr = np.asarray(psnr, dtype=float)
     clip = np.asarray(clip, dtype=float)
     if psnr.shape != clip.shape:
@@ -191,64 +188,10 @@ def scalarize(
             np.stack([psnr.reshape(b, n1 * n2), clip.reshape(b, n1 * n2)], axis=-1),
             dtype=torch.float64,
         )
-        out = apply_t_score(values, baseline_idx=baseline_idx)
+        out = t_target_score_values(values, baseline_idx=baseline_idx)
         return out.detach().cpu().numpy().reshape(b, n1, n2)
     if psnr.ndim != 2:
         raise ValueError(f"psnr/clip must be 2D or 3D, got shape {psnr.shape}")
     values = torch.as_tensor(np.stack([psnr.ravel(), clip.ravel()], axis=-1), dtype=torch.float64)
-    out = apply_t_score(values, baseline_idx=baseline_idx)
+    out = t_target_score_values(values, baseline_idx=baseline_idx)
     return out.detach().cpu().numpy().reshape(psnr.shape)
-
-
-def pairwise_ranking_loss(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
-    """Logistic pairwise loss: penalize pred ordering that disagrees with true."""
-    if pred.shape[0] < 2:
-        return pred.new_zeros(())
-    diff_true = true.unsqueeze(1) - true.unsqueeze(0)
-    diff_pred = pred.unsqueeze(1) - pred.unsqueeze(0)
-    mask = diff_true > 0
-    if not mask.any():
-        return pred.new_zeros(())
-    return torch.nn.functional.softplus(-diff_pred[mask]).mean()
-
-
-def prep_sample_id(value) -> str:
-    return f"{int(value):08d}"
-
-
-def resolve_cell_path(cell_path: str) -> str:
-    path = Path(cell_path)
-    if path.is_absolute():
-        return str(path)
-    return str(_s().GENERATED_DIR / cell_path.lstrip("/"))
-
-
-def resolve_image_path(image_path: str) -> str:
-    path = Path(image_path)
-    if path.is_absolute():
-        return str(path)
-    return str(_s().DATASET_DIR / image_path)
-
-
-def resolve_mask_path(mask_path: str) -> str:
-    path = Path(mask_path)
-    if path.is_absolute():
-        return str(path)
-    return str(_s().DATASET_DIR / mask_path)
-
-
-def resolve_embedding_path(embedding_path: str) -> str:
-    """Resolve a path from id_to_embeddings_*.csv to an absolute .pt path.
-
-    Absolute CSV paths are returned as-is. Relative paths are under
-    EMBEDDINGS_DIR/annotation_embeddings/ (matching grid_generate layout),
-    whether written as `{id}/source.pt` or `annotation_embeddings/{id}/source.pt`.
-    """
-    s = _s()
-    path = Path(embedding_path)
-    if path.is_absolute():
-        return str(path)
-    path = Path(str(embedding_path).lstrip("/"))
-    if path.parts and path.parts[0] == s.EMBEDDINGS_SAMPLES_DIRNAME:
-        return str(s.EMBEDDINGS_DIR / path)
-    return str(s.EMBEDDINGS_DIR / s.EMBEDDINGS_SAMPLES_DIRNAME / path)

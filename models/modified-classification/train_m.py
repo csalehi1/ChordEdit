@@ -36,7 +36,8 @@ from _data import (
     save_splits_df,
     split_df,
 )
-from _helpers import apply_t_score, format_results, pairwise_ranking_loss, save_run_settings
+from _helpers import format_results, pairwise_ranking_loss, save_run_settings
+from scores import normalize_score_deltas
 from model_m import MetricPredictor
 from settings import *
 
@@ -44,7 +45,6 @@ from settings import *
 def parse_args() -> argparse.Namespace:
     # Argument parser for the command line.
     parser = argparse.ArgumentParser(description="Train metric surrogate M")
-    parser.add_argument("--skip-model", action="store_true")
     return parser.parse_args()
 
 
@@ -55,8 +55,11 @@ def evaluate(
     device: torch.device | None = None,
 ) -> dict[str, float]:
     """Per-target MAE/RMSE/R² in normalized metric units, plus standardized loss."""
+    
     if device is None:
         device = next(model.regressor.parameters()).device
+    
+    # Set the model to evaluation mode.
     model.regressor.eval()
     preds, trues = [], []
     loss_sum, n = 0.0, 0
@@ -74,7 +77,10 @@ def evaluate(
     pred = torch.cat(preds)
     true = torch.cat(trues)
     err = pred - true
-    metrics: dict[str, float] = {"loss": loss_sum / n}
+
+    # Calculate the metrics for each target column.
+    metrics: dict[str, float] = {}
+    metrics["loss"] = loss_sum / n
     for i, col in enumerate(M_TARGET_COLS):
         e = err[:, i]
         ss_res = (e ** 2).sum()
@@ -82,6 +88,7 @@ def evaluate(
         metrics[f"mae_{col}"] = e.abs().mean().item()
         metrics[f"rmse_{col}"] = (e ** 2).mean().sqrt().item()
         metrics[f"r2_{col}"] = (1 - ss_res / ss_tot).item()
+    
     return metrics
 
 
@@ -141,29 +148,41 @@ def train(
     # Iterate over the epochs.
     print("\n")
     for epoch in range(1, EPOCHS + 1):
+
         epoch_start = time.perf_counter()
+        # Set the model to training mode.
         model.regressor.train()
+
         # Iterate over the train loader.
         for batch in train_loader:
+
             img, mask, src, tar, t, y = model_inputs(batch, device)
             out = model.regressor(img, mask, src, tar, t)
+
             # Standardize targets in z-scored space for MSE loss.
             mse = torch.nn.functional.mse_loss(out, (y - mean) / std)
             loss = mse
+
+            # If specified, use per-sample ranking loss.
             if use_ranking:
+
                 # Same apply_t_score (Δ then T_TARGET_SCORE) for true and pred order.
                 # SampleGridBatchSampler yields one sample's full grid per batch.
                 y_hat = model.regressor.denormalize(out)
-                base = (
-                    torch.isclose(t[:, 0], torch.as_tensor(DEFAULT_T_START, device=t.device, dtype=t.dtype))
-                    & torch.isclose(t[:, 1], torch.as_tensor(DEFAULT_T_END, device=t.device, dtype=t.dtype))
-                ).nonzero(as_tuple=False)
-                if base.numel() != 1:
-                    raise ValueError(f"Expected exactly one default-(t_start,t_end) row in batch, found {int(base.numel())}")
-                baseline_idx = int(base[0])
-                true_m = apply_t_score(y, baseline_idx=baseline_idx)
-                pred_m = apply_t_score(y_hat, baseline_idx=baseline_idx)
+                base_t_start = torch.as_tensor(DEFAULT_T_START, device=t.device, dtype=t.dtype)
+                base_t_end = torch.as_tensor(DEFAULT_T_END, device=t.device, dtype=t.dtype)
+                base_mask = (torch.isclose(t[:, 0], base_t_start) & torch.isclose(t[:, 1], base_t_end)).nonzero(as_tuple=False)
+                if base_mask.numel() != 1:
+                    raise ValueError(f"Expected exactly one default-(t_start,t_end) row in batch, found {int(base_mask.numel())}")
+                baseline_idx = int(base_mask[0])
+                
+                # Calculate the true and predicted metrics.
+                true_delta = normalize_score_deltas(y, baseline_idx)
+                pred_delta = normalize_score_deltas(y_hat, baseline_idx)
+                true_m = T_TARGET_SCORE(true_delta)
+                pred_m = T_TARGET_SCORE(pred_delta)
                 loss = loss + RANKING_LOSS_WEIGHT * pairwise_ranking_loss(pred_m, true_m)
+            
             # Backpropagate the training loss.
             optimizer.zero_grad()
             loss.backward()
@@ -185,6 +204,7 @@ def train(
                 },
                 weights_out,
             )
+        
         elapsed = time.perf_counter() - epoch_start
         train_results = evaluate(model, train_loader, device)
         print(
@@ -195,8 +215,8 @@ def train(
         )
 
     # Load the best weights and evaluate the model on the test set.
-    ckpt = torch.load(weights_out, map_location=device, weights_only=False)
-    model.regressor.load_state_dict(ckpt["regressor_state_dict"])
+    checkpoint = torch.load(weights_out, map_location=device, weights_only=False)
+    model.regressor.load_state_dict(checkpoint["regressor_state_dict"])
     results = evaluate(model, test_loader, device)
     print(f"\n    {'Test:':<6} {format_results(results)}")
 
@@ -205,6 +225,7 @@ def train(
     metrics_out = run_dir / "m_train_metrics.json"
     with open(metrics_out, "w") as f:
         json.dump({"val_best_loss": best_val, "test": results}, f, indent=4)
+    
     return run_dir
 
 
@@ -216,16 +237,6 @@ def main() -> None:
     
     torch.manual_seed(SEED)
     np.random.seed(SEED)
-
-    # # Create run directory to save information to.
-    # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # run_dir = OUTPUTS_DIR / timestamp
-    # run_dir.mkdir(parents=True, exist_ok=True)
-    # save_run_settings(run_dir)
-
-    if skip_model:
-        print("Skipping model training.")
-        return
 
     # For data: load, prepare, and split into train/val/test sets.
     data_df = load_df()
