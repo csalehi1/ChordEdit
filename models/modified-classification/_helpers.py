@@ -148,29 +148,56 @@ def unnormalize_metric_arrays(
     )
 
 
+def apply_t_score(
+    values: torch.Tensor,
+    baseline_idx: int | torch.Tensor,
+) -> torch.Tensor:
+    """Per-sample normalized deltas then settings.T_TARGET_SCORE (phi on Delta).
+
+    values: (..., N, C). Returns scores shaped (..., N).
+    baseline_idx: int, or LongTensor matching values.shape[:-2].
+    """
+    from scores import normalize_score_deltas
+
+    deltas = normalize_score_deltas(values, baseline_idx)
+    return _s().T_TARGET_SCORE(deltas)
+
+
 def scalarize(
     psnr: np.ndarray,
     clip: np.ndarray,
-    bounds: dict[str, tuple[float, float]],
+    bounds: dict[str, tuple[float, float]] | None = None,
     *,
     already_normalized: bool = False,
+    baseline_idx: int,
 ) -> np.ndarray:
-    """Combine PSNR and CLIP into scalar m using dataset min-max bounds."""
-    if already_normalized:
-        return (np.asarray(psnr, dtype=float) + np.asarray(clip, dtype=float)) / 2.0
-    s = _s()
-    psnr_n = (np.asarray(psnr, dtype=float) - bounds[s.PSNR_COL][0]) / (
-        bounds[s.PSNR_COL][1] - bounds[s.PSNR_COL][0] + _EPS
-    )
-    clip_n = (np.asarray(clip, dtype=float) - bounds[s.CLIP_COL][0]) / (
-        bounds[s.CLIP_COL][1] - bounds[s.CLIP_COL][0] + _EPS
-    )
-    return (psnr_n + clip_n) / 2.0
+    """Combine PSNR and CLIP via apply_t_score (preserves input shape).
 
-
-def combined_score_tensor(targets: torch.Tensor) -> torch.Tensor:
-    """Scalar m from min-max normalized (psnr, clip), shape (N, 2) -> (N,)."""
-    return (targets[:, 0] + targets[:, 1]) / 2.0
+    For 3D (B, n1, n2) grids, scores each image independently as (B, N, C).
+    When already_normalized is False and bounds are given, applies dataset
+    min-max before scoring.
+    """
+    psnr = np.asarray(psnr, dtype=float)
+    clip = np.asarray(clip, dtype=float)
+    if psnr.shape != clip.shape:
+        raise ValueError(f"psnr/clip shape mismatch: {psnr.shape} vs {clip.shape}")
+    if not already_normalized and bounds is not None:
+        s = _s()
+        psnr = (psnr - bounds[s.PSNR_COL][0]) / (bounds[s.PSNR_COL][1] - bounds[s.PSNR_COL][0] + _EPS)
+        clip = (clip - bounds[s.CLIP_COL][0]) / (bounds[s.CLIP_COL][1] - bounds[s.CLIP_COL][0] + _EPS)
+    if psnr.ndim == 3:
+        b, n1, n2 = psnr.shape
+        values = torch.as_tensor(
+            np.stack([psnr.reshape(b, n1 * n2), clip.reshape(b, n1 * n2)], axis=-1),
+            dtype=torch.float64,
+        )
+        out = apply_t_score(values, baseline_idx=baseline_idx)
+        return out.detach().cpu().numpy().reshape(b, n1, n2)
+    if psnr.ndim != 2:
+        raise ValueError(f"psnr/clip must be 2D or 3D, got shape {psnr.shape}")
+    values = torch.as_tensor(np.stack([psnr.ravel(), clip.ravel()], axis=-1), dtype=torch.float64)
+    out = apply_t_score(values, baseline_idx=baseline_idx)
+    return out.detach().cpu().numpy().reshape(psnr.shape)
 
 
 def pairwise_ranking_loss(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
@@ -183,31 +210,6 @@ def pairwise_ranking_loss(pred: torch.Tensor, true: torch.Tensor) -> torch.Tenso
     if not mask.any():
         return pred.new_zeros(())
     return torch.nn.functional.softplus(-diff_pred[mask]).mean()
-
-
-def add_combined_score(
-    df: pd.DataFrame,
-    bounds: dict[str, tuple[float, float]],
-    *,
-    psnr_col: str | None = None,
-    clip_col: str | None = None,
-    out_col: str | None = None,
-    already_normalized: bool = False,
-) -> pd.Series:
-    s = _s()
-    if psnr_col is None:
-        psnr_col = s.PSNR_COL
-    if clip_col is None:
-        clip_col = s.CLIP_COL
-    if out_col is None:
-        out_col = s.T_TARGET_COL
-    score = scalarize(
-        df[psnr_col].to_numpy(dtype=float),
-        df[clip_col].to_numpy(dtype=float),
-        bounds,
-        already_normalized=already_normalized,
-    )
-    return pd.Series(score, index=df.index, name=out_col)
 
 
 def prep_sample_id(value) -> str:

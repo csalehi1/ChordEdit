@@ -36,7 +36,7 @@ from _data import (
     save_splits_df,
     split_df,
 )
-from _helpers import format_results, pairwise_ranking_loss, save_run_settings
+from _helpers import apply_t_score, format_results, pairwise_ranking_loss, save_run_settings
 from model_m import MetricPredictor
 from settings import *
 
@@ -151,10 +151,18 @@ def train(
             mse = torch.nn.functional.mse_loss(out, (y - mean) / std)
             loss = mse
             if use_ranking:
-                # Same T_TARGET_SCORE for true order and differentiable pred scores.
+                # Same apply_t_score (Δ then T_TARGET_SCORE) for true and pred order.
+                # SampleGridBatchSampler yields one sample's full grid per batch.
                 y_hat = model.regressor.denormalize(out)
-                true_m = T_TARGET_SCORE(y)
-                pred_m = T_TARGET_SCORE(y_hat)
+                base = (
+                    torch.isclose(t[:, 0], torch.as_tensor(DEFAULT_T_START, device=t.device, dtype=t.dtype))
+                    & torch.isclose(t[:, 1], torch.as_tensor(DEFAULT_T_END, device=t.device, dtype=t.dtype))
+                ).nonzero(as_tuple=False)
+                if base.numel() != 1:
+                    raise ValueError(f"Expected exactly one default-(t_start,t_end) row in batch, found {int(base.numel())}")
+                baseline_idx = int(base[0])
+                true_m = apply_t_score(y, baseline_idx=baseline_idx)
+                pred_m = apply_t_score(y_hat, baseline_idx=baseline_idx)
                 loss = loss + RANKING_LOSS_WEIGHT * pairwise_ranking_loss(pred_m, true_m)
             # Backpropagate the training loss.
             optimizer.zero_grad()
