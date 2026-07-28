@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from typing import Any
 
@@ -119,6 +120,13 @@ def calc_normalized(
     When False, each metric uses a single min/max over all non-metric
     dimensions.
 
+    NaN marks an unlabeled candidate (e.g. a sparse timestep grid). NaN cells
+    are excluded from the min/max — one missing cell cannot poison the rest of
+    the sample — and stay NaN in the output. NaN support is for scoring/eval
+    only: backprop through a NaN-sparse tensor yields NaN gradients (0 * NaN
+    in elementwise backwards), so training must use dense labeled-only
+    batches, as train_m's ranking loss does.
+
     values: (..., N, C)
     per_sample: bool = True
 
@@ -128,14 +136,16 @@ def calc_normalized(
         raise ValueError(f"values must be (..., N, C), got shape {tuple(values.shape)}")
 
     if per_sample:
-        # Independent range per sample along candidate axis N.
-        vmin = values.amin(dim=-2, keepdim=True)
-        vmax = values.amax(dim=-2, keepdim=True)
+        # Independent range per sample along candidate axis N. Torch has no
+        # nanmin/nanmax, so mask NaN with +/-inf sentinels that can never win
+        # the reduction.
+        vmin = values.nan_to_num(nan=math.inf).amin(dim=-2, keepdim=True)
+        vmax = values.nan_to_num(nan=-math.inf).amax(dim=-2, keepdim=True)
     else:
         # One global range per metric across every leading / candidate dim.
         reduce_dims = tuple(range(values.ndim - 1))
-        vmin = values.amin(dim=reduce_dims, keepdim=True)
-        vmax = values.amax(dim=reduce_dims, keepdim=True)
+        vmin = values.nan_to_num(nan=math.inf).amin(dim=reduce_dims, keepdim=True)
+        vmax = values.nan_to_num(nan=-math.inf).amax(dim=reduce_dims, keepdim=True)
 
     return (values - vmin) / (vmax - vmin + _EPS)
 
@@ -147,6 +157,9 @@ def calc_deltas(
     """
     Subtract the baseline (default) edit along the candidate axis.
 
+    Every delta is relative to the baseline, so a NaN (unlabeled) baseline
+    cell would silently invalidate the whole sample; raise instead.
+
     values: (..., N, C)
     baseline_idx: int or LongTensor matching values.shape[:-2]
 
@@ -154,7 +167,7 @@ def calc_deltas(
     """
     if values.ndim < 2:
         raise ValueError(f"values must be (..., N, C), got shape {tuple(values.shape)}")
-    
+
     def _gather_baseline(values: torch.Tensor, baseline_idx: int | torch.Tensor) -> torch.Tensor:
         if isinstance(baseline_idx, torch.Tensor):
             leading = values.shape[:-2]
@@ -167,7 +180,10 @@ def calc_deltas(
         i = int(baseline_idx)
         return values[..., i : i + 1, :]
 
-    return values - _gather_baseline(values, baseline_idx)
+    baseline = _gather_baseline(values, baseline_idx)
+    if torch.isnan(baseline).any():
+        raise ValueError("baseline (default) cell is NaN/unlabeled for at least one sample")
+    return values - baseline
 
 
 def calc_normalized_deltas(
@@ -188,6 +204,8 @@ def calc_normalized_deltas(
     improvement over the default and Delta_i < 0 a regression.
 
     Equivalent to calc_deltas(calc_normalized(values, per_sample=...), ...).
+    NaN (unlabeled) cells stay NaN without affecting labeled cells; the
+    baseline cell itself must be labeled (calc_deltas raises otherwise).
 
     values: (..., N, C)
     baseline_idx: int or LongTensor matching values.shape[:-2]

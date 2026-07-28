@@ -31,7 +31,6 @@ from PIL import Image
 from pipeline_chord import ChordEditPipeline, DEFAULT_COMPUTE_DTYPE
 from run_pie_bench import paths_from_model_root
 
-from _helpers import mean_pool
 from settings import *
 
 
@@ -86,6 +85,12 @@ def fourier_timestep_features(t: torch.Tensor, n_freqs: int = T_FOURIER_FREQS) -
         feats.append(torch.sin(freq * t))
         feats.append(torch.cos(freq * t))
     return torch.cat(feats, dim=-1)
+
+
+def mean_pool(last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Mask-weighted mean over the token dimension."""
+    mask = attention_mask.unsqueeze(-1).expand_as(last_hidden).float()
+    return (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
 
 
 def pairwise_ranking_loss(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
@@ -350,8 +355,8 @@ class MetricRegressor(nn.Module):
         t: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Combine image/mask/text embeddings into a single context vector.
-        text = combine_text_embeddings(src_emb, tar_emb)
-        context = torch.cat([self.img_proj(img_emb), self.mask_proj(mask_emb), self.text_proj(text)], dim=-1)
+        text_emb = combine_text_embeddings(src_emb, tar_emb)
+        context = torch.cat([self.img_proj(img_emb), self.mask_proj(mask_emb), self.text_proj(text_emb)], dim=-1)
         # Encode the timestep into a feature vector.
         t_feat = self.t_encoder(fourier_timestep_features(t))
         return context, t_feat
@@ -377,7 +382,7 @@ class MetricRegressor(nn.Module):
         return torch.cat([psnr, clip], dim=-1) # shape (N, 2)
 
     def denormalize(self, standardized: torch.Tensor) -> torch.Tensor:
-        """Map standardized predictions back to min-max normalized metric units."""
+        """Map standardized predictions back to raw metric units (PSNR / CLIP)."""
         return standardized * self.target_std + self.target_mean
 
 
@@ -459,7 +464,7 @@ class MetricPredictor(nn.Module):
         tar_emb: torch.Tensor,
         t: torch.Tensor,
     ) -> torch.Tensor:
-        """Predict (psnr, clip) in min-max normalized units from precomputed embeddings."""
+        """Predict (psnr, clip) in raw metric units from precomputed embeddings."""
         out = self.regressor(img_emb, mask_emb, src_emb, tar_emb, t)
         return self.regressor.denormalize(out)
 
@@ -473,11 +478,12 @@ class MetricPredictor(nn.Module):
         t_start: list[float],
         t_end: list[float],
     ) -> torch.Tensor:
-        """Predict (psnr, clip) in min-max normalized units for raw inputs."""
-        
-        # Set the model to evaluation mode.
+        """Predict (psnr, clip) in raw metric units for raw inputs."""
+
+        # Set the model to evaluation mode, remembering the current mode.
+        was_training = self.training
         self.eval()
-        
+
         device = self.regressor.target_mean.device
         img_emb = self.image_encoder(images).to(device)
         mask_emb = self.image_encoder(masks).to(device)
@@ -486,8 +492,8 @@ class MetricPredictor(nn.Module):
         t = torch.tensor(list(zip(t_start, t_end)), dtype=torch.float, device=device)
         
         out = self.predict_emb(img_emb, mask_emb, src_emb, tar_emb, t)
-        
-        # Set the model to training mode.
-        self.train(self.training)
-        
+
+        # Restore the mode the model was in before predict().
+        self.train(was_training)
+
         return out # shape (N, 2)

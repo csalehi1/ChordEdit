@@ -33,7 +33,7 @@ from _data import (
     load_df,
     model_inputs,
     prepare_df,
-    save_splits_df,
+    save_split_df,
     split_df,
 )
 from _helpers import save_run_settings
@@ -54,7 +54,7 @@ def evaluate(
     loader,
     device: torch.device | None = None,
 ) -> dict[str, float]:
-    """Per-target MAE/RMSE/R^2 in normalized metric units, plus standardized loss."""
+    """Per-target MAE/RMSE/R^2 in raw metric units, plus z-scored MSE loss."""
     
     if device is None:
         device = next(model.regressor.parameters()).device
@@ -124,7 +124,7 @@ def train(
     # Normalize the targets if specified.
     if NORMALIZE_TARGETS:
         # Store train mean/std so MSE is computed in z-scored space.
-        # Will map predictions back to min-max [0,1] units for ranking/eval.
+        # denormalize maps predictions back to raw metric units for ranking/eval.
         model.regressor.set_target_stats(y_train.mean(0), y_train.std(0))
     print(
         "Target columns (train):  "
@@ -221,7 +221,7 @@ def train(
     print(f"\n    {'Test:':<6} {format_results(results)}")
 
     # Save the splits and metrics.
-    save_splits_df(train_X, val_X, test_X, run_dir)
+    save_split_df(train_X, val_X, test_X, run_dir)
     metrics_out = run_dir / "m_train_metrics.json"
     with open(metrics_out, "w") as f:
         json.dump({"val_best_loss": best_val, "test": results}, f, indent=4)

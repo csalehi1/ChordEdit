@@ -18,10 +18,6 @@ SETTINGS_FILENAME = "settings.py"
 _PACKAGE_DIR = Path(__file__).resolve().parent
 _LIVE_SETTINGS = _PACKAGE_DIR / SETTINGS_FILENAME
 
-_EPS = 1e-8
-
-
-# --- Run settings -----------------------------------------------------------------
 
 def _s():
     """Current settings module (live or per-run snapshot in sys.modules)."""
@@ -78,16 +74,6 @@ def resolve_run_dir(outputs_dir: Path, run_dir: Path | None = None) -> Path:
     return candidates[-1]
 
 
-# --- Model tensors ----------------------------------------------------------------
-
-def mean_pool(last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    """Mask-weighted mean over the token dimension."""
-    mask = attention_mask.unsqueeze(-1).expand_as(last_hidden).float()
-    return (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
-
-
-# --- Device / reporting / loss ----------------------------------------------------
-
 def resolve_device(gpu: int | str | None = None) -> torch.device:
     """None -> cuda:0 if available else cpu; int -> cuda:N; \"cpu\" -> cpu."""
     if gpu is None:
@@ -97,33 +83,23 @@ def resolve_device(gpu: int | str | None = None) -> torch.device:
     return torch.device(f"cuda:{int(gpu)}")
 
 
-# --- Targets + T score ------------------------------------------------------------
-
-def normalize_target_columns(
-    y_df: pd.DataFrame,
-    bounds: dict[str, tuple[float, float]] | None = None,
-) -> pd.DataFrame:
-    y_df = y_df.copy()
-    for col in _s().M_TARGET_COLS:
-        if bounds is None:
-            col_min, col_max = np.nanmin(y_df[col]), np.nanmax(y_df[col])
-        else:
-            col_min, col_max = bounds[col]
-        y_df[col] = (y_df[col] - col_min) / (col_max - col_min + _EPS)
-    return y_df
-
-
-def unnormalize_metric_arrays(
-    psnr: np.ndarray,
-    clip: np.ndarray,
-    bounds: dict[str, tuple[float, float]],
-) -> tuple[np.ndarray, np.ndarray]:
+def grid_axes_from_df(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """Sorted unique (t_start, t_end) grid axes."""
     s = _s()
-    psnr_min, psnr_max = bounds[s.PSNR_COL]
-    clip_min, clip_max = bounds[s.CLIP_COL]
     return (
-        psnr * (psnr_max - psnr_min + _EPS) + psnr_min,
-        clip * (clip_max - clip_min + _EPS) + clip_min,
+        np.sort(np.asarray(df[s.T_START_COL].unique())),
+        np.sort(np.asarray(df[s.T_END_COL].unique())),
+    )
+
+
+def timestep_pairs_from_df(df: pd.DataFrame) -> np.ndarray:
+    """Unique (t_start, t_end) pairs in df, shape (N, 2), sorted."""
+    s = _s()
+    return (
+        df.loc[:, [s.T_START_COL, s.T_END_COL]]
+        .drop_duplicates()
+        .sort_values([s.T_START_COL, s.T_END_COL])
+        .to_numpy(dtype=np.float64)
     )
 
 
@@ -140,33 +116,38 @@ def t_target_score_values(
     return _s().T_TARGET_SCORE(deltas)
 
 
-def scalarize(
-    psnr: np.ndarray,
-    clip: np.ndarray,
-    bounds: dict[str, tuple[float, float]] | None = None,
-    *,
-    already_normalized: bool = False,
-    baseline_idx: int,
-) -> np.ndarray:
-    """Combine PSNR and CLIP via apply_t_score (preserves input shape)."""
-    psnr = np.asarray(psnr, dtype=float)
-    clip = np.asarray(clip, dtype=float)
-    if psnr.shape != clip.shape:
-        raise ValueError(f"psnr/clip shape mismatch: {psnr.shape} vs {clip.shape}")
-    if not already_normalized and bounds is not None:
-        s = _s()
-        psnr = (psnr - bounds[s.PSNR_COL][0]) / (bounds[s.PSNR_COL][1] - bounds[s.PSNR_COL][0] + _EPS)
-        clip = (clip - bounds[s.CLIP_COL][0]) / (bounds[s.CLIP_COL][1] - bounds[s.CLIP_COL][0] + _EPS)
-    if psnr.ndim == 3:
-        b, n1, n2 = psnr.shape
-        values = torch.as_tensor(
-            np.stack([psnr.reshape(b, n1 * n2), clip.reshape(b, n1 * n2)], axis=-1),
-            dtype=torch.float64,
-        )
-        out = t_target_score_values(values, baseline_idx=baseline_idx)
-        return out.detach().cpu().numpy().reshape(b, n1, n2)
-    if psnr.ndim != 2:
-        raise ValueError(f"psnr/clip must be 2D or 3D, got shape {psnr.shape}")
-    values = torch.as_tensor(np.stack([psnr.ravel(), clip.ravel()], axis=-1), dtype=torch.float64)
-    out = t_target_score_values(values, baseline_idx=baseline_idx)
-    return out.detach().cpu().numpy().reshape(psnr.shape)
+# def scalarize(
+#     psnr: np.ndarray,
+#     clip: np.ndarray,
+#     *,
+#     baseline_idx: int,
+# ) -> np.ndarray:
+#     """Combine PSNR and CLIP via per-sample Δ scoring (preserves input shape).
+
+#     Accepts raw metric units: calc_normalized_deltas applies per-sample range
+#     normalization, which is invariant to any global affine rescaling of the
+#     inputs, so no prior min-max is needed. NaN cells (unlabeled grid points)
+#     stay NaN without affecting labeled cells.
+
+#     3D input is a stack of per-sample grids (n_samples, n1, n2), each sample
+#     normalized over its own grid. 2D input is interpreted as ONE sample's
+#     (n1, n2) grid — never pass a (n_samples, N) stack as 2D, or the whole
+#     stack is normalized as a single sample with one shared baseline row.
+#     """
+#     psnr = np.asarray(psnr, dtype=float)
+#     clip = np.asarray(clip, dtype=float)
+#     if psnr.shape != clip.shape:
+#         raise ValueError(f"psnr/clip shape mismatch: {psnr.shape} vs {clip.shape}")
+#     if psnr.ndim == 3:
+#         b, n1, n2 = psnr.shape
+#         values = torch.as_tensor(
+#             np.stack([psnr.reshape(b, n1 * n2), clip.reshape(b, n1 * n2)], axis=-1),
+#             dtype=torch.float64,
+#         )
+#         out = t_target_score_values(values, baseline_idx=baseline_idx)
+#         return out.detach().cpu().numpy().reshape(b, n1, n2)
+#     if psnr.ndim != 2:
+#         raise ValueError(f"psnr/clip must be 2D or 3D, got shape {psnr.shape}")
+#     values = torch.as_tensor(np.stack([psnr.ravel(), clip.ravel()], axis=-1), dtype=torch.float64)
+#     out = t_target_score_values(values, baseline_idx=baseline_idx)
+#     return out.detach().cpu().numpy().reshape(psnr.shape)

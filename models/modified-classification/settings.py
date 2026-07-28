@@ -128,7 +128,7 @@ T model settings.
 """
 
 # Scalar objective for timestep selection and M ranking loss.
-# T_TARGET_SCORE takes per-sample normalized deltas Δ; see scores.normalized_score_deltas.
+# T_TARGET_SCORE takes per-sample normalized deltas Δ; see scores.calc_normalized_deltas.
 _T_SCORE_KW = dict(alpha=2.0)
 T_TARGET_SCORE = partial(linex_score, **_T_SCORE_KW)  # Torch phi(Δ)
 T_TARGET_SCORE_DF = partial(score_df, score_fn=linex_score, **_T_SCORE_KW)  # DataFrame
