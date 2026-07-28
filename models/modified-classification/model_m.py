@@ -25,14 +25,19 @@ import torch
 import torch.nn as nn
 from PIL import Image
 
-# ChordEdit provides the same VAE / text stack used at edit time, so M's
+# ChordEdit provides the same VAE/text stack used at edit time, so M's
 # embeddings stay consistent with the metrics collected from ChordEdit grids.
 # paths_from_model_root resolves SD-Turbo component dirs under SD_TURBO_ROOT.
 from pipeline_chord import ChordEditPipeline, DEFAULT_COMPUTE_DTYPE
 from run_pie_bench import paths_from_model_root
 
-from _helpers import combine_text_embeddings, mean_pool
+from _helpers import mean_pool
 from settings import *
+
+
+def combine_text_embeddings(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Concat, difference, and Hadamard product of an embedding pair (4 * dim)."""
+    return torch.cat([a, b, a - b, a * b], dim=-1)
 
 
 def encode_text_pooled(pipeline: ChordEditPipeline, prompts: list[str]) -> torch.Tensor:
@@ -63,8 +68,18 @@ def encode_text_pooled(pipeline: ChordEditPipeline, prompts: list[str]) -> torch
     return mean_pool(hidden, attn_mask).to(device=device, dtype=pipeline._compute_dtype)
 
 
+def format_results(m: dict[str, float]) -> str:
+    """Fixed-width metric line so Train/Val columns stay aligned."""
+    return f"loss={m['loss']:7.4f}  " + "  ".join(
+        f"{col}: MAE={m[f'mae_{col}']:6.3f} R2={m[f'r2_{col}']:7.3f}"
+        for col in M_TARGET_COLS
+    )
+
+
 def fourier_timestep_features(t: torch.Tensor, n_freqs: int = T_FOURIER_FREQS) -> torch.Tensor:
     """Encode (t_start, t_end) with raw values, their product, and sin/cos bands."""
+    # The Fourier bands allow the model to capture both coarse and
+    # fine-grained temporal relationships.
     feats: list[torch.Tensor] = [t, (t[:, 0:1] * t[:, 1:2])]
     for k in range(n_freqs):
         freq = (2.0**k) * math.pi
@@ -73,61 +88,21 @@ def fourier_timestep_features(t: torch.Tensor, n_freqs: int = T_FOURIER_FREQS) -
     return torch.cat(feats, dim=-1)
 
 
-class FiLM(nn.Module):
-    """Feature-wise linear modulation from a conditioning vector."""
-
-    def __init__(self, feature_dim: int, cond_dim: int):
-        super().__init__()
-        self.to_gamma = nn.Linear(cond_dim, feature_dim)
-        self.to_beta = nn.Linear(cond_dim, feature_dim)
-        nn.init.zeros_(self.to_gamma.weight)
-        nn.init.ones_(self.to_gamma.bias)
-        nn.init.zeros_(self.to_beta.weight)
-        nn.init.zeros_(self.to_beta.bias)
-
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        return self.to_gamma(cond) * x + self.to_beta(cond)
+def pairwise_ranking_loss(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
+    """Logistic pairwise loss: penalize pred ordering that disagrees with true."""
+    if pred.shape[0] < 2:
+        return pred.new_zeros(())
+    diff_true = true.unsqueeze(1) - true.unsqueeze(0)
+    diff_pred = pred.unsqueeze(1) - pred.unsqueeze(0)
+    mask = diff_true > 0
+    if not mask.any():
+        return pred.new_zeros(())
+    return torch.nn.functional.softplus(-diff_pred[mask]).mean()
 
 
-class FiLMBlock(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, cond_dim: int, dropout_rate: float):
-        super().__init__()
-        self.linear = nn.Linear(in_dim, out_dim)
-        self.norm = nn.LayerNorm(out_dim)
-        self.film = FiLM(out_dim, cond_dim)
-        self.dropout = nn.Dropout(dropout_rate)
-
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        h = self.film(self.norm(self.linear(x)), cond)
-        h = torch.relu(h)
-        return self.dropout(h)
-
-
-class FiLMMLPBody(nn.Module):
-    """MLP body where each hidden layer is modulated by timestep embeddings."""
-
-    def __init__(
-        self,
-        in_features: int,
-        cond_dim: int,
-        n_wide: int,
-        n_hidden: int,
-        n_inner: int,
-        dropout_rate: float,
-    ):
-        super().__init__()
-        self.blocks = nn.ModuleList(
-            [
-                FiLMBlock(in_features, n_wide, cond_dim, dropout_rate),
-                FiLMBlock(n_wide, n_hidden, cond_dim, dropout_rate),
-                FiLMBlock(n_hidden, n_inner, cond_dim, dropout_rate),
-            ]
-        )
-
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        for block in self.blocks:
-            x = block(x, cond)
-        return x
+"""
+ChordEdit encoders.
+"""
 
 
 class TextEncoder(nn.Module):
@@ -182,8 +157,131 @@ class VaeImageEncoder(nn.Module):
         return encoded.flatten(start_dim=1)
 
 
+"""
+CLIP-Edited.
+"""
+
+
+class FiLM(nn.Module):
+    """Feature-wise linear modulation from a conditioning vector."""
+
+    def __init__(self, feature_dim: int, cond_dim: int):
+        super().__init__()
+        # The condition initially has no effect on the feature: forward
+        # returns 1*x+0=x. As training progresses, gradients flowing
+        # into to_gamma.weight and to_beta.weight gradually teach it how
+        # to use the condition. This is for stability.
+        self.to_gamma = nn.Linear(cond_dim, feature_dim)
+        self.to_beta = nn.Linear(cond_dim, feature_dim)
+        nn.init.zeros_(self.to_gamma.weight)
+        nn.init.ones_(self.to_gamma.bias) # \gamma starts as all 1s
+        nn.init.zeros_(self.to_beta.weight)
+        nn.init.zeros_(self.to_beta.bias) # \beta starts as all 0s
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        # Apply the FiLM modulation to the input.
+        return self.to_gamma(cond) * x + self.to_beta(cond)
+
+
+class FiLMBlock(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, cond_dim: int, dropout_rate: float):
+        super().__init__()
+        self.linear = nn.Linear(in_dim, out_dim)
+        self.norm = nn.LayerNorm(out_dim)
+        self.film = FiLM(out_dim, cond_dim)
+        self.dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        h = self.film(self.norm(self.linear(x)), cond)
+        h = torch.relu(h)
+        return self.dropout(h)
+
+
+class FiLMMLPBody(nn.Module):
+    """MLP body where each hidden layer is modulated by timestep embeddings."""
+
+    def __init__(
+        self,
+        in_features: int,
+        cond_dim: int,
+        n_wide: int,
+        n_hidden: int,
+        n_inner: int,
+        dropout_rate: float,
+    ):
+        super().__init__()
+        # Three FiLM blocks with ReLU activations and dropout serve as
+        # the overall MLP for CLIP-Edited.
+        self.blocks = nn.ModuleList(
+            [
+                FiLMBlock(in_features, n_wide, cond_dim, dropout_rate),
+                FiLMBlock(n_wide, n_hidden, cond_dim, dropout_rate),
+                FiLMBlock(n_hidden, n_inner, cond_dim, dropout_rate),
+            ]
+        )
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        # Iterate through the blocks, applying the FiLM modulation to the input.
+        for block in self.blocks:
+            x = block(x, cond)
+        return x
+
+
+"""
+PSNR-Unedited
+"""
+
+
+class MLPBlock(nn.Module):
+    """Plain MLP layer (no FiLM): Linear → LayerNorm → ReLU → Dropout."""
+
+    def __init__(self, in_dim: int, out_dim: int, dropout_rate: float):
+        super().__init__()
+        self.linear = nn.Linear(in_dim, out_dim)
+        self.norm = nn.LayerNorm(out_dim)
+        self.dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = torch.relu(self.norm(self.linear(x)))
+        return self.dropout(h)
+
+
+class MLPBody(nn.Module):
+    """MLP body for PSNR-Unedited (timesteps concatenated into the input, not FiLM'd)."""
+
+    def __init__(
+        self,
+        in_features: int,
+        n_wide: int,
+        n_hidden: int,
+        n_inner: int,
+        dropout_rate: float,
+    ):
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            [
+                MLPBlock(in_features, n_wide, dropout_rate),
+                MLPBlock(n_wide, n_hidden, dropout_rate),
+                MLPBlock(n_hidden, n_inner, dropout_rate),
+            ]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
+        return x
+
+
+"""
+Shared metric predictor components.
+"""
+
+
 class MetricRegressor(nn.Module):
-    """PSNR MLP tower + FiLM-conditioned CLIP tower over bottlenecked embeddings."""
+    """
+    PSNR-Unedited MLP tower and CLIP-Edited FiLM-conditioned MLP
+    tower over bottlenecked embeddings and timestep conditioning.
+    """
 
     def __init__(
         self,
@@ -204,6 +302,7 @@ class MetricRegressor(nn.Module):
         if n_targets != 2:
             raise ValueError("MetricRegressor expects exactly two targets (psnr, clip)")
 
+        # Project the embeddings to the MLP input dimension.
         self.img_proj = nn.Sequential(
             nn.Linear(img_dim, img_proj_dim),
             nn.LayerNorm(img_proj_dim),
@@ -219,47 +318,30 @@ class MetricRegressor(nn.Module):
             nn.LayerNorm(text_proj_dim),
             nn.ReLU(),
         )
-        t_in = 3 + 4 * t_fourier_freqs
+
+        # Timestep encoder takes Fourier features instead of raw t.
+        t_in, t_out = 3 + 4 * t_fourier_freqs, t_proj_dim * 2
         self.t_encoder = nn.Sequential(
-            nn.Linear(t_in, t_proj_dim * 2),
+            nn.Linear(t_in, t_out),
             nn.ReLU(),
-            nn.Linear(t_proj_dim * 2, t_proj_dim),
+            nn.Linear(t_out, t_proj_dim),
             nn.ReLU(),
         )
 
-        context_dim = img_proj_dim * 2 + text_proj_dim
-        psnr_in = context_dim + t_proj_dim
-        self.psnr_body = self._make_body(psnr_in, n_wide, n_hidden, n_inner, dropout_rate)
+        # PSNR-Unedited MLP body and head.
+        psnr_in = img_proj_dim * 2 + text_proj_dim + t_proj_dim
+        self.psnr_body = MLPBody(psnr_in, n_wide, n_hidden, n_inner, dropout_rate)
         self.psnr_head = nn.Linear(n_inner, 1)
-        self.clip_body = FiLMMLPBody(
-            context_dim, t_proj_dim, n_wide, n_hidden, n_inner, clip_dropout_rate
-        )
+
+        # CLIP-Edited FiLM-conditioned MLP body and head.
+        clip_in = img_proj_dim * 2 + text_proj_dim
+        self.clip_body = FiLMMLPBody(clip_in, t_proj_dim, n_wide, n_hidden, n_inner, clip_dropout_rate)
         self.clip_head = nn.Linear(n_inner, 1)
 
         self.register_buffer("target_mean", torch.zeros(n_targets))
         self.register_buffer("target_std", torch.ones(n_targets))
 
-    @staticmethod
-    def _make_body(
-        in_features: int,
-        n_wide: int,
-        n_hidden: int,
-        n_inner: int,
-        dropout_rate: float,
-    ) -> nn.Sequential:
-        return nn.Sequential(
-            nn.Linear(in_features, n_wide),
-            nn.LayerNorm(n_wide),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(n_wide, n_hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(n_hidden, n_inner),
-            nn.ReLU(),
-        )
-
-    def _context_and_t(
+    def _get_inputs(
         self,
         img_emb: torch.Tensor,
         mask_emb: torch.Tensor,
@@ -267,11 +349,10 @@ class MetricRegressor(nn.Module):
         tar_emb: torch.Tensor,
         t: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Combine image/mask/text embeddings into a single context vector.
         text = combine_text_embeddings(src_emb, tar_emb)
-        context = torch.cat(
-            [self.img_proj(img_emb), self.mask_proj(mask_emb), self.text_proj(text)],
-            dim=-1,
-        )
+        context = torch.cat([self.img_proj(img_emb), self.mask_proj(mask_emb), self.text_proj(text)], dim=-1)
+        # Encode the timestep into a feature vector.
         t_feat = self.t_encoder(fourier_timestep_features(t))
         return context, t_feat
 
@@ -288,11 +369,12 @@ class MetricRegressor(nn.Module):
         tar_emb: torch.Tensor,
         t: torch.Tensor,
     ) -> torch.Tensor:
-        """Return standardized metric predictions, shape (N, 2) — [psnr, clip]."""
-        context, t_feat = self._context_and_t(img_emb, mask_emb, src_emb, tar_emb, t)
+        """Return standardized metric predictions."""
+        context, t_feat = self._get_inputs(img_emb, mask_emb, src_emb, tar_emb, t)
+        # Predcit PSNR and CLIP from the context and timestep feature.
         psnr = self.psnr_head(self.psnr_body(torch.cat([context, t_feat], dim=-1)))
         clip = self.clip_head(self.clip_body(context, t_feat))
-        return torch.cat([psnr, clip], dim=-1)
+        return torch.cat([psnr, clip], dim=-1) # shape (N, 2)
 
     def denormalize(self, standardized: torch.Tensor) -> torch.Tensor:
         """Map standardized predictions back to min-max normalized metric units."""
@@ -300,7 +382,7 @@ class MetricRegressor(nn.Module):
 
 
 class MetricPredictor(nn.Module):
-    """Bundles ChordEdit encoders with the trainable metric regressor M."""
+    """Bundles ChordEdit encoders with MetricRegressor."""
 
     def __init__(
         self,
@@ -345,7 +427,7 @@ class MetricPredictor(nn.Module):
     def release_encoders(self) -> None:
         """Free VAE/text pipeline after embeddings are precomputed."""
         # Drop frozen SD encoders from GPU once embeddings exist so
-        # training only keeps the small regressor on device.
+        # that training only keeps the small regressor on device.
         import gc
 
         if "image_encoder" in self._modules:
@@ -369,7 +451,7 @@ class MetricPredictor(nn.Module):
         tar_emb = self.text_encoder([tar_prompt]).to(device)
         return img_emb, mask_emb, src_emb, tar_emb
 
-    def predict_metrics_from_emb(
+    def predict_emb(
         self,
         img_emb: torch.Tensor,
         mask_emb: torch.Tensor,
@@ -392,15 +474,20 @@ class MetricPredictor(nn.Module):
         t_end: list[float],
     ) -> torch.Tensor:
         """Predict (psnr, clip) in min-max normalized units for raw inputs."""
-        training = self.training
+        
+        # Set the model to evaluation mode.
         self.eval()
+        
         device = self.regressor.target_mean.device
         img_emb = self.image_encoder(images).to(device)
         mask_emb = self.image_encoder(masks).to(device)
         src_emb = self.text_encoder(src_prompts).to(device)
         tar_emb = self.text_encoder(tar_prompts).to(device)
-        # Combine the two timestep scalars into a single tensor.
         t = torch.tensor(list(zip(t_start, t_end)), dtype=torch.float, device=device)
-        out = self.predict_metrics_from_emb(img_emb, mask_emb, src_emb, tar_emb, t)
-        self.train(training)
-        return out
+        
+        out = self.predict_emb(img_emb, mask_emb, src_emb, tar_emb, t)
+        
+        # Set the model to training mode.
+        self.train(self.training)
+        
+        return out # shape (N, 2)

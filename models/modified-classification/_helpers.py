@@ -86,11 +86,6 @@ def mean_pool(last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.
     return (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
 
 
-def combine_text_embeddings(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Concat, difference, and Hadamard product of an embedding pair."""
-    return torch.cat([a, b, a - b, a * b], dim=-1)
-
-
 # --- Device / reporting / loss ----------------------------------------------------
 
 def resolve_device(gpu: int | str | None = None) -> torch.device:
@@ -102,40 +97,20 @@ def resolve_device(gpu: int | str | None = None) -> torch.device:
     return torch.device(f"cuda:{int(gpu)}")
 
 
-def format_results(m: dict[str, float]) -> str:
-    """Fixed-width metric line so Train/Val columns stay aligned."""
-    return f"loss={m['loss']:7.4f}  " + "  ".join(
-        f"{col}: MAE={m[f'mae_{col}']:6.3f} R2={m[f'r2_{col}']:7.3f}"
-        for col in _s().M_TARGET_COLS
-    )
-
-
-def pairwise_ranking_loss(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
-    """Logistic pairwise loss: penalize pred ordering that disagrees with true."""
-    if pred.shape[0] < 2:
-        return pred.new_zeros(())
-    diff_true = true.unsqueeze(1) - true.unsqueeze(0)
-    diff_pred = pred.unsqueeze(1) - pred.unsqueeze(0)
-    mask = diff_true > 0
-    if not mask.any():
-        return pred.new_zeros(())
-    return torch.nn.functional.softplus(-diff_pred[mask]).mean()
-
-
 # --- Targets + T score ------------------------------------------------------------
 
 def normalize_target_columns(
-    y: pd.DataFrame,
+    y_df: pd.DataFrame,
     bounds: dict[str, tuple[float, float]] | None = None,
 ) -> pd.DataFrame:
-    y = y.copy()
+    y_df = y_df.copy()
     for col in _s().M_TARGET_COLS:
         if bounds is None:
-            col_min, col_max = np.nanmin(y[col]), np.nanmax(y[col])
+            col_min, col_max = np.nanmin(y_df[col]), np.nanmax(y_df[col])
         else:
             col_min, col_max = bounds[col]
-        y[col] = (y[col] - col_min) / (col_max - col_min + _EPS)
-    return y
+        y_df[col] = (y_df[col] - col_min) / (col_max - col_min + _EPS)
+    return y_df
 
 
 def unnormalize_metric_arrays(
@@ -160,8 +135,8 @@ def t_target_score_values(
 
     values: (..., N, C). Returns scores shaped (..., N).
     """
-    from scores import normalize_score_deltas
-    deltas = normalize_score_deltas(values, baseline_idx)
+    from scores import calc_normalized_deltas
+    deltas = calc_normalized_deltas(values, baseline_idx)
     return _s().T_TARGET_SCORE(deltas)
 
 

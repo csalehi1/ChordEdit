@@ -36,9 +36,9 @@ from _data import (
     save_splits_df,
     split_df,
 )
-from _helpers import format_results, pairwise_ranking_loss, save_run_settings
-from scores import normalize_score_deltas
-from model_m import MetricPredictor
+from _helpers import save_run_settings
+from scores import calc_normalized_deltas
+from model_m import MetricPredictor, format_results, pairwise_ranking_loss
 from settings import *
 
 
@@ -54,7 +54,7 @@ def evaluate(
     loader,
     device: torch.device | None = None,
 ) -> dict[str, float]:
-    """Per-target MAE/RMSE/R² in normalized metric units, plus standardized loss."""
+    """Per-target MAE/RMSE/R^2 in normalized metric units, plus standardized loss."""
     
     if device is None:
         device = next(model.regressor.parameters()).device
@@ -137,7 +137,7 @@ def train(
 
     # Initialize the optimizer.
     optimizer = torch.optim.AdamW(model.regressor.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    mean, std = model.regressor.target_mean, model.regressor.target_std
+    y_mean, y_std = model.regressor.target_mean, model.regressor.target_std
 
     # Train the model.
     weights_out = run_dir / "regressor_weights.pt"
@@ -160,7 +160,7 @@ def train(
             out = model.regressor(img, mask, src, tar, t)
 
             # Standardize targets in z-scored space for MSE loss.
-            mse = torch.nn.functional.mse_loss(out, (y - mean) / std)
+            mse = torch.nn.functional.mse_loss(out, (y - y_mean) / y_std)
             loss = mse
 
             # If specified, use per-sample ranking loss.
@@ -177,11 +177,11 @@ def train(
                 baseline_idx = int(base_mask[0])
                 
                 # Calculate the true and predicted metrics.
-                true_delta = normalize_score_deltas(y, baseline_idx)
-                pred_delta = normalize_score_deltas(y_hat, baseline_idx)
-                true_m = T_TARGET_SCORE(true_delta)
-                pred_m = T_TARGET_SCORE(pred_delta)
-                loss = loss + RANKING_LOSS_WEIGHT * pairwise_ranking_loss(pred_m, true_m)
+                true_delta = calc_normalized_deltas(y, baseline_idx)
+                pred_delta = calc_normalized_deltas(y_hat, baseline_idx)
+                true_phi = T_TARGET_SCORE(true_delta)
+                pred_phi = T_TARGET_SCORE(pred_delta)
+                loss = loss + RANKING_LOSS_WEIGHT * pairwise_ranking_loss(pred_phi, true_phi)
             
             # Backpropagate the training loss.
             optimizer.zero_grad()
@@ -233,15 +233,14 @@ def main() -> None:
 
     # Parse arguments. NOTE: Currently unused.
     args = parse_args()
-    skip_model = args.skip_model
     
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
     # For data: load, prepare, and split into train/val/test sets.
     data_df = load_df()
-    X, y = prepare_df(data_df)
-    train_X, val_X, test_X, train_y, val_y, test_y = split_df(X, y)
+    X_df, y_df = prepare_df(data_df)
+    train_X, val_X, test_X, train_y, val_y, test_y = split_df(X_df, y_df)
     print(
         f"Splits: train={len(train_X)} cells ({train_X[SAMPLE_ID_COL].nunique()} samples)  "
         f"val={len(val_X)} cells ({val_X[SAMPLE_ID_COL].nunique()} samples)  "

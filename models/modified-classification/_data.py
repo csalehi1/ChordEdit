@@ -206,22 +206,22 @@ def load_df(metrics_csv: Path | None = None, inputs_csv: Path | None = None) -> 
 def prepare_df(data_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Split a loaded table into X and min-max normalized y."""
     bounds = target_bounds(data_df)
-    X = data_df.drop(columns=list(M_TARGET_COLS)).copy()
+    X_df = data_df.drop(columns=list(M_TARGET_COLS)).copy()
     y_raw: pd.DataFrame = data_df.loc[:, list(M_TARGET_COLS)]
     # Min-max so PSNR/CLIP share [0, 1] before ranking; MSE still z-scores later.
     y = normalize_target_columns(y_raw, bounds=bounds)
-    return X, y
+    return X_df, y
 
 
 def split_df(
-    X: pd.DataFrame,
-    y: pd.DataFrame,
+    X_df: pd.DataFrame,
+    y_df: pd.DataFrame,
     *,
     seed: int = SEED,
     train_frac: float = TRAIN_FRAC,
     val_frac: float = VAL_FRAC,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Split X and y by sample_id into train/val/test sets."""
+    """Split the dataframes by SAMPLE_ID_COL into train/val/test and X/y dataframes."""
 
     def split_df_by_sample(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         sample_ids = np.sort(np.asarray(df[SAMPLE_ID_COL].unique()))
@@ -242,8 +242,8 @@ def split_df(
         test = df.loc[np.isin(sample_col, test_ids)].reset_index(drop=True)
         return train, val, test
 
-    combined = pd.concat([X.reset_index(drop=True), y.reset_index(drop=True)], axis=1)
-    train, val, test = split_df_by_sample(combined)
+    Xy_df = pd.concat([X_df.reset_index(drop=True), y_df.reset_index(drop=True)], axis=1)
+    train, val, test = split_df_by_sample(Xy_df)
     target_cols = list(M_TARGET_COLS)
     return (
         train.drop(columns=target_cols),

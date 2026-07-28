@@ -108,52 +108,94 @@ def linex_score(
     return 0.5 * (combined * weights).sum(dim=-1)
 
 
-def normalize_score_deltas(
+def calc_normalized(
     values: torch.Tensor,
-    baseline_idx: int | torch.Tensor,
+    *,
+    per_sample: bool = True,
 ) -> torch.Tensor:
     """
-    Per-sample-normalized score deltas relative to a default edit. 
-    Because metrics live on different scales, scoring uses deltas
-
-        Delta_i = (s_i - s_i^0) / (max_T s_i - min_T s_i)
-
-    where min/max are over the same sample's candidate edits T, and s_i^0 is
-    the baseline (default) edit. When the per-metric range is positive,
-    Delta_i is in [-1, 1]; Delta_i > 0 is an improvement over the default and
-    Delta_i < 0 a regression.
+    Min-max normalize metric columns. If per_sample is True (default),
+    each leading sample is scaled independently over its N candidates.
+    When False, each metric uses a single min/max over all non-metric
+    dimensions.
 
     values: (..., N, C)
-    baseline_idx: (N,) or int
+    per_sample: bool = True
 
     Returns: (..., N, C)
     """
     if values.ndim < 2:
         raise ValueError(f"values must be (..., N, C), got shape {tuple(values.shape)}")
 
-    # Apply amin/amax over N. Find per-sample min and max.
-    vmin = values.amin(dim=-2, keepdim=True)
-    vmax = values.amax(dim=-2, keepdim=True)
-    denom = vmax - vmin + _EPS
-
-    # Handle the case of a tensor baseline_idx.
-    if isinstance(baseline_idx, torch.Tensor):
-        n = values.shape[:-2]
-        if tuple(baseline_idx.shape) != tuple(n):
-            raise ValueError(f"baseline_idx shape {tuple(baseline_idx.shape)} != {tuple(n)}")
-
-        # Gather along N. Expands to (..., 1, C) without Python loops.
-        c = values.shape[-1]
-        idx = baseline_idx.to(dtype=torch.long, device=values.device)
-        idx = idx.unsqueeze(-1).unsqueeze(-1).expand(*n, 1, c)
-        s0 = torch.gather(values, dim=-2, index=idx)
-    
-    # Handle the case of an int baseline_idx.
+    if per_sample:
+        # Independent range per sample along candidate axis N.
+        vmin = values.amin(dim=-2, keepdim=True)
+        vmax = values.amax(dim=-2, keepdim=True)
     else:
-        idx = int(baseline_idx)
-        s0 = values[..., idx : idx + 1, :]
+        # One global range per metric across every leading / candidate dim.
+        reduce_dims = tuple(range(values.ndim - 1))
+        vmin = values.amin(dim=reduce_dims, keepdim=True)
+        vmax = values.amax(dim=reduce_dims, keepdim=True)
 
-    return (values - s0) / denom
+    return (values - vmin) / (vmax - vmin + _EPS)
+
+
+def calc_deltas(
+    values: torch.Tensor,
+    baseline_idx: int | torch.Tensor,
+) -> torch.Tensor:
+    """
+    Subtract the baseline (default) edit along the candidate axis.
+
+    values: (..., N, C)
+    baseline_idx: int or LongTensor matching values.shape[:-2]
+
+    Returns: (..., N, C) with baseline rows at 0.
+    """
+    if values.ndim < 2:
+        raise ValueError(f"values must be (..., N, C), got shape {tuple(values.shape)}")
+    
+    def _gather_baseline(values: torch.Tensor, baseline_idx: int | torch.Tensor) -> torch.Tensor:
+        if isinstance(baseline_idx, torch.Tensor):
+            leading = values.shape[:-2]
+            if tuple(baseline_idx.shape) != tuple(leading):
+                raise ValueError(f"baseline_idx shape {tuple(baseline_idx.shape)} must match {tuple(leading)}")
+            c = values.shape[-1]
+            idx = baseline_idx.to(dtype=torch.long, device=values.device)
+            idx = idx.unsqueeze(-1).unsqueeze(-1).expand(*leading, 1, c)
+            return torch.gather(values, dim=-2, index=idx)
+        i = int(baseline_idx)
+        return values[..., i : i + 1, :]
+
+    return values - _gather_baseline(values, baseline_idx)
+
+
+def calc_normalized_deltas(
+    values: torch.Tensor,
+    baseline_idx: int | torch.Tensor,
+    *,
+    per_sample: bool = True,
+) -> torch.Tensor:
+    """
+    Per-sample-normalized score deltas relative to a default edit.
+    Because metrics live on different scales, scoring uses deltas
+
+        Delta_i = (s_i - s_i^0) / (max_T s_i - min_T s_i)
+
+    where min/max are over the same sample's candidate edits T when
+    per_sample=True, and s_i^0 is the baseline (default) edit. When the
+    per-metric range is positive, Delta_i is in [-1, 1]; Delta_i > 0 is an
+    improvement over the default and Delta_i < 0 a regression.
+
+    Equivalent to calc_deltas(calc_normalized(values, per_sample=...), ...).
+
+    values: (..., N, C)
+    baseline_idx: int or LongTensor matching values.shape[:-2]
+    per_sample: bool = True
+
+    Returns: (..., N, C)
+    """
+    return calc_deltas(calc_normalized(values, per_sample=per_sample), baseline_idx)
 
 
 def score_df(
@@ -166,7 +208,7 @@ def score_df(
     Score each row of a metrics DataFrame via per-sample normalized deltas.
 
     Groups by sample_id, packs equal-sized grids to (B, N, C), applies
-    normalized_score_deltas then score_fn in one batched call, and returns a
+    calc_normalized_deltas then score_fn in one batched call, and returns a
     Series aligned to df.index.
     """
     from settings import DEFAULT_T_END, DEFAULT_T_START, SAMPLE_ID_COL, T_END_COL, T_START_COL
@@ -200,7 +242,7 @@ def score_df(
 
     values = torch.as_tensor(np.stack(values_list), dtype=torch.float64)
     baseline_idx = torch.as_tensor(baseline_list, dtype=torch.long)
-    deltas = normalize_score_deltas(values, baseline_idx)
+    deltas = calc_normalized_deltas(values, baseline_idx)
 
     # Process the score kwargs.
     score_kwargs = dict(kwargs)
