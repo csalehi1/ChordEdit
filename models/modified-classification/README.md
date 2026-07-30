@@ -82,9 +82,22 @@ conda activate chordedit
 cd models/modified-classification
 ```
 
-Requires SD-Turbo weights at `SD_TURBO_ROOT` (see repo root `README.md`).
+Requires ChordEdit weights at `CHORD_EDIT_MODEL_ROOT` for the selected `CHORD_EDIT_MODEL` (see `settings.py`).
 
 ## M — metric surrogate
+
+**0. Cache embeddings (optional)**
+
+Pack scattered per-sample embedding `.pt` files into a packed table at
+`.cache/packed_embeddings/<CHORD_EDIT_MODEL>-<DIR_NAME>.pt` (next to `_data.py`)
+without training. Edit globals at the top of the script (`DIR_NAME`, paths,
+`FREEZE_ENCODERS`), then:
+
+```bash
+python scripts/cache_embeddings.py
+```
+
+With `FREEZE_ENCODERS=True` (default) this packs scattered files only (no model load). Set `FREEZE_ENCODERS=False` to encode images/prompts with ChordEdit instead. Later `train_m` / eval reuse the packed cache.
 
 **1. Train**
 

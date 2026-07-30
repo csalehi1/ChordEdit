@@ -13,15 +13,48 @@ Dataset settings.
 # NOTE: Set this to the directory containing the generated metrics and inputs CSV files.
 DIR_NAME_DEFAULT = "UltraEdit_Region_10"
 DIR_NAME = input(f"Dataset directory [{DIR_NAME_DEFAULT}]: ") or DIR_NAME_DEFAULT
+
+# ChordEdit backbone used for encoders / embedding caches.
+# Disk layout uses embeddings/<CHORD_EDIT_MODEL>/{DIR_NAME}/...
+CHORD_EDIT_MODEL = "sd_turbo"  # "sd_turbo" | "sdxl_turbo" | "flux"
+
+CHORD_EDIT_MODEL_CONFIGS = {
+    "sd_turbo": {
+        "root": Path("/shared/ssd_30T/mirick/models/sd-turbo"),
+        "image_size": 512,
+        "pipeline_type": "sd",
+    },
+    "sdxl_turbo": {
+        "root": Path("/shared/ssd_30T/zarageddes/models/sdxl-turbo"),
+        "image_size": 1024,
+        "pipeline_type": "sdxl",
+    },
+    "flux": {
+        "root": Path("/shared/ssd_30T/zarageddes/models/flux1-schnell"),
+        "image_size": 1024,
+        "pipeline_type": "flux",
+    },
+}
+if CHORD_EDIT_MODEL not in CHORD_EDIT_MODEL_CONFIGS:
+    raise ValueError(
+        f"Unknown CHORD_EDIT_MODEL={CHORD_EDIT_MODEL!r}; "
+        f"expected one of {sorted(CHORD_EDIT_MODEL_CONFIGS)}"
+    )
+_CHORD_CFG = CHORD_EDIT_MODEL_CONFIGS[CHORD_EDIT_MODEL]
+CHORD_EDIT_MODEL_ROOT = _CHORD_CFG["root"]
+IMAGE_SIZE = int(_CHORD_CFG["image_size"])
+CHORD_EDIT_PIPELINE_TYPE = str(_CHORD_CFG["pipeline_type"])
+
 GENERATED_DIR = Path(f"/shared/ssd_30T/mirick/generated/ultra_edit/{DIR_NAME}")
 DATASET_DIR = Path(f"/shared/ssd_30T/mirick/datasets/ultra_edit/{DIR_NAME}")
-# Precomputed embeddings (used when FREEZE_ENCODERS is True). 
-EMBEDDINGS_DIR = Path(f"/shared/ssd_30T/mirick/embeddings/ultraedit/{DIR_NAME}")
+# Scattered per-sample embeddings (used when FREEZE_ENCODERS is True).
+EMBEDDINGS_DIR = Path(f"/shared/ssd_30T/mirick/embeddings/{CHORD_EDIT_MODEL}/{DIR_NAME}")
 EMBEDDINGS_SAMPLES_DIRNAME = "annotation_embeddings"
 
-INPUTS_CSV = GENERATED_DIR / f"id_to_inputs_{DIR_NAME.replace('_', '').lower()}.csv"
-METRICS_CSV = GENERATED_DIR / f"id_to_metrics_{DIR_NAME.replace('_', '').lower()}.csv"
-EMBEDDINGS_CSV = EMBEDDINGS_DIR / f"id_to_embeddings_{DIR_NAME.replace('_', '').lower()}.csv"
+_SLUG = DIR_NAME.replace("_", "").lower()
+INPUTS_CSV = GENERATED_DIR / f"id_to_inputs_{_SLUG}.csv"
+METRICS_CSV = GENERATED_DIR / f"id_to_metrics_{_SLUG}.csv"
+EMBEDDINGS_CSV = EMBEDDINGS_DIR / f"id_to_embeddings_{_SLUG}.csv"
 
 # Package root: live settings.py sits next to model_m.py; run copies live under
 # outputs/<DIR_NAME>/<timestamp>/settings.py (parents[2] == package dir).
@@ -34,9 +67,6 @@ OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 _outputs_gitignore = OUTPUTS_DIR.parent / ".gitignore"
 if not _outputs_gitignore.exists():
     _outputs_gitignore.write_text("*\n!.gitignore\n", encoding="utf-8")
-
-# Training-ready pooled/flattened embedding tables (built on first load from annotation_embeddings/).
-M_EMBEDDINGS_PATH = OUTPUTS_DIR.parent / ".cache" / "embeddings" / f"m_{DIR_NAME.replace('_', '').lower()}.pt"
 
 # Shared column name for sample IDs.
 SAMPLE_ID_COL = "sample_id"
@@ -95,11 +125,9 @@ the paper's (t*, t**); mask is the edit mask m_obj.
 M_TARGET_COLS = (PSNR_COL, CLIP_COL)
 M_TARGET_LABELS = {PSNR_COL: "PSNR-Unedited", CLIP_COL: "CLIP-Edited"}
 
-# ChordEdit encoders loaded from SD-TURBO_ROOT for image/text embedding.
+# ChordEdit encoders loaded from CHORD_EDIT_MODEL_ROOT for image/text embedding.
 # When FREEZE_ENCODERS is True and EMBEDDINGS_CSV is set, embeddings are loaded from disk.
 # Set FREEZE_ENCODERS=False or EMBEDDINGS_CSV=None to encode on the fly instead.
-SD_TURBO_ROOT = Path("/shared/ssd_30T/mirick/models/sd-turbo")
-IMAGE_SIZE = 512
 USE_CENTER_CROP = True
 FREEZE_ENCODERS = True
 

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,13 +13,17 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
 
-from model_m import SurrogateModel, mean_pool
+from model_m import SurrogateModel
 from settings import *
 
 METRICS_COLS = [SAMPLE_ID_COL, T_START_COL, T_END_COL, T_DELTA_COL, *M_TARGET_COLS]
 INPUTS_COLS = [SAMPLE_ID_COL, SOURCE_PROMPT_COL, TARGET_PROMPT_COL, IMAGE_PATH_COL, MASK_PATH_COL]
 DATA_COLS = list(dict.fromkeys(METRICS_COLS + INPUTS_COLS))
 ID_TO_SPLIT_NAME = "id_to_split.csv"
+
+# Packed embedding tables: .cache/packed_embeddings/<CHORD_EDIT_MODEL>-<DIR_NAME>.pt
+_DATA_DIR = Path(__file__).resolve().parent
+_PACKED_EMBEDDINGS_DIR = _DATA_DIR / ".cache" / "packed_embeddings"
 
 # CellItem: (sample_idx, img, mask, src, tar, t, y); model uses indices 1..6.
 MODEL_BATCH_SLICE = slice(1, 7)
@@ -41,30 +43,14 @@ def _prep_sample_id(value) -> str:
     return f"{int(value):08d}"
 
 
-def _slice_embedding_cache(
-    cache_path: Path,
-    sample_ids: list[str],
-) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
-    """Load embedding tables from cache iff it covers all sample_ids, else None."""
-    if not cache_path.exists():
-        return None
-    
-    data = torch.load(cache_path, map_location="cpu", weights_only=False)
-    id_to_i = {sid: i for i, sid in enumerate(data["sample_ids"])}
-    # Check if the cache covers all sample_ids.
-    if not all(sid in id_to_i for sid in sample_ids):
-        return None
-    
-    # Slice the embedding tables to the requested sample_ids.
-    idxs = [id_to_i[sid] for sid in sample_ids]
-    print(f"Loaded embeddings from {cache_path} ({len(sample_ids)} samples)")
-    return (
-        sample_ids,
-        data["img"][idxs].contiguous(),
-        data["mask"][idxs].contiguous(),
-        data["src"][idxs].contiguous(),
-        data["tar"][idxs].contiguous(),
-    )
+def _prep_embedding_path(embedding_path: str) -> str:
+    path = Path(embedding_path)
+    if path.is_absolute():
+        return str(path)
+    path = Path(str(embedding_path).lstrip("/"))
+    if path.parts and path.parts[0] == EMBEDDINGS_SAMPLES_DIRNAME:
+        return str(EMBEDDINGS_DIR / path)
+    return str(EMBEDDINGS_DIR / EMBEDDINGS_SAMPLES_DIRNAME / path)
 
 
 # --- Dataset and loaders ----------------------------------------------------------
@@ -264,135 +250,32 @@ def load_split_df(run_dir: Path) -> dict[str, pd.DataFrame]:
 
 """
 Embeddings.
+
+Scattered: many per-sample .pt files indexed by EMBEDDINGS_CSV (slow to load).
+Packed: one stacked table at .cache/packed_embeddings/<CHORD_EDIT_MODEL>-<DIR_NAME>.pt (fast to load).
 """
 
 def get_embeddings(
     samples: pd.DataFrame,
     predictor: SurrogateModel,
     *,
-    use_cache: bool = True,
     batch_size: int = EMBED_BATCH_SIZE,
 ) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """CPU embedding tables: disk when FREEZE_ENCODERS, else encode."""
+    """Return CPU embedding tables (img, mask, src, tar), packed for training."""
 
-    def _load_embeddings_from_csv(
+    packed_path = _PACKED_EMBEDDINGS_DIR / f"{CHORD_EDIT_MODEL}-{DIR_NAME}.pt"
+    sample_ids = samples[SAMPLE_ID_COL].tolist()
+
+    def _load_embeddings(
         samples: pd.DataFrame,
-        predictor: SurrogateModel,
-    ) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Load from M_EMBEDDINGS_PATH, or pack per-sample .pt files into that cache."""
+    ) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Load packed cache, or pack scattered per-sample .pt files. Return None if unavailable."""
 
-        def _resolve_embedding_path(embedding_path: str) -> str:
-            """Absolute CSV paths as-is; relative under EMBEDDINGS_DIR/annotation_embeddings/."""
-            path = Path(embedding_path)
-            if path.is_absolute():
-                return str(path)
-            path = Path(str(embedding_path).lstrip("/"))
-            if path.parts and path.parts[0] == EMBEDDINGS_SAMPLES_DIRNAME:
-                return str(EMBEDDINGS_DIR / path)
-            return str(EMBEDDINGS_DIR / EMBEDDINGS_SAMPLES_DIRNAME / path)
-
+        # Flatten a scattered tensor to a contiguous 1D float vector for the packed table.
         def _latent_to_vector(t: torch.Tensor) -> torch.Tensor:
             return t.detach().float().reshape(-1).contiguous()
 
-        def _text_seq_to_vector(
-            t: torch.Tensor,
-            prompt: str,
-            tokenizer,
-            attn_mask: torch.Tensor | None = None,
-        ) -> torch.Tensor:
-            """Mean-pool saved CLIP hidden states to match TextEncoder output dims."""
-            t = t.detach().float()
-            if t.ndim == 1:
-                return t.contiguous()
-            if t.ndim == 2 and t.shape[0] == 1:
-                return t.reshape(-1).contiguous()
-            if t.ndim == 2:
-                hidden = t.unsqueeze(0)
-            elif t.ndim == 3:
-                hidden = t
-            else:
-                raise ValueError(f"Unexpected text embedding shape: {tuple(t.shape)}")
-
-            if attn_mask is None:
-                inputs = tokenizer(
-                    prompt,
-                    padding="max_length",
-                    truncation=True,
-                    max_length=tokenizer.model_max_length,
-                    return_tensors="pt",
-                )
-                attn_mask = inputs.attention_mask
-            if attn_mask.shape[-1] != hidden.shape[1]:
-                pooled = hidden.mean(dim=1)
-            else:
-                pooled = mean_pool(hidden, attn_mask)
-            return pooled.reshape(-1).contiguous()
-
-        if EMBEDDINGS_CSV is None:
-            raise ValueError("EMBEDDINGS_CSV is None; cannot load precomputed embeddings")
-        if not Path(EMBEDDINGS_CSV).exists():
-            raise FileNotFoundError(f"Embeddings CSV not found: {EMBEDDINGS_CSV}")
-        if predictor.pipeline is None:
-            raise RuntimeError("SurrogateModel.pipeline is required to tokenize prompts when loading embeddings")
-        tokenizer = predictor.pipeline.tokenizer
-
-        sample_ids = samples[SAMPLE_ID_COL].tolist()
-        cached = _slice_embedding_cache(Path(M_EMBEDDINGS_PATH), sample_ids)
-        if cached is not None:
-            return cached
-        if Path(M_EMBEDDINGS_PATH).exists():
-            print(f"{M_EMBEDDINGS_PATH} incomplete for requested samples; rebuilding from per-sample files")
-
-        emb_df = pd.read_csv(EMBEDDINGS_CSV)
-        if emb_df.isna().any().any():
-            raise ValueError(f"Missing values found in {EMBEDDINGS_CSV}")
-        emb_df[SAMPLE_ID_COL] = emb_df[SAMPLE_ID_COL].map(_prep_sample_id)
-        for col in (SOURCE_EMB_COL, TARGET_EMB_COL, IMAGE_EMB_COL, MASK_EMB_COL):
-            if col not in emb_df.columns:
-                raise ValueError(f"Missing column {col!r} in {EMBEDDINGS_CSV}")
-            emb_df[col] = emb_df[col].map(_resolve_embedding_path)
-
-        id_to_row = emb_df.set_index(SAMPLE_ID_COL)
-        if id_to_row.index.has_duplicates:
-            dupes = id_to_row.index[id_to_row.index.duplicated()].unique().tolist()
-            preview = ", ".join(str(s) for s in dupes[:5])
-            raise ValueError(f"Duplicate sample_id(s) in {EMBEDDINGS_CSV}: {preview}")
-
-        missing = [sid for sid in sample_ids if sid not in id_to_row.index]
-        if missing:
-            preview = ", ".join(missing[:5])
-            more = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
-            raise KeyError(f"Missing embeddings for {len(missing)} sample_id(s): {preview}{more}")
-
-        id_to_prompts = samples.set_index(SAMPLE_ID_COL).loc[:, [SOURCE_PROMPT_COL, TARGET_PROMPT_COL]]
-        src_prompts = [str(id_to_prompts.loc[sid, SOURCE_PROMPT_COL]) for sid in sample_ids]
-        tar_prompts = [str(id_to_prompts.loc[sid, TARGET_PROMPT_COL]) for sid in sample_ids]
-        src_masks = tokenizer(
-            src_prompts,
-            padding="max_length",
-            truncation=True,
-            max_length=tokenizer.model_max_length,
-            return_tensors="pt",
-        ).attention_mask
-        tar_masks = tokenizer(
-            tar_prompts,
-            padding="max_length",
-            truncation=True,
-            max_length=tokenizer.model_max_length,
-            return_tensors="pt",
-        ).attention_mask
-
-        path_rows = [
-            (
-                sid,
-                str(id_to_row.loc[sid, IMAGE_EMB_COL]),
-                str(id_to_row.loc[sid, MASK_EMB_COL]),
-                str(id_to_row.loc[sid, SOURCE_EMB_COL]),
-                str(id_to_row.loc[sid, TARGET_EMB_COL]),
-            )
-            for sid in sample_ids
-        ]
-
+        # Load a .pt file into a contiguous tensor.
         def _load_pt(path: str) -> torch.Tensor:
             if not Path(path).exists():
                 raise FileNotFoundError(f"Missing embedding file: {path}")
@@ -401,113 +284,207 @@ def get_embeddings(
                 raise TypeError(f"Expected Tensor in {path}, got {type(t)}")
             return t
 
+        # Load a single sample's embeddings from a scattered .pt file.
         def _load_sample(row: tuple[str, str, str, str, str]):
-            sid, img_p, mask_p, src_p, tar_p = row
-            return sid, _load_pt(img_p), _load_pt(mask_p), _load_pt(src_p), _load_pt(tar_p)
+            sid, img_pt, mask_pt, src_pt, tar_pt = row
+            return sid, _load_pt(img_pt), _load_pt(mask_pt), _load_pt(src_pt), _load_pt(tar_pt)
 
-        print(f"Packing embeddings from {EMBEDDINGS_CSV} ({len(sample_ids)} samples) -> {M_EMBEDDINGS_PATH}")
+        # Return packed tables if they cover every sample_id, else None.
+        def _slice_packed_cache() -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+            if not packed_path.exists():
+                return None
+            data = torch.load(packed_path, map_location="cpu", weights_only=False)
+            id_to_i = {sid: i for i, sid in enumerate(data["sids"])}
+            if not all(sid in id_to_i for sid in sample_ids):
+                return None
+            idxs = [id_to_i[sid] for sid in sample_ids]
+            print(f"Loaded embeddings from {packed_path} ({len(sample_ids)} samples)")
+            return (
+                sample_ids,
+                data["img"][idxs].contiguous(),
+                data["mask"][idxs].contiguous(),
+                data["src"][idxs].contiguous(),
+                data["tar"][idxs].contiguous(),
+            )
+
+        # Load the packed table if it already covers every requested sample.
+        cached = _slice_packed_cache()
+        if cached is not None:
+            return cached
+        if packed_path.exists():
+            print(f"{packed_path} incomplete for requested samples; packing from scattered files...")
+
+        # Else, load and pack the scattered embeddings from the CSV file
+        # Embeddings are scattared in order to best support symlinks
+        # between different sizes of the dataset. However, they take a
+        # non-insignificant amount of time to load, so we cache the
+        # packed embeddings for this model specifically.
+
+        if EMBEDDINGS_CSV is None or not Path(EMBEDDINGS_CSV).exists():
+            return None
+
+        # Verify the CSV file is valid and matches the expected columns.
+        emb_df = pd.read_csv(EMBEDDINGS_CSV)
+        if emb_df.isna().any().any():
+            raise ValueError(f"Missing values found in {EMBEDDINGS_CSV}")
+        emb_df[SAMPLE_ID_COL] = emb_df[SAMPLE_ID_COL].map(_prep_sample_id)
+        for col in (SOURCE_EMB_COL, TARGET_EMB_COL, IMAGE_EMB_COL, MASK_EMB_COL):
+            if col not in emb_df.columns:
+                raise ValueError(f"Missing column {col!r} in {EMBEDDINGS_CSV}")
+            emb_df[col] = emb_df[col].map(_prep_embedding_path)
+
+        # Check that the CSV file covers all requested samples.
+        id_to_row = emb_df.set_index(SAMPLE_ID_COL)
+        missing = [sid for sid in sample_ids if sid not in id_to_row.index]
+        if missing:
+            preview = ", ".join(missing[:5])
+            more = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
+            print(f"Scattered embeddings missing {len(missing)} sample_id(s): {preview}{more}")
+            return None
+
+        path_rows = [(
+            sid,
+            str(id_to_row.loc[sid, IMAGE_EMB_COL]),
+            str(id_to_row.loc[sid, MASK_EMB_COL]),
+            str(id_to_row.loc[sid, SOURCE_EMB_COL]),
+            str(id_to_row.loc[sid, TARGET_EMB_COL]),
+            ) for sid in sample_ids
+        ]
+
+        # Pack many scattered per-sample .pt files into one packed training table.
+        print(f"Packing scattered embeddings ({len(sample_ids)} samples) -> {packed_path}")
         img_rows: list[torch.Tensor] = []
         mask_rows: list[torch.Tensor] = []
         src_rows: list[torch.Tensor] = []
         tar_rows: list[torch.Tensor] = []
         with ThreadPoolExecutor(max_workers=32) as pool:
-            for i, (sid, img_t, mask_t, src_t, tar_t) in enumerate(
-                tqdm(pool.map(_load_sample, path_rows), total=len(path_rows), desc="Loading embeddings", unit="sample")
-            ):
+            # Load the embeddings in parallel using a thread pool.
+            for sid, img_t, mask_t, src_t, tar_t in tqdm(pool.map(_load_sample, path_rows), total=len(path_rows), desc="Packing embeddings", unit="sample"):
                 img_rows.append(_latent_to_vector(img_t))
                 mask_rows.append(_latent_to_vector(mask_t))
-                src_rows.append(_text_seq_to_vector(src_t, src_prompts[i], tokenizer, attn_mask=src_masks[i : i + 1]))
-                tar_rows.append(_text_seq_to_vector(tar_t, tar_prompts[i], tokenizer, attn_mask=tar_masks[i : i + 1]))
+                src_rows.append(_latent_to_vector(src_t))
+                tar_rows.append(_latent_to_vector(tar_t))
 
+        # Stack the embeddings into a single tensor per embedding type.
         img_emb = torch.stack(img_rows, dim=0)
         mask_emb = torch.stack(mask_rows, dim=0)
         src_emb = torch.stack(src_rows, dim=0)
         tar_emb = torch.stack(tar_rows, dim=0)
 
-        Path(M_EMBEDDINGS_PATH).parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = Path(str(M_EMBEDDINGS_PATH) + ".tmp")
-        torch.save(
-            {"sample_ids": list(sample_ids), "img": img_emb, "mask": mask_emb, "src": src_emb, "tar": tar_emb},
-            tmp_path,
-        )
-        tmp_path.replace(M_EMBEDDINGS_PATH)
-        print(f"Saved {M_EMBEDDINGS_PATH}")
+        packed_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = Path(str(packed_path) + ".tmp")
+        torch.save({
+            "sids": list(sample_ids),
+            "img": img_emb,
+            "mask": mask_emb,
+            "src": src_emb,
+            "tar": tar_emb,
+        }, tmp_path)
+        tmp_path.replace(packed_path)
+        print(f"Saved packed embeddings: {packed_path}")
         return sample_ids, img_emb, mask_emb, src_emb, tar_emb
 
     def _encode_embeddings(
         samples: pd.DataFrame,
         predictor: SurrogateModel,
         *,
-        use_cache: bool = True,
         batch_size: int = EMBED_BATCH_SIZE,
+        cache_scattered: bool = True,
+        cache_packed: bool = True,
     ) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Encode with ChordEdit encoders; optional disk cache keyed by inputs + SD root."""
-        cache_key = hashlib.sha256(f"{INPUTS_CSV}|{SD_TURBO_ROOT}".encode()).hexdigest()[:12]
-        cache_path = Path(OUTPUTS_DIR.parent / ".cache" / "embeddings" / f"{cache_key}.pt").resolve()
-        sample_ids = samples[SAMPLE_ID_COL].tolist()
-
-        if use_cache:
-            cached = _slice_embedding_cache(cache_path, sample_ids)
-            if cached is not None:
-                return cached
-            if cache_path.exists():
-                print(f"Embedding cache miss (incomplete): {cache_path}")
-
+        """Encode with ChordEdit; optionally write scattered and/or packed caches."""
         n_samples = len(sample_ids)
         image_paths = samples[IMAGE_PATH_COL].tolist()
         mask_paths = samples[MASK_PATH_COL].tolist()
         src_prompts = samples[SOURCE_PROMPT_COL].tolist()
         tar_prompts = samples[TARGET_PROMPT_COL].tolist()
-        img_chunks: list[torch.Tensor] = []
-        mask_chunks: list[torch.Tensor] = []
-        src_chunks: list[torch.Tensor] = []
-        tar_chunks: list[torch.Tensor] = []
+        img_batches: list[torch.Tensor] = []
+        mask_batches: list[torch.Tensor] = []
+        src_batches: list[torch.Tensor] = []
+        tar_batches: list[torch.Tensor] = []
 
         print(f"Encoding embeddings for {n_samples} samples (batch_size={batch_size})...")
-        for start in range(0, n_samples, batch_size):
-            batch_start = time.perf_counter()
+        for start in tqdm(range(0, n_samples, batch_size), desc="Encoding embeddings", unit="batch"):
             end = min(start + batch_size, n_samples)
             images = [Image.open(p).convert("RGB") for p in image_paths[start:end]]
             masks = [Image.open(p).convert("RGB") for p in mask_paths[start:end]]
             with torch.no_grad():
-                img_chunks.append(predictor.image_encoder(images).float().cpu())
-                mask_chunks.append(predictor.image_encoder(masks).float().cpu())
-                src_chunks.append(predictor.text_encoder(src_prompts[start:end]).float().cpu())
-                tar_chunks.append(predictor.text_encoder(tar_prompts[start:end]).float().cpu())
+                img_batches.append(predictor.image_encoder(images).float().cpu())
+                mask_batches.append(predictor.image_encoder(masks).float().cpu())
+                src_batches.append(predictor.text_encoder(src_prompts[start:end]).float().cpu())
+                tar_batches.append(predictor.text_encoder(tar_prompts[start:end]).float().cpu())
             del images, masks
-            elapsed = time.perf_counter() - batch_start
-            print(f"    Encoded [{end}/{n_samples}] ({end - start} samples in {elapsed:.2f}s)", flush=True)
 
-        img_emb = torch.cat(img_chunks, dim=0)
-        mask_emb = torch.cat(mask_chunks, dim=0)
-        src_emb = torch.cat(src_chunks, dim=0)
-        tar_emb = torch.cat(tar_chunks, dim=0)
+        img_emb = torch.cat(img_batches, dim=0)
+        mask_emb = torch.cat(mask_batches, dim=0)
+        src_emb = torch.cat(src_batches, dim=0)
+        tar_emb = torch.cat(tar_batches, dim=0)
 
-        if use_cache:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {"sample_ids": list(sample_ids), "img": img_emb, "mask": mask_emb, "src": src_emb, "tar": tar_emb},
-                cache_path,
-            )
-            print(f"Saved embedding cache: {cache_path}")
+        if cache_scattered:
+            # Write many per-sample .pt files indexed by EMBEDDINGS_CSV.
+            samples_root = EMBEDDINGS_DIR / EMBEDDINGS_SAMPLES_DIRNAME
+            print(f"Caching scattered embeddings ({n_samples} samples) -> {samples_root}")
+            rows: list[dict[str, str]] = []
+            for i, sid in enumerate(tqdm(sample_ids, desc="Caching scattered", unit="sample")):
+                sample_dir = samples_root / sid
+                sample_dir.mkdir(parents=True, exist_ok=True)
+                img_path = sample_dir / "image.pt"
+                mask_path = sample_dir / "mask.pt"
+                src_path = sample_dir / "source.pt"
+                tar_path = sample_dir / "target.pt"
+                torch.save(img_emb[i].contiguous(), img_path)
+                torch.save(mask_emb[i].contiguous(), mask_path)
+                torch.save(src_emb[i].contiguous(), src_path)
+                torch.save(tar_emb[i].contiguous(), tar_path)
+                rows.append({
+                    SAMPLE_ID_COL: sid,
+                    SOURCE_EMB_COL: str(src_path),
+                    TARGET_EMB_COL: str(tar_path),
+                    IMAGE_EMB_COL: str(img_path),
+                    MASK_EMB_COL: str(mask_path),
+                })
+            if EMBEDDINGS_CSV is not None:
+                csv_path = Path(EMBEDDINGS_CSV)
+                csv_path.parent.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame(rows).sort_values(SAMPLE_ID_COL).to_csv(csv_path, index=False)
+                print(f"Saved scattered embeddings CSV: {csv_path}")
+
+        if cache_packed:
+            # Pack encoder outputs into one packed training table.
+            print(f"Packing encoded embeddings ({n_samples} samples) -> {packed_path}")
+            packed_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = Path(str(packed_path) + ".tmp")
+            torch.save({
+                "sids": list(sample_ids),
+                "img": img_emb,
+                "mask": mask_emb,
+                "src": src_emb,
+                "tar": tar_emb,
+            }, tmp_path)
+            tmp_path.replace(packed_path)
+            print(f"Saved packed embeddings: {packed_path}")
 
         return sample_ids, img_emb, mask_emb, src_emb, tar_emb
 
-    if FREEZE_ENCODERS and EMBEDDINGS_CSV is not None:
-        return _load_embeddings_from_csv(samples, predictor)
-    return _encode_embeddings(samples, predictor, use_cache=use_cache, batch_size=batch_size)
+    # Try to load a packed table, or pack a table from scattered embeddings.
+    loaded = _load_embeddings(samples)
+    if loaded is not None:
+        return loaded
+    print("Embeddings caching failed, encoding with ChordEdit...")
+
+    # Encode with ChordEdit and optionally write a packed table.
+    return _encode_embeddings(samples, predictor, batch_size=batch_size, cache_scattered=True, cache_packed=True)
 
 
 def get_embeddings_by_sample(
     df: pd.DataFrame,
     predictor: SurrogateModel,
-    device: torch.device,
-    *,
-    use_cache: bool = True,
 ) -> dict[str, dict[str, torch.Tensor]]:
     """Embeddings keyed by sample_id."""
+    # TODO: Check that device is correct.
+    device = predictor.regressor.target_mean.device
     samples = df.drop_duplicates(subset=SAMPLE_ID_COL).sort_values(SAMPLE_ID_COL)
-    sample_ids, img_emb, mask_emb, src_emb, tar_emb = get_embeddings(samples, predictor, use_cache=use_cache)
+    sample_ids, img_emb, mask_emb, src_emb, tar_emb = get_embeddings(samples, predictor)
     img_emb, mask_emb, src_emb, tar_emb = img_emb.to(device), mask_emb.to(device), src_emb.to(device), tar_emb.to(device)
     return {
         sid: {"img": img_emb[i], "mask": mask_emb[i], "src": src_emb[i], "tar": tar_emb[i]}
@@ -528,7 +505,7 @@ def create_dataloaders(
 ) -> tuple[DataLoader[CellItem], DataLoader[CellItem], DataLoader[CellItem]]:
     """Build train/val/test DataLoaders from split feature and target tables."""
     samples = pd.concat([train_X, val_X, test_X], ignore_index=True).drop_duplicates(SAMPLE_ID_COL).sort_values(SAMPLE_ID_COL)
-    sample_ids, img_emb, mask_emb, src_emb, tar_emb = get_embeddings(samples, predictor, use_cache=True)
+    sample_ids, img_emb, mask_emb, src_emb, tar_emb = get_embeddings(samples, predictor)
     emb_table = EmbeddingTable(img=img_emb, mask=mask_emb, src=src_emb, tar=tar_emb)
     sample_id_to_idx = {sid: i for i, sid in enumerate(sample_ids)}
 

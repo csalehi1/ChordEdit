@@ -32,7 +32,7 @@ from PIL import Image
 
 # ChordEdit provides the same VAE/text stack used at edit time, so M's
 # embeddings stay consistent with the metrics collected from ChordEdit grids.
-# paths_from_model_root resolves SD-Turbo component dirs under SD_TURBO_ROOT.
+# paths_from_model_root resolves component dirs under CHORD_EDIT_MODEL_ROOT.
 from pipeline_chord import ChordEditPipeline, DEFAULT_COMPUTE_DTYPE
 from run_pie_bench import paths_from_model_root
 
@@ -46,13 +46,21 @@ def combine_text_embeddings(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 def encode_text_pooled(pipeline: ChordEditPipeline, prompts: list[str]) -> torch.Tensor:
     """
-    Mean-pool ChordEdit text-encoder outputs to (N, hidden_dim) for the MLP.
+    Collapse ChordEdit text-encoder outputs to (N, hidden_dim) for the MLP.
 
-    ChordEdit's encode_prompt and _encode_text return the full token sequence for
-    UNet conditioning. M needs one vector per prompt, so we tokenize once,
-    run the pipeline text encoder, and attention-mask mean-pool here instead of
-    extending pipeline_chord.py.
+    SD / SD-Turbo: mean-pool CLIP last_hidden_state over tokens (UNet still uses
+    the full sequence). SDXL / SDXL-Turbo: use CLIP's native pooled embeds from
+    text_encoder_2 (text_embeds), matching ChordEdit's SDXL conditioning.
     """
+    device = pipeline._device
+    dtype = pipeline._compute_dtype
+
+    if getattr(pipeline, "_is_sdxl", False):
+        cond = pipeline._encode_sdxl_text(prompts)
+        if cond.pooled_embeds is None:
+            raise RuntimeError("SDXL text encoding did not produce pooled_embeds")
+        return cond.pooled_embeds.to(device=device, dtype=dtype)
+
     inputs = pipeline.tokenizer(
         list(prompts),
         padding="max_length",
@@ -60,7 +68,6 @@ def encode_text_pooled(pipeline: ChordEditPipeline, prompts: list[str]) -> torch
         max_length=pipeline.tokenizer.model_max_length,
         return_tensors="pt",
     )
-    device = pipeline._device
     input_ids = inputs.input_ids.to(device)
     attn_mask = inputs.attention_mask.to(device)
     encoder_mask = attn_mask if pipeline._use_attention_mask else None
@@ -69,7 +76,7 @@ def encode_text_pooled(pipeline: ChordEditPipeline, prompts: list[str]) -> torch
         hidden = outputs.last_hidden_state
     else:
         hidden = outputs[0]
-    return mean_pool(hidden, attn_mask).to(device=device, dtype=pipeline._compute_dtype)
+    return mean_pool(hidden, attn_mask).to(device=device, dtype=dtype)
 
 
 def format_results(m: dict[str, float]) -> str:
@@ -115,19 +122,22 @@ ChordEdit encoders.
 """
 
 class TextEncoder(nn.Module):
-    """ChordEdit text encoding with mean-pooled hidden states for the MLP."""
+    """ChordEdit text encoding collapsed to a fixed vector for the MLP."""
 
     def __init__(self, pipeline: ChordEditPipeline):
         super().__init__()
         self._pipeline = pipeline
+        with torch.no_grad():
+            # Probe output width (SD mean-pool hidden vs SDXL pooled embeds).
+            self._hidden_dim = int(encode_text_pooled(pipeline, [""]).shape[-1])
 
     @property
     def hidden_dim(self) -> int:
-        return self._pipeline.text_encoder.config.hidden_size
+        return self._hidden_dim
 
     @torch.no_grad()
     def forward(self, sentences: list[str]) -> torch.Tensor:
-        # Reuse ChordEdit's tokenizer + CLIP text encoder, then mean-pool to a
+        # Reuse ChordEdit's tokenizer and text encoder(s), then collapse to a
         # fixed vector. UNet conditioning uses the full token sequence; the MLP
         # needs one embedding per prompt (see encode_text_pooled above).
         return encode_text_pooled(self._pipeline, sentences)
@@ -398,10 +408,23 @@ class SurrogateModel(nn.Module):
         super().__init__()
         # We reuse ChordEdit's VAE and text encoder (and their preprocess helpers)
         # so their embeddings match the runs that produced (psnr, clip) labels. Full
-        # from_local_sd_weights also loads UNet/scheduler; encoder-only loading
-        # would require pipeline_chord.py changes, which we avoid here.
-        self.pipeline = ChordEditPipeline.from_local_sd_weights(
-            paths_from_model_root(SD_TURBO_ROOT),
+        # from_local_* also loads UNet/scheduler; encoder-only loading would
+        # require pipeline_chord.py changes, which we avoid here.
+        if CHORD_EDIT_PIPELINE_TYPE == "flux":
+            raise NotImplementedError(
+                "CHORD_EDIT_MODEL='flux' encoder loading is not implemented in "
+                "ChordEditPipeline yet; pack precomputed embeddings with "
+                "FREEZE_ENCODERS=True, or use sd_turbo / sdxl_turbo."
+            )
+        if CHORD_EDIT_PIPELINE_TYPE not in {"sd", "sdxl"}:
+            raise ValueError(f"Unsupported CHORD_EDIT_PIPELINE_TYPE={CHORD_EDIT_PIPELINE_TYPE!r}")
+
+        component_paths = paths_from_model_root(
+            CHORD_EDIT_MODEL_ROOT, model_type=CHORD_EDIT_PIPELINE_TYPE
+        )
+        self.pipeline = ChordEditPipeline.from_local_weights(
+            component_paths,
+            model_type=CHORD_EDIT_PIPELINE_TYPE,
             image_size=IMAGE_SIZE,
             use_center_crop=USE_CENTER_CROP,
             compute_dtype=DEFAULT_COMPUTE_DTYPE,
@@ -414,6 +437,9 @@ class SurrogateModel(nn.Module):
                 param.requires_grad = False
             for param in self.pipeline.text_encoder.parameters():
                 param.requires_grad = False
+            if self.pipeline.text_encoder_2 is not None:
+                for param in self.pipeline.text_encoder_2.parameters():
+                    param.requires_grad = False
 
         # Thin wrappers that call ChordEdit preprocess/encode helpers above.
         self.image_encoder = VaeImageEncoder(self.pipeline)
