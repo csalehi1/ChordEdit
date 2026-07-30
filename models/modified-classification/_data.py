@@ -15,7 +15,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
 
-from model_m import MetricPredictor, mean_pool
+from model_m import SurrogateModel, mean_pool
 from settings import *
 
 METRICS_COLS = [SAMPLE_ID_COL, T_START_COL, T_END_COL, T_DELTA_COL, *M_TARGET_COLS]
@@ -268,7 +268,7 @@ Embeddings.
 
 def get_embeddings(
     samples: pd.DataFrame,
-    predictor: MetricPredictor,
+    predictor: SurrogateModel,
     *,
     use_cache: bool = True,
     batch_size: int = EMBED_BATCH_SIZE,
@@ -277,7 +277,7 @@ def get_embeddings(
 
     def _load_embeddings_from_csv(
         samples: pd.DataFrame,
-        predictor: MetricPredictor,
+        predictor: SurrogateModel,
     ) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Load from M_EMBEDDINGS_PATH, or pack per-sample .pt files into that cache."""
 
@@ -333,7 +333,7 @@ def get_embeddings(
         if not Path(EMBEDDINGS_CSV).exists():
             raise FileNotFoundError(f"Embeddings CSV not found: {EMBEDDINGS_CSV}")
         if predictor.pipeline is None:
-            raise RuntimeError("MetricPredictor.pipeline is required to tokenize prompts when loading embeddings")
+            raise RuntimeError("SurrogateModel.pipeline is required to tokenize prompts when loading embeddings")
         tokenizer = predictor.pipeline.tokenizer
 
         sample_ids = samples[SAMPLE_ID_COL].tolist()
@@ -436,7 +436,7 @@ def get_embeddings(
 
     def _encode_embeddings(
         samples: pd.DataFrame,
-        predictor: MetricPredictor,
+        predictor: SurrogateModel,
         *,
         use_cache: bool = True,
         batch_size: int = EMBED_BATCH_SIZE,
@@ -500,7 +500,7 @@ def get_embeddings(
 
 def get_embeddings_by_sample(
     df: pd.DataFrame,
-    predictor: MetricPredictor,
+    predictor: SurrogateModel,
     device: torch.device,
     *,
     use_cache: bool = True,
@@ -516,7 +516,7 @@ def get_embeddings_by_sample(
 
 
 def create_dataloaders(
-    predictor: MetricPredictor,
+    predictor: SurrogateModel,
     train_X: pd.DataFrame,
     train_y: pd.DataFrame,
     val_X: pd.DataFrame,

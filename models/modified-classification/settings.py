@@ -69,6 +69,7 @@ Shared model settings.
 """
 
 # Values of t_delta column to train models on. Set to `None` to use every t_delta.
+# t_delta is the paper's transport-estimator parameter delta; paper results use delta = 0.
 TARGET_T_DELTA = 0.0
 
 # Sample-level split ratios (by sample_id, not individual grid rows).
@@ -81,6 +82,10 @@ SEED = 42
 
 """
 M model settings.
+
+Paper: surrogate model M_hat(x_src, c_src, c_tar, t*, t**) -> s = (s_1, s_2),
+predicting s_1 = PSNR-Unedited and s_2 = CLIP-Edited. Code's t_start/t_end are
+the paper's (t*, t**); mask is the edit mask m_obj.
 
     Model architecture:
     M(img_emb, mask_emb, src_emb, tar_emb, t_start, t_end) -> (psnr, clip)
@@ -123,15 +128,18 @@ RANKING_LOSS_WEIGHT = 0.3
 """
 T model settings.
 
+Paper: selector model T(s in S) -> (t*, t**), which evaluates M_hat over all
+(t*, t**) in the quantized grid T and picks the argmax of phi.
+
     Model architecture:
     T(img, src_prompt, tar_prompt) -> (t_start, t_end)
 """
 
-# Scalar objective for timestep selection and M ranking loss.
-# T_TARGET_SCORE takes per-sample normalized deltas Δ; see scores.calc_normalized_deltas.
+# Scalar objective phi for timestep selection and M_hat ranking loss.
+# T_TARGET_PHI takes per-sample normalized deltas Delta; see scores.calc_normalized_deltas.
 _T_SCORE_KW = dict(alpha=2.0)
-T_TARGET_SCORE = partial(linex_score, **_T_SCORE_KW)  # Torch phi(Δ)
-T_TARGET_SCORE_DF = partial(score_df, score_fn=linex_score, **_T_SCORE_KW)  # DataFrame
+T_TARGET_PHI = partial(linex_score, **_T_SCORE_KW)  # Torch phi(Delta)
+T_TARGET_PHI_DF = partial(score_df, score_fn=linex_score, **_T_SCORE_KW)  # DataFrame
 T_TARGET_COL = "linex_score"
 T_TARGET_LABEL = "LINEX Score"
 
@@ -143,5 +151,5 @@ DEFAULT_T_END = 0.3
 GRID_T_START = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
 GRID_T_END = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
 
-# Deviate-or-default gate: minimum predicted gain to leave baseline timesteps.
-NOISE_FLOOR_M = 0.0
+# Deviate-or-default gate: minimum predicted phi gain to leave baseline timesteps.
+NOISE_FLOOR_PHI = 0.0

@@ -31,7 +31,7 @@ flowchart TB
   te --> src_emb[src_emb]
   te --> tar_emb[tar_emb]
 
-  subgraph regressor [Trainable MetricRegressor]
+  subgraph regressor [Trainable SurrogateRegressor]
     img_proj[img_proj]
     mask_proj[mask_proj]
     text_combine["combine_text: cat, diff, product"]

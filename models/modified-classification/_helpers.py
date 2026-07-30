@@ -103,51 +103,53 @@ def timestep_pairs_from_df(df: pd.DataFrame) -> np.ndarray:
     )
 
 
-def t_target_score_values(
+def t_target_phi_values(
     values: torch.Tensor,
     baseline_idx: int | torch.Tensor,
 ) -> torch.Tensor:
-    """Per-sample normalized deltas then settings.T_TARGET_SCORE (phi on Delta).
+    """Per-sample normalized deltas then settings.T_TARGET_PHI (phi on Delta).
 
     values: (..., N, C). Returns scores shaped (..., N).
     """
     from scores import calc_normalized_deltas
     deltas = calc_normalized_deltas(values, baseline_idx)
-    return _s().T_TARGET_SCORE(deltas)
+    return _s().T_TARGET_PHI(deltas)
 
 
-# def scalarize(
-#     psnr: np.ndarray,
-#     clip: np.ndarray,
-#     *,
-#     baseline_idx: int,
-# ) -> np.ndarray:
-#     """Combine PSNR and CLIP via per-sample Δ scoring (preserves input shape).
+def score_metric_grids(
+    psnr: np.ndarray,
+    clip: np.ndarray,
+    baseline_idx: int | np.ndarray,
+) -> np.ndarray:
+    """Score a stack of (PSNR, CLIP) timestep grids into phi via per-sample deltas.
 
-#     Accepts raw metric units: calc_normalized_deltas applies per-sample range
-#     normalization, which is invariant to any global affine rescaling of the
-#     inputs, so no prior min-max is needed. NaN cells (unlabeled grid points)
-#     stay NaN without affecting labeled cells.
+    psnr, clip: (n_samples, n_start, n_end) - always a stack, one grid per
+    sample, each normalized over its own grid. Pass a single sample's grid as
+    grid[None] so the sample axis is never ambiguous.
+    baseline_idx: flat index of the default cell, i * n_end + j.
 
-#     3D input is a stack of per-sample grids (n_samples, n1, n2), each sample
-#     normalized over its own grid. 2D input is interpreted as ONE sample's
-#     (n1, n2) grid — never pass a (n_samples, N) stack as 2D, or the whole
-#     stack is normalized as a single sample with one shared baseline row.
-#     """
-#     psnr = np.asarray(psnr, dtype=float)
-#     clip = np.asarray(clip, dtype=float)
-#     if psnr.shape != clip.shape:
-#         raise ValueError(f"psnr/clip shape mismatch: {psnr.shape} vs {clip.shape}")
-#     if psnr.ndim == 3:
-#         b, n1, n2 = psnr.shape
-#         values = torch.as_tensor(
-#             np.stack([psnr.reshape(b, n1 * n2), clip.reshape(b, n1 * n2)], axis=-1),
-#             dtype=torch.float64,
-#         )
-#         out = t_target_score_values(values, baseline_idx=baseline_idx)
-#         return out.detach().cpu().numpy().reshape(b, n1, n2)
-#     if psnr.ndim != 2:
-#         raise ValueError(f"psnr/clip must be 2D or 3D, got shape {psnr.shape}")
-#     values = torch.as_tensor(np.stack([psnr.ravel(), clip.ravel()], axis=-1), dtype=torch.float64)
-#     out = t_target_score_values(values, baseline_idx=baseline_idx)
-#     return out.detach().cpu().numpy().reshape(psnr.shape)
+    Raw metric units are fine: the per-sample range normalization inside
+    calc_normalized_deltas is invariant to any global affine rescaling, so no
+    prior min-max is needed. NaN (unlabeled) cells stay NaN without affecting
+    labeled cells; the baseline cell itself must be labeled.
+
+    Returns: (n_samples, n_start, n_end)
+    """
+    psnr = np.asarray(psnr, dtype=float)
+    clip = np.asarray(clip, dtype=float)
+    if psnr.shape != clip.shape:
+        raise ValueError(f"psnr/clip shape mismatch: {psnr.shape} vs {clip.shape}")
+    if psnr.ndim != 3:
+        raise ValueError(
+            f"expected (n_samples, n_start, n_end), got {psnr.shape}; "
+            f"pass grid[None] for a single sample"
+        )
+
+    b, n1, n2 = psnr.shape
+    values = torch.as_tensor(
+        np.stack([psnr.reshape(b, n1 * n2), clip.reshape(b, n1 * n2)], axis=-1),
+        dtype=torch.float64,
+    )
+    idx = baseline_idx if isinstance(baseline_idx, int) else torch.as_tensor(baseline_idx, dtype=torch.long)
+    out = t_target_phi_values(values, idx)
+    return out.detach().cpu().numpy().reshape(b, n1, n2)

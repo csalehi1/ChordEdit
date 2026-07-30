@@ -1,5 +1,10 @@
 """
-Metric surrogate M.
+Surrogate model M_hat.
+
+Paper: M_hat(x_src, c_src, c_tar, t*, t**) -> s = (s_1, s_2), predicting
+s_1 = PSNR-Unedited and s_2 = CLIP-Edited. Code's t_start/t_end are the
+paper's (t*, t**) on the quantized N x N grid T (N=11); mask is the edit
+mask m_obj.
 
     M(img_emb, mask_emb, src_emb, tar_emb, t_start, t_end) -> (psnr, clip)
 
@@ -109,7 +114,6 @@ def pairwise_ranking_loss(pred: torch.Tensor, true: torch.Tensor) -> torch.Tenso
 ChordEdit encoders.
 """
 
-
 class TextEncoder(nn.Module):
     """ChordEdit text encoding with mean-pooled hidden states for the MLP."""
 
@@ -165,7 +169,6 @@ class VaeImageEncoder(nn.Module):
 """
 CLIP-Edited.
 """
-
 
 class FiLM(nn.Module):
     """Feature-wise linear modulation from a conditioning vector."""
@@ -236,9 +239,8 @@ class FiLMMLPBody(nn.Module):
 PSNR-Unedited
 """
 
-
 class MLPBlock(nn.Module):
-    """Plain MLP layer (no FiLM): Linear → LayerNorm → ReLU → Dropout."""
+    """Plain MLP layer (no FiLM): Linear -> LayerNorm -> ReLU -> Dropout."""
 
     def __init__(self, in_dim: int, out_dim: int, dropout_rate: float):
         super().__init__()
@@ -281,8 +283,7 @@ class MLPBody(nn.Module):
 Shared metric predictor components.
 """
 
-
-class MetricRegressor(nn.Module):
+class SurrogateRegressor(nn.Module):
     """
     PSNR-Unedited MLP tower and CLIP-Edited FiLM-conditioned MLP
     tower over bottlenecked embeddings and timestep conditioning.
@@ -305,7 +306,7 @@ class MetricRegressor(nn.Module):
     ):
         super().__init__()
         if n_targets != 2:
-            raise ValueError("MetricRegressor expects exactly two targets (psnr, clip)")
+            raise ValueError("SurrogateRegressor expects exactly two targets (psnr, clip)")
 
         # Project the embeddings to the MLP input dimension.
         self.img_proj = nn.Sequential(
@@ -386,8 +387,8 @@ class MetricRegressor(nn.Module):
         return standardized * self.target_std + self.target_mean
 
 
-class MetricPredictor(nn.Module):
-    """Bundles ChordEdit encoders with MetricRegressor."""
+class SurrogateModel(nn.Module):
+    """Bundles ChordEdit encoders with SurrogateRegressor."""
 
     def __init__(
         self,
@@ -419,7 +420,7 @@ class MetricPredictor(nn.Module):
         self.text_encoder = TextEncoder(self.pipeline)
         self._encoder_img_dim = self.image_encoder.hidden_dim
         self._encoder_text_dim = self.text_encoder.hidden_dim
-        self.regressor = MetricRegressor(self._encoder_img_dim, self._encoder_text_dim, n_targets=len(M_TARGET_COLS))
+        self.regressor = SurrogateRegressor(self._encoder_img_dim, self._encoder_text_dim, n_targets=len(M_TARGET_COLS))
 
     @property
     def encoder_img_dim(self) -> int:

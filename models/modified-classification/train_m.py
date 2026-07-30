@@ -1,5 +1,5 @@
 """
-Train the metric surrogate M:
+Train the surrogate model M_hat (paper: M_hat(x_src, c_src, c_tar, t*, t**) -> s):
 
     M(img_emb, mask_emb, src_emb, tar_emb, t_start, t_end) -> (psnr, clip)
 
@@ -38,7 +38,7 @@ from _data import (
 )
 from _helpers import save_run_settings
 from scores import calc_normalized_deltas
-from model_m import MetricPredictor, format_results, pairwise_ranking_loss
+from model_m import SurrogateModel, format_results, pairwise_ranking_loss
 from settings import *
 
 
@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
 
 @torch.no_grad()
 def evaluate(
-    model: MetricPredictor,
+    model: SurrogateModel,
     loader,
     device: torch.device | None = None,
 ) -> dict[str, float]:
@@ -93,7 +93,7 @@ def evaluate(
 
 
 def train(
-    model: MetricPredictor,
+    model: SurrogateModel,
     train_X: pd.DataFrame,
     train_y: pd.DataFrame,
     val_X: pd.DataFrame,
@@ -166,7 +166,7 @@ def train(
             # If specified, use per-sample ranking loss.
             if use_ranking:
 
-                # Same apply_t_score (Δ then T_TARGET_SCORE) for true and pred order.
+                # Same scoring (Delta then T_TARGET_PHI) for true and pred order.
                 # SampleGridBatchSampler yields one sample's full grid per batch.
                 y_hat = model.regressor.denormalize(out)
                 base_t_start = torch.as_tensor(DEFAULT_T_START, device=t.device, dtype=t.dtype)
@@ -179,8 +179,8 @@ def train(
                 # Calculate the true and predicted metrics.
                 true_delta = calc_normalized_deltas(y, baseline_idx)
                 pred_delta = calc_normalized_deltas(y_hat, baseline_idx)
-                true_phi = T_TARGET_SCORE(true_delta)
-                pred_phi = T_TARGET_SCORE(pred_delta)
+                true_phi = T_TARGET_PHI(true_delta)
+                pred_phi = T_TARGET_PHI(pred_delta)
                 loss = loss + RANKING_LOSS_WEIGHT * pairwise_ranking_loss(pred_phi, true_phi)
             
             # Backpropagate the training loss.
@@ -249,7 +249,7 @@ def main() -> None:
 
     # Initialize and train the model.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MetricPredictor(device=device).to(device)
+    model = SurrogateModel(device=device).to(device)
     run_dir = train(model, train_X, train_y, val_X, val_y, test_X, test_y)
     print(f"\nSaved to {run_dir.resolve()}")
 
