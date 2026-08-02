@@ -37,7 +37,7 @@ def load_run_settings(run_dir: Path):
     path = Path(run_dir) / SETTINGS_FILENAME
     if not path.exists():
         raise FileNotFoundError(f"Missing {path}. Re-run train_m.py to snapshot settings.py for this run.")
-    already = [n for n in ("_data", "model_m", "model_t") if n in sys.modules]
+    already = [n for n in ("_data", "embeddings", "model_m", "model_t") if n in sys.modules]
     if already:
         raise RuntimeError(
             f"load_run_settings() must be called before importing modules that bind settings "

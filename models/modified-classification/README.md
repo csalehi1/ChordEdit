@@ -91,11 +91,12 @@ Requires ChordEdit weights at `CHORD_EDIT_MODEL_ROOT` for the selected `CHORD_ED
 Pack scattered per-sample embedding `.pt` files (written by the annotation
 pipeline) into a packed table at
 `.cache/packed_embeddings/<CHORD_EDIT_MODEL>-<t_delta>-<dir_slug>.pt` (next to
-`_data.py`; `t_delta` is `TARGET_T_DELTA` with `.` replaced by `p`, `dir_slug`
-is `DIR_NAME` with underscores removed and lowercased) without training:
+`embeddings.py`, which holds all cache/encode logic; `t_delta` is
+`TARGET_T_DELTA` with `.` replaced by `p`, `dir_slug` is `DIR_NAME` with
+underscores removed and lowercased) without training:
 
 ```bash
-python scripts/claude_cache_embeds.py --dir-names UltraEdit_Region_1000  # CPU-only
+python train_m.py --skip-model  # CPU-only; builds the caches, then exits
 ```
 
 Encoder behavior always matches the ChordEdit model type: for `sd` models the
@@ -108,8 +109,8 @@ as a miss and repacked.
 
 Later `train_m` / eval reuse the packed cache. Encoders are inherited from the
 ChordEdit pipeline and are never trainable; if no cache can satisfy a request,
-`train_m`/eval fall back to encoding on the fly with the frozen encoders after
-a prominent warning (the pack-only script above raises instead).
+`embeddings.get_embeddings` falls back to encoding on the fly with the frozen
+encoders (and raises if the caller provides no encoder-bearing predictor).
 
 **1. Train**
 
