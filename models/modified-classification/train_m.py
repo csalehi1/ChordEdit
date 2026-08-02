@@ -130,10 +130,12 @@ def train(
         # denormalize maps predictions back to raw metric units for ranking/eval.
         model.regressor.set_target_stats(y_train.mean(0), y_train.std(0))
     print(
-        "Target columns (train):  "
-        + "  ".join(
-            f"{c}: mean={model.regressor.target_mean[i]:.3f} "
-            f"std={model.regressor.target_std[i]:.3f}"
+        "Target columns (train):\n"
+        f"  {'Target':<20} {'Mean':>8} {'Std':>8}\n"
+        + "\n".join(
+            f"  {c:<20} "
+            f"{model.regressor.target_mean[i]:8.3f} "
+            f"{model.regressor.target_std[i]:8.3f}"
             for i, c in enumerate(M_TARGET_COLS)
         )
     )
@@ -244,9 +246,10 @@ def main() -> None:
     X_df, y_df = prepare_df(data_df)
     train_X, val_X, test_X, train_y, val_y, test_y = split_df(X_df, y_df)
     print(
-        f"Splits: train={len(train_X)} cells ({train_X[SAMPLE_ID_COL].nunique()} samples)  "
-        f"val={len(val_X)} cells ({val_X[SAMPLE_ID_COL].nunique()} samples)  "
-        f"test={len(test_X)} cells ({test_X[SAMPLE_ID_COL].nunique()} samples)"
+        f"Dataset splits:\n"
+        f"  train: {len(train_X)} cells ({train_X[SAMPLE_ID_COL].nunique()} samples)\n"
+        f"  val: {len(val_X)} cells ({val_X[SAMPLE_ID_COL].nunique()} samples)\n"
+        f"  test: {len(test_X)} cells ({test_X[SAMPLE_ID_COL].nunique()} samples)"
     )
 
     # Initialize and train the model.

@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from settings import *
 
 _PACKED_EMBEDDINGS_DIR = Path(__file__).resolve().parent / ".cache" / "packed_embeddings"
+_SCATTERED_EMBEDDINGS_DIR = Path(f"/shared/ssd_30T/mirick/embeddings/{CHORD_EDIT_MODEL}/{DIR_NAME}/annotation_embeddings/")
 
 
 def _prep_sample_id(value) -> str:
@@ -45,14 +46,8 @@ def _prep_embedding_path(embedding_path: str) -> str:
         return str(path)
     path = Path(str(embedding_path).lstrip("/"))
     if path.parts and path.parts[0] == EMBEDDINGS_SAMPLES_DIRNAME:
-        return str(EMBEDDINGS_DIR / path)
-    return str(EMBEDDINGS_DIR / EMBEDDINGS_SAMPLES_DIRNAME / path)
-
-
-def mean_pool(last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    """Mask-weighted mean over the token dimension."""
-    mask = attention_mask.unsqueeze(-1).expand_as(last_hidden).float()
-    return (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+        path = path.relative_to(EMBEDDINGS_SAMPLES_DIRNAME)
+    return str(_SCATTERED_EMBEDDINGS_DIR / path)
 
 
 """
@@ -67,19 +62,21 @@ mean_pool), sdxl must store text_encoder_2's pooled embeds directly
 hidden-state sequences), flux is not implemented.
 """
 
-TEXT_POOLING_BY_PIPELINE = {"sd": "masked_mean", "sdxl": "pooled_embeds"}
-
-
 def _get_text_pooling() -> str:
-    """Text pooling name for CHORD_EDIT_PIPELINE_TYPE; raises for unsupported types."""
+    """Text pooling name for CHORD_EDIT_PIPELINE_TYPE."""
+    if CHORD_EDIT_PIPELINE_TYPE == "sd":
+        return "masked_mean"
+    if CHORD_EDIT_PIPELINE_TYPE == "sdxl":
+        return "pooled_embeds"
     if CHORD_EDIT_PIPELINE_TYPE == "flux":
-        raise NotImplementedError(
-            "CHORD_EDIT_MODEL='flux' text pooling is not implemented; "
-            "use sd_turbo / sdxl_turbo."
-        )
-    if CHORD_EDIT_PIPELINE_TYPE not in TEXT_POOLING_BY_PIPELINE:
-        raise ValueError(f"Unsupported CHORD_EDIT_PIPELINE_TYPE={CHORD_EDIT_PIPELINE_TYPE!r}")
-    return TEXT_POOLING_BY_PIPELINE[CHORD_EDIT_PIPELINE_TYPE]
+        raise NotImplementedError()
+    raise ValueError(f"Unsupported CHORD_EDIT_PIPELINE_TYPE={CHORD_EDIT_PIPELINE_TYPE!r}")
+
+
+def mean_pool(last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Mask-weighted mean over the token dimension."""
+    mask = attention_mask.unsqueeze(-1).expand_as(last_hidden).float()
+    return (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
 
 
 class SdMaskedMeanTextExtractor:
@@ -222,7 +219,6 @@ def _load_packed_cache(
         print(f"{packed_path} missing {n_missing} of {len(sample_ids)} requested samples; repacking")
         return None
     idxs = [id_to_i[sid] for sid in sample_ids]
-    print(f"Loaded embeddings from {packed_path} ({len(sample_ids)} samples)")
     return (
         sample_ids,
         data["img"][idxs].contiguous(),
@@ -379,11 +375,10 @@ def _encode_embeddings(
 
     if cache_scattered:
         # Write many per-sample .pt files indexed by EMBEDDINGS_CSV.
-        samples_root = EMBEDDINGS_DIR / EMBEDDINGS_SAMPLES_DIRNAME
-        print(f"Caching scattered embeddings ({n_samples} samples) -> {samples_root}")
+        print(f"Caching scattered embeddings ({n_samples} samples) -> {_SCATTERED_EMBEDDINGS_DIR}")
         rows: list[dict[str, str]] = []
         for i, sid in enumerate(tqdm(sample_ids, desc="Caching scattered", unit="sample")):
-            sample_dir = samples_root / sid
+            sample_dir = _SCATTERED_EMBEDDINGS_DIR / sid
             sample_dir.mkdir(parents=True, exist_ok=True)
             img_path = sample_dir / "image.pt"
             mask_path = sample_dir / "mask.pt"

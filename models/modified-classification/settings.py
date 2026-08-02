@@ -11,12 +11,12 @@ Dataset settings.
 """
 
 # NOTE: Set this to the directory containing the generated metrics and inputs CSV files.
-DIR_NAME_DEFAULT = "UltraEdit_Region_10000"
-DIR_NAME = input(f"Dataset directory [{DIR_NAME_DEFAULT}]: ") or DIR_NAME_DEFAULT
+DIR_NAME_DEFAULT = "UltraEdit_Region_10000" # UltraEdit_Background_1000_v2 | UltraEdit_Region_<N> | UltraEdit_Style_1000_v2
+DIR_NAME = input(f"Press <ENTER> to confirm `DIR_NAME` [{DIR_NAME_DEFAULT}]: ") or DIR_NAME_DEFAULT
 
-# ChordEdit backbone used for encoders / embedding caches.
-# Disk layout uses embeddings/<CHORD_EDIT_MODEL>/{DIR_NAME}/...
-CHORD_EDIT_MODEL = "sdxl_turbo"  # "sd_turbo" | "sdxl_turbo" | "flux"
+# NOTE: Choose the ChordEdit model to use for the encoders and embedding caches.
+CHORD_EDIT_MODEL_DEFAULT = "sd_turbo"  # "sd_turbo" | "sdxl_turbo" | "flux"
+CHORD_EDIT_MODEL = input(f"Press <ENTER> to confirm `CHORD_EDIT_MODEL` [{CHORD_EDIT_MODEL_DEFAULT}]: ") or CHORD_EDIT_MODEL_DEFAULT
 
 CHORD_EDIT_MODEL_CONFIGS = {
     "sd_turbo": {
