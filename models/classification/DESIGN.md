@@ -145,22 +145,32 @@ At inference, the continuous prediction is snapped to the nearest bucket index. 
 ## Data Pipeline
 
 1. Load `id_to_metrics_*.csv` (`METRICS_CSV`) and filter to rows where `t_delta == TARGET_T_DELTA`
-2. Compute the configured target score via `C_TARGET_FUNC` (default: `compute_softplus_score` over `C_TARGET_COLS`) and pick the row with the highest `C_TARGET_COL` per `sample_id`
+2. Compute the configured target score via `C_TARGET_FUNC` (default: `linex_score` over per-sample normalized deltas of `C_TARGET_COLS`) and pick the row with the highest `C_TARGET_COL` per `sample_id`. The baseline row scores exactly $0$, so the selected row is the best improvement over the baseline edit, or the baseline itself when no candidate improves on it
 3. Join with `id_to_inputs_*.csv` (`INPUTS_CSV`) to get `(source_prompt, target_prompt)`
 4. Map discrete `t_start` / `t_end` float values to ordinal indices $0, 1, 2, \ldots$ into the fixed grids `GRID_T_START` / `GRID_T_END` (missing cells in the CSV are fine; those classes simply receive no labels)
 5. Random split 80/10/10 for train/val/test
 
 ### Target Score Options
 
-The score used to select the best row per `sample_id` is configured in `settings.py` by setting `C_TARGET_FUNC`, `C_TARGET_COL`, and `C_TARGET_LABEL` together. `C_TARGET_COLS` names the raw metric columns passed into the score function (default: PSNR and CLIP).
+The score used to select the best row per `sample_id` is configured in `settings.py` by setting `C_TARGET_ALPHA`, `C_TARGET_FUNC`, `C_TARGET_COL`, and `C_TARGET_LABEL` together. `C_TARGET_COLS` names the raw metric columns passed into the score function (default: PSNR and CLIP).
 
-- **`compute_weighted_combined_score`**: Weighted blend of the configured columns (optionally min-max normalised per row).
+Metrics live on different scales, so scoring never uses raw values. For each `sample_id`, `scores.calc_normalized_deltas` min-max scales each metric across that sample's candidate cells $T$ and subtracts the baseline cell $s_i^0$ at $(\text{DEFAULT\_T\_START}, \text{DEFAULT\_T\_END})$:
 
-- **`compute_agreement_score`**: $1$ when all configured metrics agree on a row, decreasing with per-row spread.
+$$\Delta_i = \frac{s_i - s_i^0}{\max_T s_i - \min_T s_i}$$
 
-- **`compute_naive_pareto_score`**: For each `sample_id` group, the baseline row is identified at $(\text{DEFAULT\_T\_START}, \text{DEFAULT\_T\_END})$. Each row receives the product of $\max(0, \Delta m_i)$ over metrics relative to that baseline; the baseline itself scores $0$.
+giving $\Delta_i \in [-1, 1]$, with $\Delta_i > 0$ an improvement and $\Delta = 0$ at the baseline. `scores.score_df` performs the DataFrame $\to (B, N, C)$ packing, applies the score in one batched call, and returns a `pd.Series` aligned to `df.index`. All scores are plain functions of $\Delta$ and are differentiable, so the same objective can be reused as a training signal without change.
 
-- **`compute_softplus_score`** (active default): Uses the same baseline as above. With $s(t) = \operatorname{softplus}_\beta(t) - \log 2 / \beta$, each row receives $m = \sum_i s_i + \alpha \prod_i s_i$ on (optionally normalised) metric deltas. Default $\alpha = 1$, $\beta = 2$ (`_FUNC_ALPHA`, `_FUNC_BETA` in `settings.py`). The baseline scores $0$; improvements are rewarded smoothly and regressions penalised.
+- **`naive_score`**: $\varphi(\Delta) = \sum_i w_i \Delta_i$. Simple and interpretable, each weight independently scaling one metric's importance. Indifferent to balance: it cannot distinguish a candidate that improves both metrics moderately from one that maximizes one while tanking the other, so long as the weighted sums match.
+
+- **`cara_score`**: $\varphi(\Delta) = \frac{1}{\alpha}\sum_i w_i\left(1 - e^{-\alpha\Delta_i}\right)$, the exponential (CARA) utility $u(x) = (1 - e^{-\alpha x})/\alpha$ normalized so $u(0) = 0$ and $u'(0) = 1$. Strict concavity biases toward balance: regressions incur an exponentially growing penalty. The cost is that gains saturate at $w_i/\alpha$, so it cannot separate "improves a metric strongly" from "improves it very strongly".
+
+- **`linex_score`** (active default): the average of the two, i.e. the linear-exponential (LINEX) utility $u(x) = \tfrac{1}{2}\left(x + (1 - e^{-\alpha x})/\alpha\right)$:
+
+$$\varphi_{\text{LINEX}}(\Delta) = \frac{1}{2}\sum_i w_i\left[\Delta_i + \frac{1 - e^{-\alpha\Delta_i}}{\alpha}\right]$$
+
+  Keeps CARA's superlinear regression penalty while removing its reward cap — gains accrue at an asymptotic rate of $1/2$ per unit, so the score is unbounded in both directions. The trade-off is a weaker balance bias: at matched $\alpha$ its curvature is half of CARA's ($u''(0) = -\alpha/2$ vs $-\alpha$). Default $\alpha = 2$ (`C_TARGET_ALPHA`). Recovers `naive_score` as $\alpha \to 0^+$.
+
+All three reduce the trailing metric axis of a $(\dots, N, C)$ delta tensor, accept optional per-metric `weights` of shape $(C,)$, and map $\Delta = 0 \mapsto 0$.
 
 ## Training
 

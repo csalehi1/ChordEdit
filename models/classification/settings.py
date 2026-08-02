@@ -1,16 +1,9 @@
-from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Callable
 
 import numpy as np
 
-from models.classification.scores import (
-    compute_weighted_combined_score,
-    compute_agreement_score,
-    compute_naive_pareto_score,
-    compute_softplus_score,
-)
+from models.classification.scores import linex_score, score_df
 
 
 """
@@ -70,10 +63,22 @@ GRID_VALUES = np.linspace(0.0, 1.0, 11)
 GRID_T_START = GRID_VALUES
 GRID_T_END = GRID_VALUES
 
-_FUNC_ALPHA, _FUNC_BETA, _FUNC_NORM = 1.0, 2.0, True
-C_TARGET_FUNC = lambda df: compute_softplus_score(df, *C_TARGET_COLS, alpha=_FUNC_ALPHA, beta=_FUNC_BETA, normalize=_FUNC_NORM)
-C_TARGET_COL = f"softplus_score_a{_FUNC_ALPHA:g}-b{_FUNC_BETA:g}-n{_FUNC_NORM:d}"
-C_TARGET_LABEL = f"Softplus Score ($\\alpha={_FUNC_ALPHA}$, $\\beta={_FUNC_BETA}$, $n={_FUNC_NORM:d}$)"
+# Scalar objective used to pick one row per sample_id.
+# Scores consume per-sample normalized deltas Δ; see scores.calc_normalized_deltas.
+C_TARGET_ALPHA = 2.0
+_C_SCORE_KW = dict(alpha=C_TARGET_ALPHA)
+C_TARGET_SCORE = partial(linex_score, **_C_SCORE_KW)                          # torch φ(Δ)
+C_TARGET_SCORE_DF = partial(score_df, score_fn=linex_score, **_C_SCORE_KW)    # (df, *cols) -> Series
+
+
+def linex_score_df(df):
+    """C_TARGET_FUNC with C_TARGET_COLS bound: metrics DataFrame -> pd.Series."""
+    return C_TARGET_SCORE_DF(df, *C_TARGET_COLS)
+
+
+C_TARGET_FUNC = linex_score_df
+C_TARGET_COL = "linex_score"
+C_TARGET_LABEL = f"LINEX Score ($\\alpha={C_TARGET_ALPHA:g}$)"
 
 
 """

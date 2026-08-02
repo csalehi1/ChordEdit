@@ -97,8 +97,9 @@ def load_data() -> pd.DataFrame:
     filtered = metrics[metrics[T_DELTA_COL] == TARGET_T_DELTA].copy()
     if C_TARGET_COL not in filtered.columns:
         filtered[C_TARGET_COL] = C_TARGET_FUNC(filtered)
-    # Rows with default t-values will score 0 on softplus so that
-    # a maximum value will always exist among improving rows.
+    # The baseline (DEFAULT_T_START, DEFAULT_T_END) row scores exactly 0 under
+    # any of the delta scores, so idxmax picks the best improving row, or the
+    # baseline itself when no candidate improves on it.
     best_idx = filtered.groupby(SAMPLE_ID_COL)[C_TARGET_COL].idxmax()
     best = filtered.loc[best_idx, [SAMPLE_ID_COL, T_START_COL, T_END_COL]].reset_index(drop=True)
 

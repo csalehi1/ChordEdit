@@ -1,138 +1,278 @@
-import pandas as pd
+from __future__ import annotations
+
+import math
+from collections.abc import Callable
+from typing import Any
+
 import numpy as np
+import pandas as pd
+import torch
+
 
 _EPS = 1e-8
 
 
-def compute_weighted_combined_score(
+def naive_score(
+    deltas: torch.Tensor,  # (..., N, C)
+    weights: torch.Tensor | None = None,  # (C,)
+) -> torch.Tensor:
+    """
+    Naive Score. Weighted sum of the metric deltas. Simple and interpretable,
+    with each weight independently scaling its metric's importance. However, it
+    is indifferent to balance: it cannot distinguish a candidate that improves
+    both metrics moderately from one that maximizes one metric while tanking
+    the other, so long as the weighted sums match.
+
+        phi_nai(Delta) = sum_i w_i * Delta_i
+
+    deltas: (..., N, C)
+    weights: (C,) or None for equal weights (w_i = 1)
+
+    Returns: shape (..., N)
+
+    See a plot of the score surface (2 metrics):
+    https://www.desmos.com/3d/50byxqmq3q
+    """
+    if weights is None:
+        return deltas.sum(dim=-1)
+    return (deltas * weights).sum(dim=-1)
+
+
+def cara_score(
+    deltas: torch.Tensor,  # (..., N, C)
+    weights: torch.Tensor | None = None,  # (C,)
+    alpha: float = 2.0,
+) -> torch.Tensor:
+    """
+    CARA Score. Sum of deltas passed through the exponential (CARA) utility
+    u(x) = (1 - e^{-alpha x}) / alpha, normalized so u(0) = 0 and u'(0) = 1.
+    Strict concavity biases toward balance: regressions incur an exponentially
+    growing penalty, so a severe regression cannot be offset by gains
+    elsewhere. The cost is that gains saturate at w_i / alpha per metric, so
+    the score cannot distinguish among candidates that improve a metric
+    strongly versus very strongly. Recovers the Naive Score as alpha -> 0+.
+
+        phi_CARA(Delta) = (1/alpha) * sum_i w_i * (1 - exp(-alpha * Delta_i))
+
+    deltas: (..., N, C)
+    weights: (C,) or None for equal weights (w_i = 1)
+    alpha: float > 0
+
+    Returns: shape (..., N)
+
+    See a plot of the score surface (2 metrics):
+    https://www.desmos.com/3d/wbahputeel
+    """
+    # u(x) = (1 - e^{-alpha x}) / alpha
+    # See https://en.wikipedia.org/wiki/Exponential_utility.
+    u = -torch.expm1(-alpha * deltas) / alpha
+
+    if weights is None:
+        return u.sum(dim=-1)
+    return (u * weights).sum(dim=-1)
+
+
+def linex_score(
+    deltas: torch.Tensor,  # (..., N, C)
+    weights: torch.Tensor | None = None,  # (C,)
+    alpha: float = 2.0,
+) -> torch.Tensor:
+    """
+    LINEX Score. Average of the Naive and CARA Scores, equivalent to the
+    linear-exponential (LINEX) utility u(x) = (x + (1 - e^{-alpha x}) / alpha) / 2,
+    normalized so u(0) = 0 and u'(0) = 1. Keeps CARA's superlinear regression
+    penalty while removing its reward cap: gains accrue at an asymptotic rate
+    of 1/2 per unit, so the score is unbounded both above and below and can
+    distinguish among candidates that improve both metrics. The trade-off is a
+    weaker balance bias: at matched alpha its curvature is half of CARA's
+    (u''(0) = -alpha/2 vs -alpha), and a large gain on one metric can
+    partially offset weakness on the other. Recovers the Naive Score as
+    alpha -> 0+.
+
+        phi_LINEX(Delta) = (phi_nai(Delta) + phi_CARA(Delta)) / 2
+                         = (1/2) * sum_i w_i * [Delta_i + (1 - exp(-alpha * Delta_i)) / alpha]
+
+    deltas: (..., N, C)
+    weights: (C,) or None for equal weights (w_i = 1)
+    alpha: float > 0
+
+    Returns: shape (..., N)
+
+    See a plot of the score surface (2 metrics):
+    https://www.desmos.com/3d/7ambm2crdv
+    """
+    # Fuse naive + cara into one expm1 pass.
+    u = -torch.expm1(-alpha * deltas) / alpha
+    combined = deltas + u
+    if weights is None:
+        return 0.5 * combined.sum(dim=-1)
+    return 0.5 * (combined * weights).sum(dim=-1)
+
+
+def calc_normalized(
+    values: torch.Tensor,
+    *,
+    per_sample: bool = True,
+) -> torch.Tensor:
+    """
+    Min-max normalize metric columns. If per_sample is True (default),
+    each leading sample is scaled independently over its N candidates.
+    When False, each metric uses a single min/max over all non-metric
+    dimensions.
+
+    NaN marks an unlabeled candidate (e.g. a sparse timestep grid). NaN cells
+    are excluded from the min/max — one missing cell cannot poison the rest of
+    the sample — and stay NaN in the output. NaN support is for scoring/eval
+    only: backprop through a NaN-sparse tensor yields NaN gradients (0 * NaN
+    in elementwise backwards), so any caller that backprops must use dense
+    labeled-only batches. train.py only consumes score_df output for label
+    selection, so no gradients flow through these helpers.
+
+    values: (..., N, C)
+    per_sample: bool = True
+
+    Returns: (..., N, C)
+    """
+    if values.ndim < 2:
+        raise ValueError(f"values must be (..., N, C), got shape {tuple(values.shape)}")
+
+    if per_sample:
+        # Independent range per sample along candidate axis N. Torch has no
+        # nanmin/nanmax, so mask NaN with +/-inf sentinels that can never win
+        # the reduction.
+        vmin = values.nan_to_num(nan=math.inf).amin(dim=-2, keepdim=True)
+        vmax = values.nan_to_num(nan=-math.inf).amax(dim=-2, keepdim=True)
+    else:
+        # One global range per metric across every leading / candidate dim.
+        reduce_dims = tuple(range(values.ndim - 1))
+        vmin = values.nan_to_num(nan=math.inf).amin(dim=reduce_dims, keepdim=True)
+        vmax = values.nan_to_num(nan=-math.inf).amax(dim=reduce_dims, keepdim=True)
+
+    return (values - vmin) / (vmax - vmin + _EPS)
+
+
+def calc_deltas(
+    values: torch.Tensor,
+    baseline_idx: int | torch.Tensor,
+) -> torch.Tensor:
+    """
+    Subtract the baseline (default) edit along the candidate axis.
+
+    Every delta is relative to the baseline, so a NaN (unlabeled) baseline
+    cell would silently invalidate the whole sample; raise instead.
+
+    values: (..., N, C)
+    baseline_idx: int or LongTensor matching values.shape[:-2]
+
+    Returns: (..., N, C) with baseline rows at 0.
+    """
+    if values.ndim < 2:
+        raise ValueError(f"values must be (..., N, C), got shape {tuple(values.shape)}")
+
+    def _gather_baseline(values: torch.Tensor, baseline_idx: int | torch.Tensor) -> torch.Tensor:
+        if isinstance(baseline_idx, torch.Tensor):
+            leading = values.shape[:-2]
+            if tuple(baseline_idx.shape) != tuple(leading):
+                raise ValueError(f"baseline_idx shape {tuple(baseline_idx.shape)} must match {tuple(leading)}")
+            c = values.shape[-1]
+            idx = baseline_idx.to(dtype=torch.long, device=values.device)
+            idx = idx.unsqueeze(-1).unsqueeze(-1).expand(*leading, 1, c)
+            return torch.gather(values, dim=-2, index=idx)
+        i = int(baseline_idx)
+        return values[..., i : i + 1, :]
+
+    baseline = _gather_baseline(values, baseline_idx)
+    if torch.isnan(baseline).any():
+        raise ValueError("baseline (default) cell is NaN/unlabeled for at least one sample")
+    return values - baseline
+
+
+def calc_normalized_deltas(
+    values: torch.Tensor,
+    baseline_idx: int | torch.Tensor,
+    *,
+    per_sample: bool = True,
+) -> torch.Tensor:
+    """
+    Per-sample-normalized score deltas relative to a default edit.
+    Because metrics live on different scales, scoring uses deltas
+
+        Delta_i = (s_i - s_i^0) / (max_T s_i - min_T s_i)
+
+    where min/max are over the same sample's candidate edits T when
+    per_sample=True, and s_i^0 is the baseline (default) edit. When the
+    per-metric range is positive, Delta_i is in [-1, 1]; Delta_i > 0 is an
+    improvement over the default and Delta_i < 0 a regression.
+
+    Equivalent to calc_deltas(calc_normalized(values, per_sample=...), ...).
+    NaN (unlabeled) cells stay NaN without affecting labeled cells; the
+    baseline cell itself must be labeled (calc_deltas raises otherwise).
+
+    values: (..., N, C)
+    baseline_idx: int or LongTensor matching values.shape[:-2]
+    per_sample: bool = True
+
+    Returns: (..., N, C)
+    """
+    return calc_deltas(calc_normalized(values, per_sample=per_sample), baseline_idx)
+
+
+def score_df(
     df: pd.DataFrame,
     *cols: str,
-    weights: np.ndarray | None = None,
-    normalize: bool = True,
+    score_fn: Callable[..., torch.Tensor],
+    **kwargs: Any,
 ) -> pd.Series:
     """
-    Return a combined quality score that weights an arbitrary set of metrics.
+    Score each row of a metrics DataFrame via per-sample normalized deltas.
 
-    When normalize is True (default), each metric is min-max scaled to [0, 1]
-    before blending; the result is also in [0, 1]. When normalize is False,
-    raw metric values are blended directly. The weights need not sum to 1.
+    Groups by sample_id, packs equal-sized grids to (B, N, C), applies
+    calc_normalized_deltas then score_fn in one batched call, and returns a
+    Series aligned to df.index.
     """
-    n_values = len(cols)
-    values = df.loc[:, list(cols)].to_numpy(dtype=float)
-    n_weights = len(weights) if weights is not None else n_values
-    weights = weights if weights is not None else np.ones(n_values, dtype=float)
-    if n_weights != n_values:
-        raise ValueError(f"weights must have shape ({n_values},), got {weights.shape}")
+    from models.classification.settings import DEFAULT_T_END, DEFAULT_T_START, SAMPLE_ID_COL, T_END_COL, T_START_COL
 
-    if normalize:
-        min_values = np.nanmin(values, axis=1, keepdims=True)
-        max_values = np.nanmax(values, axis=1, keepdims=True)
-        values = (values - min_values) / (max_values - min_values + _EPS)
+    if not cols:
+        raise ValueError("expected one or more metric column names")
 
-    combined = (values * weights).sum(axis=1) / (weights.sum() + _EPS)
-    weight_tag = "-".join(f"{w:g}" for w in weights)
-    return pd.Series(combined, index=df.index, name=f"weighted_score_{weight_tag}")
+    metric_cols = list(cols)
+    index_lists: list[np.ndarray] = []
+    values_list: list[np.ndarray] = []
+    baseline_list: list[int] = []
 
+    for _, group in df.groupby(SAMPLE_ID_COL, sort=True):
+        # Get the index of the group.
+        index_lists.append(group.index.to_numpy())
+        # Get the values of the group.
+        values_list.append(group.loc[:, metric_cols].to_numpy(dtype=np.float64, copy=True))
+        # Get the mask for the base row.
+        base_mask_t_start = np.isclose(group[T_START_COL].to_numpy(dtype=float), DEFAULT_T_START)
+        base_mask_t_end = np.isclose(group[T_END_COL].to_numpy(dtype=float), DEFAULT_T_END)
+        base_mask = base_mask_t_start & base_mask_t_end
+        # Verify that there is exactly one base row.
+        if int(base_mask.sum()) != 1:
+            raise ValueError(f"Expected exactly one base row, found {int(base_mask.sum())}")
+        # Append the index of the base row to both lists.
+        baseline_list.append(int(np.flatnonzero(np.asarray(base_mask))[0]))
 
-def compute_agreement_score(
-    df: pd.DataFrame,
-    *cols: str,
-    normalize: bool = True,
-) -> pd.Series:
-    """
-    Return a score in [0, 1] measuring how closely the given metrics agree.
+    n_rows = {v.shape[0] for v in values_list}
+    if len(n_rows) != 1:
+        raise ValueError(f"ragged candidate counts across samples: {sorted(n_rows)}")
 
-    Agreement is 1 when all metrics are equal on a row, and 0 at the point of
-    maximum per-row spread (max - min) in the population.
-    """
-    values = df.loc[:, list(cols)].to_numpy(dtype=float)
+    values = torch.as_tensor(np.stack(values_list), dtype=torch.float64)
+    baseline_idx = torch.as_tensor(baseline_list, dtype=torch.long)
+    deltas = calc_normalized_deltas(values, baseline_idx)
 
-    if normalize:
-        min_values = np.nanmin(values, axis=1, keepdims=True)
-        max_values = np.nanmax(values, axis=1, keepdims=True)
-        values = (values - min_values) / (max_values - min_values + _EPS)
+    # Process the score kwargs.
+    score_kwargs = dict(kwargs)
+    weights = score_kwargs.get("weights")
+    if weights is not None and not isinstance(weights, torch.Tensor):
+        score_kwargs["weights"] = torch.as_tensor(weights, dtype=values.dtype)
 
-    spread = np.nanmax(values, axis=1) - np.nanmin(values, axis=1)
-    return pd.Series(1.0 - spread / (np.nanmax(spread) + _EPS), index=df.index, name="agreement_score")
+    scores = score_fn(deltas, **score_kwargs)
+    scores_np = scores.detach().cpu().numpy()
 
-
-def compute_naive_pareto_score(
-    df: pd.DataFrame,
-    *cols: str,
-    sample_id_col: str = "sample_id",
-    base_t_start: float | None = None,
-    base_t_end: float | None = None,
-    normalize: bool = False,
-) -> pd.Series:
-    """
-    Return a Pareto improvement score for each row relative to the
-    baseline row in its sample_id group.
-
-    The baseline is the row at (DEFAULT_T_START, DEFAULT_T_END). When
-    normalize is True, each metric is min-max scaled within each sample_id
-    group before deltas are taken. Each row's score is the product of
-    max(0, delta_i) over all metrics relative to that baseline (the
-    baseline itself scores 0).
-    """
-    # TODO: Currently not implemented
-    raise NotImplementedError()
-
-
-def compute_softplus_score(
-    df: pd.DataFrame,
-    *cols: str,
-    alpha: float = 1.0,
-    beta: float = 2.0,
-    normalize: bool = True,
-) -> pd.Series:
-    """
-    Return a smooth score for each row relative to the baseline row in its
-    sample_id group. When normalize is True, each metric is min-max scaled
-    within each sample_id group before deltas are taken. With softplus
-    transforms s_i = sp(delta_i) of the (possibly normalized) metric deltas:
-
-        sp(x) = (1/beta)*(ln(1+e^{beta*x})-ln(2))
-        m     = sum_i s_i + alpha * prod_i s_i
-
-    The baseline scores 0. Rows that also score 0 but differ from the baseline
-    on every metric are shifted down by epsilon. Improvements are rewarded
-    smoothly and regressions are penalized.
-
-    Plot of the score surface (2 metrics):
-    https://www.desmos.com/3d/9slzoluqbd
-    """
-    from .settings import SAMPLE_ID_COL, DEFAULT_T_START, DEFAULT_T_END
-
-    # Normalize values within each sample_id group.
-    def _normalize_values(values: np.ndarray) -> np.ndarray:
-        min_values = np.nanmin(values, axis=0, keepdims=True)
-        max_values = np.nanmax(values, axis=0, keepdims=True)
-        return (values - min_values) / (max_values - min_values + _EPS)
-
-    # Calculate the shifted softplus score.
-    def _shifted_softplus(x: np.ndarray, beta: float) -> np.ndarray:
-        """Calculate (1/beta)*(ln(1+e^{beta*x})-ln(2))"""
-        if beta == 0: return x / 2.0
-        return np.logaddexp(0, beta * x) / beta - np.log(2) / beta
-
-    # Penalize rows where the score is 0 but it is not the baseline.
-    def _penalize_zeros(scores: np.ndarray, deltas: np.ndarray) -> np.ndarray:
-        """Shift down rows where the score is 0 but every metric differs from baseline."""
-        mask = (scores == 0) & np.all(deltas != 0, axis=1)
-        return scores - _EPS * mask
-
-    scores = pd.Series(0.0, index=df.index, name="softplus_score")
-    for sample_id, group in df.groupby(SAMPLE_ID_COL):
-        values = group.loc[:, list(cols)].to_numpy(dtype=float)
-        values = _normalize_values(values) if normalize else values
-        base_mask = (np.isclose(group["t_start"], DEFAULT_T_START) & np.isclose(group["t_end"], DEFAULT_T_END))
-        if base_mask.sum() != 1:
-            raise ValueError(f"Expected exactly one base row, found {base_mask.sum()}")
-        base_pos = int(np.flatnonzero(np.asarray(base_mask))[0])
-        deltas = values - values[base_pos]
-        s = _shifted_softplus(deltas, beta)
-        group_scores = s.sum(axis=1) + alpha * s.prod(axis=1)
-        group_scores = _penalize_zeros(group_scores, deltas)
-        scores.loc[group.index] = group_scores
-
-    return scores
+    out = pd.Series(np.nan, index=df.index, dtype=np.float64, name=getattr(score_fn, "__name__", "score"))
+    for idxs, row_scores in zip(index_lists, scores_np):
+        out.loc[idxs] = row_scores
+    return out

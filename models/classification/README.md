@@ -45,25 +45,39 @@ Open [eval_data.ipynb](eval_data.ipynb) to study input data before training.
 
 ### 3. Select a computed metric
 
-The training target is derived from the raw columns in `C_TARGET_COLS` (default: PSNR and CLIP). To change which score is used, set `C_TARGET_FUNC`, `C_TARGET_COL`, and `C_TARGET_LABEL` together in [settings.py](settings.py):
+The training target is a scalar score over **per-sample normalized deltas**, not raw metrics. For each `sample_id`, every metric in `C_TARGET_COLS` (default: PSNR and CLIP) is min-max scaled across that sample's candidate $(t^*, t^{**})$ cells, then the baseline cell at `(DEFAULT_T_START, DEFAULT_T_END)` is subtracted:
+
+$$\Delta_i = \frac{s_i - s_i^0}{\max_T s_i - \min_T s_i} \in [-1, 1]$$
+
+so $\Delta_i > 0$ is an improvement over the baseline edit and the baseline row itself is $\Delta = 0$. `scores.calc_normalized_deltas` builds $\Delta$; `scores.score_df` packs a metrics DataFrame into a $(B, N, C)$ tensor, applies a score in one batched call, and returns a `pd.Series` aligned to `df.index`.
+
+To change which score is used, set `C_TARGET_ALPHA`, `C_TARGET_FUNC`, `C_TARGET_COL`, and `C_TARGET_LABEL` together in [settings.py](settings.py):
 
 ```python
-_FUNC_ALPHA, _FUNC_BETA, _FUNC_NORM = 1.0, 2.0, True
-C_TARGET_FUNC = lambda df: compute_softplus_score(
-    df, *C_TARGET_COLS, alpha=_FUNC_ALPHA, beta=_FUNC_BETA, normalize=_FUNC_NORM
-)
-C_TARGET_COL = f"softplus_score_a{_FUNC_ALPHA:g}-b{_FUNC_BETA:g}-n{_FUNC_NORM:d}"
-C_TARGET_LABEL = f"Softplus Score ($\\alpha={_FUNC_ALPHA}$, $\\beta={_FUNC_BETA}$, $n={_FUNC_NORM:d}$)"
+C_TARGET_ALPHA = 2.0
+_C_SCORE_KW = dict(alpha=C_TARGET_ALPHA)
+C_TARGET_SCORE_DF = partial(score_df, score_fn=linex_score, **_C_SCORE_KW)
+
+
+def linex_score_df(df):
+    """C_TARGET_FUNC with C_TARGET_COLS bound: metrics DataFrame -> pd.Series."""
+    return C_TARGET_SCORE_DF(df, *C_TARGET_COLS)
+
+
+C_TARGET_FUNC = linex_score_df
+C_TARGET_COL = "linex_score"
+C_TARGET_LABEL = f"LINEX Score ($\\alpha={C_TARGET_ALPHA:g}$)"
 ```
 
-| Function | Description |
-|---|---|
-| `compute_softplus_score` | Smooth baseline-relative score; configure `_FUNC_ALPHA` and `_FUNC_BETA`. |
-| `compute_naive_pareto_score` | $\max(0, \Delta\text{PSNR}) \cdot \max(0, \Delta\text{CLIP})$ relative to the baseline row per sample group. |
-| `compute_agreement_score` | Similarity between the configured metric columns. |
-| `compute_weighted_combined_score` | Weighted blend of the configured metric columns. |
+| Function | $\varphi(\Delta)$ | Behaviour |
+|---|---|---|
+| `naive_score` | $\sum_i w_i \Delta_i$ | Linear and interpretable, but indifferent to balance: it cannot tell a candidate that improves both metrics moderately from one that maximizes one and tanks the other. |
+| `cara_score` | $\frac{1}{\alpha}\sum_i w_i\left(1 - e^{-\alpha \Delta_i}\right)$ | Strictly concave (exponential/CARA utility): regressions are penalized exponentially, so a severe regression cannot be offset elsewhere. Gains saturate at $w_i/\alpha$. |
+| `linex_score` **(active)** | $\frac{1}{2}\sum_i w_i\left[\Delta_i + \frac{1 - e^{-\alpha \Delta_i}}{\alpha}\right]$ | Mean of the two. Keeps CARA's superlinear regression penalty without the reward cap, so it still separates strong improvements. Curvature is half of CARA's at matched $\alpha$. |
 
-Parameterized metrics should encode their kwargs in `C_TARGET_COL`, e.g. `softplus_score_a1-b2-n1`.
+All three take `deltas` of shape $(\dots, N, C)$ plus optional `weights` of shape $(C,)$, reduce the trailing metric axis, recover `naive_score` as $\alpha \to 0^+$, and map $\Delta = 0 \mapsto 0$ — so `idxmax` per `sample_id` returns the best improving cell, or the baseline itself when nothing improves on it.
+
+`C_TARGET_COL` defaults to the score function's own name. If you persist it to `METRICS_CSV` via [add_data.ipynb](add_data.ipynb) and want the parameters pinned in the column name, use e.g. `f"linex_score_a{C_TARGET_ALPHA:g}"`.
 
 ### 4. Adjust remaining settings
 
@@ -72,8 +86,9 @@ If wanted, further edit [settings.py](settings.py) to adjust training behavior b
 | Setting | Description |
 |---|---|
 | `C_TARGET_COLS` / `C_TARGET_LABELS` | Raw metric columns (and display labels) fed into `C_TARGET_FUNC`. |
-| `C_TARGET_FUNC` / `C_TARGET_COL` / `C_TARGET_LABEL` | Active score function, column name, and plot label. |
-| `DEFAULT_T_START` / `DEFAULT_T_END` | Baseline $(t^*, t^{**})$ used by baseline-relative scores. |
+| `C_TARGET_FUNC` / `C_TARGET_COL` / `C_TARGET_LABEL` | Active score (metric columns pre-bound, `df -> Series`), output column name, and plot label. |
+| `C_TARGET_ALPHA` | Risk aversion $\alpha$ for `cara_score` / `linex_score`; larger values penalize regressions harder. |
+| `DEFAULT_T_START` / `DEFAULT_T_END` | Baseline $(t^*, t^{**})$ cell that deltas are measured against. Exactly one row per `sample_id` must match, or scoring raises. |
 | `ENCODER_MODEL` | Pretrained sentence-transformer checkpoint for the Siamese encoder. |
 | `FREEZE_ENCODER` | If `True`, encoder weights are frozen during training. Default `True`. |
 | `HEAD_TYPE` | `"CE"` (multiclass, default), `"CORAL"` (ordinal), or `"MSE"` (regression). |
@@ -117,7 +132,7 @@ Open [eval_model.ipynb](eval_model.ipynb) to inspect model performance after tra
 | `head_ce.py` | CE multiclass head (default) |
 | `head_coral.py` | CORAL ordinal head |
 | `head_mse.py` | MSE regression head |
-| `scores.py` | Scoring functions and data helpers |
+| `scores.py` | Torch score functions (`naive_score`, `cara_score`, `linex_score`), delta helpers (`calc_normalized`, `calc_deltas`, `calc_normalized_deltas`), and the `score_df` DataFrame adapter |
 | `train.py` | Training entry point |
 | `eval_model.ipynb` | Post-training evaluation notebook |
 | `eval_data.ipynb` | Dataset exploration notebook |
