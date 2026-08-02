@@ -88,16 +88,28 @@ Requires ChordEdit weights at `CHORD_EDIT_MODEL_ROOT` for the selected `CHORD_ED
 
 **0. Cache embeddings (optional)**
 
-Pack scattered per-sample embedding `.pt` files into a packed table at
-`.cache/packed_embeddings/<CHORD_EDIT_MODEL>-<DIR_NAME>.pt` (next to `_data.py`)
-without training. Edit globals at the top of the script (`DIR_NAME`, paths,
-`FREEZE_ENCODERS`), then:
+Pack scattered per-sample embedding `.pt` files (written by the annotation
+pipeline) into a packed table at
+`.cache/packed_embeddings/<CHORD_EDIT_MODEL>-<t_delta>-<dir_slug>.pt` (next to
+`_data.py`; `t_delta` is `TARGET_T_DELTA` with `.` replaced by `p`, `dir_slug`
+is `DIR_NAME` with underscores removed and lowercased) without training:
 
 ```bash
-python scripts/cache_embeddings.py
+python scripts/claude_cache_embeds.py --dir-names UltraEdit_Region_1000  # CPU-only
 ```
 
-With `FREEZE_ENCODERS=True` (default) this packs scattered files only (no model load). Set `FREEZE_ENCODERS=False` to encode images/prompts with ChordEdit instead. Later `train_m` / eval reuse the packed cache.
+Encoder behavior always matches the ChordEdit model type: for `sd` models the
+stored text sequences are collapsed with the same mask-weighted mean pooling as
+encoding (tokenizer-only, no weights); `sdxl` scattered files must already store
+`text_encoder_2` pooled embeds; `flux` raises `NotImplementedError`. Each packed
+cache carries a `meta` dict (model, pipeline type, pooling, dims, provenance) —
+a cache whose meta is missing or does not match the current settings is treated
+as a miss and repacked.
+
+Later `train_m` / eval reuse the packed cache. Encoders are inherited from the
+ChordEdit pipeline and are never trainable; if no cache can satisfy a request,
+`train_m`/eval fall back to encoding on the fly with the frozen encoders after
+a prominent warning (the pack-only script above raises instead).
 
 **1. Train**
 

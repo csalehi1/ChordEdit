@@ -45,6 +45,7 @@ from settings import *
 def parse_args() -> argparse.Namespace:
     # Argument parser for the command line.
     parser = argparse.ArgumentParser(description="Train metric surrogate M")
+    parser.add_argument("--skip-model", action="store_true")
     return parser.parse_args()
 
 
@@ -100,6 +101,7 @@ def train(
     val_y: pd.DataFrame,
     test_X: pd.DataFrame,
     test_y: pd.DataFrame,
+    skip_model: bool = False,
 ) -> Path:
     """Train the metric surrogate model and save run artifacts."""
 
@@ -112,11 +114,12 @@ def train(
     # Create dataloaders for the train, val, and test sets.
     use_ranking = RANKING_LOSS_WEIGHT > 0
     train_loader, val_loader, test_loader = create_dataloaders(model, train_X, train_y, val_X, val_y, test_X, test_y, group_train_by_sample=use_ranking)
+    if skip_model:
+        return run_dir
 
-    # Record encoder dimensions, then free VAE/text pipeline GPU memory when frozen.
+    # Record encoder dimensions, then free the (always frozen) VAE/text pipeline.
     img_dim, text_dim = model.encoder_img_dim, model.encoder_text_dim
-    if FREEZE_ENCODERS:
-        model.release_encoders()
+    model.release_encoders()
 
     target_cols = list(M_TARGET_COLS)
     y_train = torch.tensor(train_y[target_cols].values, dtype=torch.float)
@@ -231,7 +234,6 @@ def train(
 
 def main() -> None:
 
-    # Parse arguments. NOTE: Currently unused.
     args = parse_args()
     
     torch.manual_seed(SEED)
@@ -250,7 +252,16 @@ def main() -> None:
     # Initialize and train the model.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SurrogateModel(device=device).to(device)
-    run_dir = train(model, train_X, train_y, val_X, val_y, test_X, test_y)
+    run_dir = train(
+        model,
+        train_X,
+        train_y,
+        val_X,
+        val_y,
+        test_X,
+        test_y,
+        skip_model=args.skip_model,
+    )
     print(f"\nSaved to {run_dir.resolve()}")
 
 

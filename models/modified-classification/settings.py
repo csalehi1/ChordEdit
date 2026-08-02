@@ -11,12 +11,12 @@ Dataset settings.
 """
 
 # NOTE: Set this to the directory containing the generated metrics and inputs CSV files.
-DIR_NAME_DEFAULT = "UltraEdit_Region_10"
+DIR_NAME_DEFAULT = "UltraEdit_Region_10000"
 DIR_NAME = input(f"Dataset directory [{DIR_NAME_DEFAULT}]: ") or DIR_NAME_DEFAULT
 
 # ChordEdit backbone used for encoders / embedding caches.
 # Disk layout uses embeddings/<CHORD_EDIT_MODEL>/{DIR_NAME}/...
-CHORD_EDIT_MODEL = "sd_turbo"  # "sd_turbo" | "sdxl_turbo" | "flux"
+CHORD_EDIT_MODEL = "sdxl_turbo"  # "sd_turbo" | "sdxl_turbo" | "flux"
 
 CHORD_EDIT_MODEL_CONFIGS = {
     "sd_turbo": {
@@ -42,12 +42,12 @@ if CHORD_EDIT_MODEL not in CHORD_EDIT_MODEL_CONFIGS:
     )
 _CHORD_CFG = CHORD_EDIT_MODEL_CONFIGS[CHORD_EDIT_MODEL]
 CHORD_EDIT_MODEL_ROOT = _CHORD_CFG["root"]
-IMAGE_SIZE = int(_CHORD_CFG["image_size"])
+CHORD_EDIT_IMAGE_SIZE = int(_CHORD_CFG["image_size"])
 CHORD_EDIT_PIPELINE_TYPE = str(_CHORD_CFG["pipeline_type"])
 
-GENERATED_DIR = Path(f"/shared/ssd_30T/mirick/generated/ultra_edit/{DIR_NAME}")
+GENERATED_DIR = Path(f"/shared/ssd_30T/mirick/generated/{CHORD_EDIT_MODEL}/0p0/{DIR_NAME}")
 DATASET_DIR = Path(f"/shared/ssd_30T/mirick/datasets/ultra_edit/{DIR_NAME}")
-# Scattered per-sample embeddings (used when FREEZE_ENCODERS is True).
+# Scattered per-sample embeddings written by the annotation pipeline.
 EMBEDDINGS_DIR = Path(f"/shared/ssd_30T/mirick/embeddings/{CHORD_EDIT_MODEL}/{DIR_NAME}")
 EMBEDDINGS_SAMPLES_DIRNAME = "annotation_embeddings"
 
@@ -126,10 +126,10 @@ M_TARGET_COLS = (PSNR_COL, CLIP_COL)
 M_TARGET_LABELS = {PSNR_COL: "PSNR-Unedited", CLIP_COL: "CLIP-Edited"}
 
 # ChordEdit encoders loaded from CHORD_EDIT_MODEL_ROOT for image/text embedding.
-# When FREEZE_ENCODERS is True and EMBEDDINGS_CSV is set, embeddings are loaded from disk.
-# Set FREEZE_ENCODERS=False or EMBEDDINGS_CSV=None to encode on the fly instead.
+# Encoders are inherited from the ChordEdit pipeline and are always frozen;
+# embeddings come from the packed/scattered caches, with on-the-fly encoding
+# only as an explicit (warned) fallback in _data.get_embeddings.
 USE_CENTER_CROP = True
-FREEZE_ENCODERS = True
 
 # Regressor MLP architecture.
 IMG_PROJ_DIM = 512

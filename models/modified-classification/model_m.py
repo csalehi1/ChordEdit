@@ -105,6 +105,112 @@ def mean_pool(last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.
     return (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
 
 
+"""
+Per-model text extraction for packing scattered embeddings.
+
+Scattered text files store whatever the annotation pipeline emitted; collapsing
+them to one vector per prompt must match encode_text_pooled for the current
+CHORD_EDIT_MODEL so packed caches and on-the-fly encoding agree per model type:
+sd stores full last_hidden_state sequences (pooled here with mean_pool), sdxl
+must store text_encoder_2's pooled embeds directly (text_embeds is a projection
+of the EOS token and cannot be reconstructed from hidden-state sequences),
+flux is not implemented.
+"""
+
+TEXT_POOLING_BY_PIPELINE = {"sd": "masked_mean", "sdxl": "pooled_embeds"}
+
+
+def _get_text_pooling() -> str:
+    """Text pooling name for CHORD_EDIT_PIPELINE_TYPE; raises for unsupported types."""
+    if CHORD_EDIT_PIPELINE_TYPE == "flux":
+        raise NotImplementedError(
+            "CHORD_EDIT_MODEL='flux' text pooling is not implemented; "
+            "use sd_turbo / sdxl_turbo."
+        )
+    if CHORD_EDIT_PIPELINE_TYPE not in TEXT_POOLING_BY_PIPELINE:
+        raise ValueError(f"Unsupported CHORD_EDIT_PIPELINE_TYPE={CHORD_EDIT_PIPELINE_TYPE!r}")
+    return TEXT_POOLING_BY_PIPELINE[CHORD_EDIT_PIPELINE_TYPE]
+
+
+class SdMaskedMeanTextExtractor:
+    """SD branch: mask-weighted mean over the stored last_hidden_state sequence.
+
+    Attention masks come from re-tokenizing the prompts (tokenizer only, no
+    encoder weights), since the scattered files do not store them. Reuses
+    mean_pool so this cannot drift from encode_text_pooled.
+    """
+
+    name = "masked_mean"
+
+    def __init__(self, src_prompts: list[str], tar_prompts: list[str]):
+        from transformers import CLIPTokenizer
+
+        tokenizer = CLIPTokenizer.from_pretrained(str(CHORD_EDIT_MODEL_ROOT / "tokenizer"))
+        self.seq_len = int(tokenizer.model_max_length)
+
+        def _attn(prompts: list[str]) -> torch.Tensor:
+            enc = tokenizer(
+                list(prompts),
+                padding="max_length",
+                truncation=True,
+                max_length=self.seq_len,
+                return_tensors="pt",
+            )
+            return enc.attention_mask
+
+        self._attn = {"src": _attn(src_prompts), "tar": _attn(tar_prompts)}
+
+    def text_dim(self, probe: torch.Tensor, path) -> int:
+        """Validate a stored text tensor's shape and return the hidden dim."""
+        if probe.ndim != 3 or probe.shape[0] != 1:
+            raise ValueError(f"Expected text sequence (1, T, D), got {tuple(probe.shape)} in {path}")
+        if int(probe.shape[1]) != self.seq_len:
+            raise ValueError(
+                f"Stored sequence length {int(probe.shape[1])} != tokenizer max length "
+                f"{self.seq_len} in {path}; scattered embeddings do not match this model's tokenizer"
+            )
+        return int(probe.shape[2])
+
+    def __call__(self, t: torch.Tensor, i: int, kind: str, dim: int) -> torch.Tensor:
+        """Collapse sample i's stored sequence for kind in {'src', 'tar'} to (dim,)."""
+        hidden = t.reshape(1, self.seq_len, dim)
+        return mean_pool(hidden, self._attn[kind][i].unsqueeze(0))[0]
+
+
+class SdxlPooledTextExtractor:
+    """SDXL branch: scattered files must already store text_encoder_2's pooled
+    embeds (1, D); pooling cannot be redone from sequences without weights."""
+
+    name = "pooled_embeds"
+
+    def __init__(self, src_prompts: list[str], tar_prompts: list[str]):
+        pass
+
+    def text_dim(self, probe: torch.Tensor, path) -> int:
+        if probe.numel() != probe.shape[-1]:
+            raise ValueError(
+                f"Expected pooled text embeds (1, D) or (D,), got {tuple(probe.shape)} in {path}. "
+                f"SDXL pooled embeds (text_encoder_2 text_embeds) cannot be reconstructed from "
+                f"hidden-state sequences; re-run the annotation pipeline storing pooled embeds."
+            )
+        return int(probe.shape[-1])
+
+    def __call__(self, t: torch.Tensor, i: int, kind: str, dim: int) -> torch.Tensor:
+        if t.numel() != dim:
+            raise ValueError(f"Pooled text embeds numel {t.numel()} != {dim}")
+        return t.reshape(-1)
+
+
+def make_text_extractor(src_prompts: list[str], tar_prompts: list[str]):
+    """Text extractor matching CHORD_EDIT_PIPELINE_TYPE (see expected_text_pooling)."""
+    pooling = _get_text_pooling()
+    extractor_cls = {
+        SdMaskedMeanTextExtractor.name: SdMaskedMeanTextExtractor,
+        SdxlPooledTextExtractor.name: SdxlPooledTextExtractor,
+    }[pooling]
+    return extractor_cls(src_prompts, tar_prompts)
+
+
 def pairwise_ranking_loss(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
     """Logistic pairwise loss: penalize pred ordering that disagrees with true."""
     if pred.shape[0] < 2:
@@ -402,7 +508,6 @@ class SurrogateModel(nn.Module):
 
     def __init__(
         self,
-        freeze_encoders: bool = FREEZE_ENCODERS,
         device: torch.device | str | None = None,
     ):
         super().__init__()
@@ -413,8 +518,7 @@ class SurrogateModel(nn.Module):
         if CHORD_EDIT_PIPELINE_TYPE == "flux":
             raise NotImplementedError(
                 "CHORD_EDIT_MODEL='flux' encoder loading is not implemented in "
-                "ChordEditPipeline yet; pack precomputed embeddings with "
-                "FREEZE_ENCODERS=True, or use sd_turbo / sdxl_turbo."
+                "ChordEditPipeline yet; use sd_turbo / sdxl_turbo."
             )
         if CHORD_EDIT_PIPELINE_TYPE not in {"sd", "sdxl"}:
             raise ValueError(f"Unsupported CHORD_EDIT_PIPELINE_TYPE={CHORD_EDIT_PIPELINE_TYPE!r}")
@@ -425,21 +529,25 @@ class SurrogateModel(nn.Module):
         self.pipeline = ChordEditPipeline.from_local_weights(
             component_paths,
             model_type=CHORD_EDIT_PIPELINE_TYPE,
-            image_size=IMAGE_SIZE,
+            image_size=CHORD_EDIT_IMAGE_SIZE,
             use_center_crop=USE_CENTER_CROP,
             compute_dtype=DEFAULT_COMPUTE_DTYPE,
             use_safety_checker=False,
             device=device,
         )
-        if freeze_encoders:
-            # Freeze the VAE and text encoder weights.
-            for param in self.pipeline.vae.parameters():
+        # VAE-encoding a full EMBED_BATCH_SIZE batch at image_size=1024 in
+        # fp32 needs >40 GiB of activations (OOMs on a 48 GiB card). Slicing
+        # makes the VAE encode one image at a time with identical outputs.
+        self.pipeline.vae.enable_slicing()
+        # Encoders are inherited from the ChordEdit pipeline and are never
+        # trainable: freeze the VAE and text encoder weights unconditionally.
+        for param in self.pipeline.vae.parameters():
+            param.requires_grad = False
+        for param in self.pipeline.text_encoder.parameters():
+            param.requires_grad = False
+        if self.pipeline.text_encoder_2 is not None:
+            for param in self.pipeline.text_encoder_2.parameters():
                 param.requires_grad = False
-            for param in self.pipeline.text_encoder.parameters():
-                param.requires_grad = False
-            if self.pipeline.text_encoder_2 is not None:
-                for param in self.pipeline.text_encoder_2.parameters():
-                    param.requires_grad = False
 
         # Thin wrappers that call ChordEdit preprocess/encode helpers above.
         self.image_encoder = VaeImageEncoder(self.pipeline)
