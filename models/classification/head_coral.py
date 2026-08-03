@@ -46,6 +46,21 @@ def decode_ordinal(logits: torch.Tensor) -> torch.Tensor:
     return (logits > 0).long().sum(dim=-1)
 
 
+def bucket_scores_ordinal(logits: torch.Tensor) -> torch.Tensor:
+    """Per-bucket log probabilities from the K-1 cumulative threshold logits.
+
+    P(y > k) = sigmoid(logit_k), so P(y = c) = P(y > c-1) - P(y > c) with the
+    endpoints pinned at 1 and 0. The differences are not guaranteed positive
+    when the thresholds are not monotone, so they are clamped before the log.
+    """
+    n, k_minus_1 = logits.shape
+    ones = logits.new_ones(n, 1)
+    zeros = logits.new_zeros(n, 1)
+    surv = torch.cat([ones, torch.sigmoid(logits), zeros], dim=-1)  # (N, K+1)
+    probs = (surv[:, :-1] - surv[:, 1:]).clamp(min=1e-12)           # (N, K)
+    return probs.log() - probs.sum(dim=-1, keepdim=True).log()
+
+
 class CoralHead(nn.Module):
     """
     Ordinal output head with per-threshold classifiers.

@@ -2,44 +2,46 @@
 
 ## Task
 
-Given a `(source_prompt, target_prompt)` string pair, predict two diffusion timestep parameters $t^*$ and $t^{**}$, referred to in code as `t_start` and `t_end`.
+Given a sample's source image, edit mask, and `(source_prompt, target_prompt)` string pair — all as precomputed ChordEdit embeddings — predict two diffusion timestep parameters $t^*$ and $t^{**}$, referred to in code as `t_start` and `t_end`.
 
 ## Architecture
 
-The diagram below shows the default CE path connected to the shared encoder and MLP body. CORAL and MSE are alternative head implementations selected at construction time via `HEAD_TYPE`; they replace the CE heads but are not part of the default forward path.
+The diagram below shows the default CE path connected to the embedding projections and MLP body. CORAL and MSE are alternative head implementations selected at construction time via `HEAD_TYPE`; they replace the CE heads but are not part of the default forward path.
 
 ```mermaid
 %%{init: {"flowchart": {"padding": 20}} }%%
 flowchart TD
-    IN_A["`**Source Prompt String**`"] & IN_B["`**Target Prompt String**`"]
+    IN_IMG["`**Image Embedding**
+    Flattened VAE latent (img_dim = 16384 for sd_turbo)`"]
+    IN_MASK["`**Mask Embedding**
+    Flattened VAE latent of the edit mask`"]
+    IN_A["`**Source Prompt Embedding**`"] & IN_B["`**Target Prompt Embedding**`"]
 
-    IN_A --> ENC
-    IN_B --> ENC
-
-    subgraph SIAM ["SiameseEncoder with shared weights"]
-        ENC["`**AutoModel**
-        Share weights to enforce a consistent embedding space. Hugging Face embedding model.`"]
-        POOL["`**Mean-Pool**
-        Discard [CLS] token and compute a mask-weighted average over all token positions. Generalizes better than [CLS] for sentence-level tasks.`"]
-        ENC --> POOL
-    end
-
-    POOL -->|"split on batch dimension"| EMB_A["`**Source Embedding**`"] & EMB_B["`**Target Embedding**`"]
-
-    EMB_A & EMB_B --> COMB
-
-    subgraph COMB_BOX ["Combiner"]
+    subgraph PROJ ["Embedding projections"]
+        IMGP["`**img_proj: Linear(img_dim, 512) + LayerNorm + ReLU**
+        Bottlenecks the wide latent so no single modality dominates the context. IMG_ENCODER = 'conv' swaps in a small conv stack that keeps the latent's spatial layout.`"]
+        MASKP["`**mask_proj**
+        Same shape as img_proj, independent weights.`"]
         COMB["`**Concat. [ A | B | A − B | A ⊙ B ]**
         Concatenate to preserve individual semantics with difference for changes and Hadamard for similarities.`"]
+        TXTP["`**text_proj: Linear(4 × text_dim, 256) + LayerNorm + ReLU**`"]
+        COMB --> TXTP
     end
 
-    COMB --> MLP1
+    IN_IMG --> IMGP
+    IN_MASK --> MASKP
+    IN_A --> COMB
+    IN_B --> COMB
+
+    IMGP & MASKP & TXTP --> CTX["`**Context vector (1280)**`"]
+
+    CTX --> MLP1
 
     subgraph BODY ["MLP Body"]
-        MLP1["`**Linear(4h, mlp_wide=256)**
-        Expands the combiner vector into a wider representation to learn cross-modal interactions before compression.`"]
+        MLP1["`**Linear(1280, mlp_wide=256)**
+        Expands the context into a wider representation to learn cross-modal interactions before compression.`"]
         LN1["`**LayerNorm(mlp_wide=256)**
-        Stabilize training when the encoder is fine-tuned.`"]
+        Stabilize training against embedding-norm spread.`"]
         ACT1["`**ReLU()**
         Introduce nonlinearity after the first compression.`"]
         DROP1["`**Dropout(dropout=0.2)**`"]
@@ -92,19 +94,23 @@ flowchart TD
     end
 ```
 
-Strings `source_prompt` and `target_prompt` are fed into `SiameseEncoder` which outputs the concatenated embedded vector $\langle A \mid B \mid A - B \mid A \odot B \rangle$ where $\odot$ is the Hadamard product, element-wise multiplication. This output vector has size $4 \times 384 = 1536$.
+The four embeddings enter through per-modality projections mirroring the modified model's `SurrogateRegressor` input side: `img_proj` and `mask_proj` bottleneck the flattened VAE latents to `IMG_PROJ_DIM = 512` each, and `text_proj` compresses the combined text vector $\langle A \mid B \mid A - B \mid A \odot B \rangle$ (where $\odot$ is the Hadamard product) to `TEXT_PROJ_DIM = 256`.
 
-The $1536$-dimensional vector is passed through an MLP body of `Linear` with $1536 \rightarrow 256$, `LayerNorm`, `ReLU`, `Dropout` with $0.2$, `Linear` with $256 \rightarrow 128$, `ReLU`, `Dropout` with $0.2$, and `Linear` with $128 \rightarrow 64$. The $64$-dimensional output is then routed to two parallel heads with `head1` for `t_start` and `head2` for `t_end`.
+The concatenated $1280$-dimensional context vector is passed through an MLP body of `Linear` with $1280 \rightarrow 256$, `LayerNorm`, `ReLU`, `Dropout` with $0.2$, `Linear` with $256 \rightarrow 128$, `ReLU`, `Dropout` with $0.2$, and `Linear` with $128 \rightarrow 64$. The $64$-dimensional output is then routed to two parallel heads with `head1` for `t_start` and `head2` for `t_end`.
 
 `HEAD_TYPE` selects which head implementation is wired in at construction time. The default is `"CE"`: each head outputs $K_i$ logits, training minimises cross-entropy against one-hot bucket labels (with optional label smoothing), and inference takes the argmax class. Alternative types are `CORAL` (ordinal thresholds) and `MSE` (scalar regression snapped to the nearest bucket). Each decoded index lies in $\{0, \dots, k_i-1\}$ and maps to a float value in $[0.0, 1.0]$ via the ordered `buckets1` / `buckets2` tensors.
 
-### Encoder: `SiameseEncoder`
+### Embeddings: `embeddings.py`
 
-Uses `sentence-transformers/all-MiniLM-L6-v2` that outputs a hidden dimension of $384$. Both strings are encoded with *shared weights* in a single-batched forward pass. Token embeddings are reduced to a fixed-size sentence vector via mask-weighted mean pooling, which is more robust than the `[CLS]` token for sentence-level tasks.
+The model never runs an encoder itself: it consumes embeddings produced by the same frozen ChordEdit VAE and text encoder that generated the metric labels, so the classifier's inputs stay consistent with the runs that produced `(psnr, clip)`. Image and mask embeddings are flattened VAE latents; text embeddings are pooled per prompt (mask-weighted mean over `last_hidden_state` for SD, `text_encoder_2` pooled embeds for SDXL).
 
-The encoder is frozen by default (`FREEZE_ENCODER = True`). When the encoder is frozen, only the MLP and heads learn. When fine-tuning is enabled, the optimizer assigns a lower learning rate to the encoder ($2 \times 10^{-5}$) than to the MLP ($10^{-4}$) to avoid destabilising the pretrained representations early in training.
+`embeddings.get_embeddings` serves them from a three-tier cache:
 
-### Combiner: `OrdinalPairClassifier._combine`
+1. **Packed table** at `.cache/packed_embeddings/<CHORD_EDIT_MODEL>-<t_delta>-<dir_slug>.pt` — one stacked tensor per modality, tagged with a `meta` dict (model, text pooling, image size, crop, dir, `t_delta`). Any mismatch with the current settings is treated as a miss and repacked.
+2. **Scattered per-sample `.pt` files** under `EMBEDDINGS_DIR`, indexed by `EMBEDDINGS_CSV` — written by the annotation pipeline; packed into tier 1 on first use.
+3. **Live encoding** — only if a predictor object with `image_encoder` / `text_encoder` is passed. The classifier passes `predictor=None`, so a full cache miss raises with instructions instead of silently loading the diffusion pipeline.
+
+### Combiner: `model.combine_text_embeddings`
 
 The four-part interaction vector $\langle A \mid B \mid A - B \mid A \odot B \rangle$ captures individual semantics for each prompt, direction and magnitude of the edit (differences between the prompts), and element-wise co-activation (similarities between the prompts).
 
@@ -144,15 +150,17 @@ At inference, the continuous prediction is snapped to the nearest bucket index. 
 
 ## Data Pipeline
 
-1. Load `id_to_metrics_*.csv` (`METRICS_CSV`) and filter to rows where `t_delta == TARGET_T_DELTA`
-2. Compute the configured target score via `C_TARGET_FUNC` (default: `linex_score` over per-sample normalized deltas of `C_TARGET_COLS`) and pick the row with the highest `C_TARGET_COL` per `sample_id`. The baseline row scores exactly $0$, so the selected row is the best improvement over the baseline edit, or the baseline itself when no candidate improves on it
-3. Join with `id_to_inputs_*.csv` (`INPUTS_CSV`) to get `(source_prompt, target_prompt)`
-4. Map discrete `t_start` / `t_end` float values to ordinal indices $0, 1, 2, \ldots$ into the fixed grids `GRID_T_START` / `GRID_T_END` (missing cells in the CSV are fine; those classes simply receive no labels)
-5. Random split 80/10/10 for train/val/test
+1. `_data.load_df` loads `id_to_metrics_*.csv` (`METRICS_CSV`), drops rows missing the `C_TARGET_COLS` metrics, zero-pads `sample_id` to the canonical 8-digit form, and filters to rows where `t_delta == TARGET_T_DELTA`; it then loads `id_to_inputs_*.csv` (`INPUTS_CSV`), backfills `mask_image_path` from `downloaded_mask_image_path`, drops maskless rows, resolves relative image/mask paths against `DATASET_DIR`, and left-merges prompts and paths onto the metrics — one row per grid cell
+2. `_data.select_best_rows` computes the configured target score via `C_TARGET_FUNC` on the full cell table when the CSV does not already carry `C_TARGET_COL` (the per-sample delta normalization needs every cell), and picks the row with the highest `C_TARGET_COL` per `sample_id`. The baseline row scores exactly $0$, so the selected row is the best improvement over the baseline edit, or the baseline itself when no candidate improves on it
+3. Discrete `t_start` / `t_end` float values are mapped to ordinal indices $0, 1, 2, \ldots$ into the fixed grids `GRID_T_START` / `GRID_T_END` (missing cells in the CSV are fine; those classes simply receive no labels)
+4. `_data.split_df` splits by unique `sample_id` with a seeded permutation into `TRAIN_FRAC` / `VAL_FRAC` / `TEST_FRAC` (default 80/10/10), guaranteeing a nonempty test split; training saves the membership to `<run_dir>/id_to_split.csv` and `_data.load_split_df` replays it for evaluation
+5. `_data.create_sample_tensors` materializes the four embeddings for all splits with a single `embeddings.get_embeddings` call and builds device-resident `SampleTensors` (embeddings plus `y1` / `y2` bucket-index labels), which `iter_batches` slices during training
+
+Each run directory also holds the exact `settings.json` the run used (`_helpers.save_run_settings`); `_helpers.load_run_settings` binds the settings module to that snapshot before `_data` / `model` are imported, so evaluation reproduces the training config.
 
 ### Target Score Options
 
-The score used to select the best row per `sample_id` is configured in `settings.py` by setting `C_TARGET_ALPHA`, `C_TARGET_FUNC`, `C_TARGET_COL`, and `C_TARGET_LABEL` together. `C_TARGET_COLS` names the raw metric columns passed into the score function (default: PSNR and CLIP).
+The score used to select the best row per `sample_id` is configured in `settings.json` via `C_TARGET_FN` (`"naive"` | `"cara"` | `"linex"`) and `C_TARGET_ALPHA`. `C_TARGET_COLS` names the raw metric columns passed into the score function (default: PSNR and CLIP); `C_TARGET_COL` is derived as `f"{C_TARGET_FN}_score"`.
 
 Metrics live on different scales, so scoring never uses raw values. For each `sample_id`, `scores.calc_normalized_deltas` min-max scales each metric across that sample's candidate cells $T$ and subtracts the baseline cell $s_i^0$ at $(\text{DEFAULT\_T\_START}, \text{DEFAULT\_T\_END})$:
 
@@ -176,12 +184,12 @@ All three reduce the trailing metric axis of a $(\dots, N, C)$ delta tensor, acc
 
 | Hyperparameter | Value |
 |---|---|
-| Encoder | `all-MiniLM-L6-v2` (frozen by default) |
+| Inputs | Precomputed ChordEdit embeddings (image, mask, source prompt, target prompt); encoders never loaded during training |
 | Head type | `CE` (default), `CORAL`, or `MSE` |
 | CE loss | Standard cross-entropy with `LABEL_SMOOTHING = 0.15` |
-| Optimizer | AdamW with `WEIGHT_DECAY = 0.05`; encoder lr $= 2 \times 10^{-5}$, MLP lr $= 10^{-4}$ |
+| Optimizer | AdamW with `LR` $= 10^{-4}$, `WEIGHT_DECAY = 0.05` |
 | Epochs | $20$ |
 | Batch size | $64$ |
 | Dropout | $0.2$ |
 | Class weights | On by default (`USE_CLASS_WEIGHTS = True`) |
-| Checkpoint | Best model by validation balanced accuracy on `t_start` |
+| Checkpoint | Best model by validation balanced accuracy on `t_start`; stores `img_dim` / `text_dim` / buckets / the run's config for reconstruction |

@@ -135,6 +135,11 @@ def decode_classification(logits: torch.Tensor) -> torch.Tensor:
     return logits.argmax(dim=-1)
 
 
+def bucket_scores_classification(logits: torch.Tensor) -> torch.Tensor:
+    """Per-bucket log probabilities, so two heads' scores add across a cell."""
+    return F.log_softmax(logits, dim=-1)
+
+
 class ClassificationHead(nn.Module):
     """
     Linear multiclass head producing K logits per target.

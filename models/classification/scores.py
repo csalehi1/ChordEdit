@@ -1,3 +1,24 @@
+"""
+Scalarization of the score vector s = (s_1, s_2) into a single objective phi,
+following the paper's notation: s_1 = PSNR-Unedited, s_2 = CLIP-Edited.
+
+Because metrics live on different scales, all scoring functions take
+per-sample-normalized score deltas (see calc_normalized_deltas)
+
+    Delta_i = (s_i - s_i^0) / (max_T s_i - min_T s_i)
+
+where s_i^0 is the sample's default edit and min/max are over the same
+sample's candidate edits on the timestep grid T.
+
+Paper correspondence:
+    naive_score -> phi_nai(Delta) = sum_i w_i * Delta_i
+    cara_score  -> phi_CARA(Delta) = (1/alpha) * sum_i w_i * (1 - exp(-alpha * Delta_i))
+    linex_score -> phi_linex(Delta) = (phi_nai(Delta) + phi_CARA(Delta)) / 2
+
+with weights w_i and alpha the Arrow-Pratt coefficient of the underlying
+utility.
+"""
+
 from __future__ import annotations
 
 import math
@@ -121,8 +142,8 @@ def calc_normalized(
     dimensions.
 
     NaN marks an unlabeled candidate (e.g. a sparse timestep grid). NaN cells
-    are excluded from the min/max — one missing cell cannot poison the rest of
-    the sample — and stay NaN in the output. NaN support is for scoring/eval
+    are excluded from the min/max - one missing cell cannot poison the rest of
+    the sample - and stay NaN in the output. NaN support is for scoring/eval
     only: backprop through a NaN-sparse tensor yields NaN gradients (0 * NaN
     in elementwise backwards), so any caller that backprops must use dense
     labeled-only batches. train.py only consumes score_df output for label
@@ -230,7 +251,7 @@ def score_df(
     calc_normalized_deltas then score_fn in one batched call, and returns a
     Series aligned to df.index.
     """
-    from models.classification.settings import DEFAULT_T_END, DEFAULT_T_START, SAMPLE_ID_COL, T_END_COL, T_START_COL
+    from settings import DEFAULT_T_END, DEFAULT_T_START, SAMPLE_ID_COL, T_END_COL, T_START_COL
 
     if not cols:
         raise ValueError("expected one or more metric column names")

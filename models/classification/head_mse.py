@@ -20,6 +20,15 @@ def decode_regression(pred: torch.Tensor, buckets: torch.Tensor) -> torch.Tensor
     return dists.argmin(dim=1)
 
 
+def bucket_scores_regression(pred: torch.Tensor, buckets: torch.Tensor) -> torch.Tensor:
+    """Per-bucket preference scores: negative squared distance to each bucket.
+
+    Not log probabilities, but monotone in the head's own decoding rule and
+    additive across the two heads, which is all the joint cell decode needs.
+    """
+    return -((pred.unsqueeze(1) - buckets.unsqueeze(0)) ** 2)
+
+
 class RegressionHead(nn.Module):
     """
     Single linear head with sigmoid activation for bounded scalar regression.
