@@ -313,5 +313,17 @@ DEFAULT_T_END = float(_cfg("DEFAULT_T_END"))
 GRID_T_START = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
 GRID_T_END = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
 
+# Which grid cells the dataset exposes:
+#   "all"   - every labeled (t_start, t_end), i.e. the full 11 x 11 mesh
+#   "lower" - only t_start > t_end, the strict lower triangle the annotation
+#             pipeline covered before it filled the rest in
+# Restricting this changes both what the model trains on and what T can pick,
+# and phi is normalized over whichever candidate set is present, so runs on
+# different regions are not directly comparable.
+CELL_REGIONS = ("all", "lower")
+CELL_REGION = str(_cfg("CELL_REGION"))
+if CELL_REGION not in CELL_REGIONS:
+    raise ValueError(f"Unknown {CELL_REGION=}; expected one of {CELL_REGIONS}")
+
 # Deviate-or-default gate: minimum predicted phi gain to leave baseline timesteps.
 NOISE_FLOOR_PHI = float(_cfg("NOISE_FLOOR_PHI"))

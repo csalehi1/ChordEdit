@@ -289,6 +289,24 @@ def load_df(metrics_csv: Path | None = None, inputs_csv: Path | None = None) -> 
             raise ValueError(f"{TARGET_T_DELTA=} not found in {T_DELTA_COL}")
         metrics_df = metrics_df.loc[metrics_df[T_DELTA_COL] == TARGET_T_DELTA].copy()
 
+    # Restrict to the requested region of the grid before anything counts cells.
+    if CELL_REGION == "lower":
+        n_before = len(metrics_df)
+        metrics_df = metrics_df.loc[metrics_df[T_START_COL] > metrics_df[T_END_COL]].copy()
+        print(f"CELL_REGION=lower: kept {len(metrics_df)} of {n_before} cell rows (t_start > t_end).")
+
+    # Keep only samples with a complete grid. A sample missing cells cannot take
+    # part in the ranking loss or in T selection: its per-sample deltas are
+    # undefined without every candidate, and train_t requires one shared set of
+    # labeled (t_start, t_end) pairs across the split.
+    cells_per_sample = metrics_df.groupby(SAMPLE_ID_COL)[SAMPLE_ID_COL].transform("size")
+    n_cells = int(cells_per_sample.mode().iat[0])
+    incomplete = cells_per_sample != n_cells
+    if incomplete.any():
+        n_dropped = metrics_df.loc[incomplete, SAMPLE_ID_COL].nunique()
+        print(f"Dropped {n_dropped} sample(s) with fewer than {n_cells} labeled cells.")
+        metrics_df = metrics_df.loc[~incomplete].copy()
+
     # Clean inputs CSV: drop maskless rows, but use downloaded_mask_image_path when mask_image_path is empty.
     inputs_csv = inputs_csv or INPUTS_CSV
     inputs_df = pd.read_csv(inputs_csv)
