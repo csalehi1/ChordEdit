@@ -29,15 +29,14 @@ import pandas as pd
 import torch
 
 from _data import (
-    create_dataloaders,
+    CellTensors,
+    create_cell_tensors,
     load_df,
-    model_inputs,
     prepare_df,
     save_split_df,
     split_df,
 )
-from _helpers import save_run_settings
-from scores import calc_normalized_deltas
+from _helpers import save_run_settings, t_target_phi_values
 from model_m import SurrogateModel, format_results, pairwise_ranking_loss
 from settings import *
 
@@ -46,29 +45,31 @@ def parse_args() -> argparse.Namespace:
     # Argument parser for the command line.
     parser = argparse.ArgumentParser(description="Train metric surrogate M")
     parser.add_argument("--skip-model", action="store_true")
+    # Read off argv by settings.py at import time, before this parser runs;
+    # declared here so it shows up in --help and is not rejected as unknown.
+    parser.add_argument("--settings-path", default=None, help="config file to use instead of ./settings.json")
     return parser.parse_args()
+
+
+EVAL_CHUNK = 16384
 
 
 @torch.no_grad()
 def evaluate(
     model: SurrogateModel,
-    loader,
+    cells: CellTensors,
     device: torch.device | None = None,
 ) -> dict[str, float]:
     """Per-target MAE/RMSE/R^2 in raw metric units, plus z-scored MSE loss."""
-    
-    if device is None:
-        device = next(model.regressor.parameters()).device
-    
+
     # Set the model to evaluation mode.
     model.regressor.eval()
     preds, trues = [], []
     loss_sum, n = 0.0, 0
     mean, std = model.regressor.target_mean, model.regressor.target_std
 
-    # Evaluate the model on the given loader.
-    for batch in loader:
-        img, mask, src, tar, t, y = model_inputs(batch, device)
+    # Evaluate the model over the split's cells.
+    for img, mask, src, tar, t, y in cells.iter_flat(EVAL_CHUNK):
         out = model.regressor(img, mask, src, tar, t)
         y_std = (y - mean) / std
         loss_sum += torch.nn.functional.mse_loss(out, y_std, reduction="sum").item()
@@ -93,6 +94,67 @@ def evaluate(
     return metrics
 
 
+@torch.no_grad()
+def evaluate_selection(
+    model: SurrogateModel,
+    cells: CellTensors,
+    chunk_grids: int = 256,
+) -> dict[str, float]:
+    """Selection-side metrics on a split's grids: phi rank agreement and regret.
+
+    These are what T actually consumes, so they are the checkpoint signal:
+    the summed z-scored MSE is dominated by PSNR and can pick an epoch whose
+    CLIP head has collapsed.
+    """
+
+    def _row_ranks(x: torch.Tensor) -> torch.Tensor:
+        """Ordinal ranks along the last axis (ties broken by position)."""
+        order = x.argsort(dim=-1)
+        ranks = torch.empty_like(order)
+        positions = torch.arange(x.shape[-1], device=x.device).expand_as(order)
+        ranks.scatter_(-1, order, positions)
+        return ranks.to(x.dtype)
+
+
+    def _row_spearman(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Per-row Spearman rho between two (S, N) score matrices.
+
+        Ordinal ranks (no tie averaging) are enough here: phi values are
+        continuous, and this only drives checkpoint selection. train_t.py reports
+        the scipy version for the numbers that get published.
+        """
+        ra, rb = _row_ranks(a), _row_ranks(b)
+        ra = ra - ra.mean(dim=-1, keepdim=True)
+        rb = rb - rb.mean(dim=-1, keepdim=True)
+        num = (ra * rb).sum(dim=-1)
+        den = ra.norm(dim=-1) * rb.norm(dim=-1)
+        return num / den.clamp_min(1e-12)
+
+    model.regressor.eval()
+    true_parts, pred_parts = [], []
+    for k in range(0, cells.n_grids, chunk_grids):
+        sel = torch.arange(k, min(k + chunk_grids, cells.n_grids), device=cells.t.device)
+        img, mask, src, tar, t, y = cells.gather_grids(sel)
+        out = model.regressor.denormalize(model.regressor.forward_grid(img, mask, src, tar, t))
+        base = cells.grid_baseline[sel]
+        true_parts.append(t_target_phi_values(y.double(), base))
+        pred_parts.append(t_target_phi_values(out.double(), base))
+
+    true_phi = torch.cat(true_parts)
+    pred_phi = torch.cat(pred_parts)
+    rho = _row_spearman(true_phi, pred_phi)
+    rho = rho[~rho.isnan()]
+    chosen = pred_phi.argmax(dim=-1, keepdim=True)
+    reg = true_phi.max(dim=-1).values - true_phi.gather(-1, chosen).squeeze(-1)
+    # Use quantile(0.5) and not median() because torch's median takes the
+    # lower of the two middle values, while numpy (and so train_t.py) averages them.
+    return {
+        "phi_spearman": float(rho.quantile(0.5).item()) if rho.numel() else float("nan"),
+        "regret_median": float(reg.quantile(0.5).item()),
+        "regret_p90": float(reg.quantile(0.9).item()),
+    }
+
+
 def train(
     model: SurrogateModel,
     train_X: pd.DataFrame,
@@ -106,16 +168,21 @@ def train(
     """Train the metric surrogate model and save run artifacts."""
 
     # Create run directory to save information to.
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = OUTPUTS_DIR / timestamp
+    run_name = RUN_NAME or datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = OUTPUTS_DIR / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     save_run_settings(run_dir)
 
-    # Create dataloaders for the train, val, and test sets.
-    use_ranking = RANKING_LOSS_WEIGHT > 0
-    train_loader, val_loader, test_loader = create_dataloaders(model, train_X, train_y, val_X, val_y, test_X, test_y, group_train_by_sample=use_ranking)
+    # Build device-resident cell tensors for the train, val, and test sets.
+    device = next(model.regressor.parameters()).device
+    splits_df = {"train": (train_X, train_y), "val": (val_X, val_y), "test": (test_X, test_y)}
+    splits_cells = create_cell_tensors(model, splits_df, device)
+    train_cells, val_cells, test_cells = splits_cells["train"], splits_cells["val"], splits_cells["test"]
     if skip_model:
         return run_dir
+
+    # Whole-grid batches only: ranking / selection / cell-anchor all need them.
+    use_ranking = RANKING_LOSS_WEIGHT > 0
 
     # Record encoder dimensions, then free the (always frozen) VAE/text pipeline.
     img_dim, text_dim = model.encoder_img_dim, model.encoder_text_dim
@@ -127,7 +194,6 @@ def train(
     # Normalize the targets if specified.
     if NORMALIZE_TARGETS:
         # Store train mean/std so MSE is computed in z-scored space.
-        # denormalize maps predictions back to raw metric units for ranking/eval.
         model.regressor.set_target_stats(y_train.mean(0), y_train.std(0))
     print(
         "Target columns (train):\n"
@@ -140,108 +206,170 @@ def train(
         )
     )
 
-    # Initialize the optimizer.
+    # Anchor each cell on the train split's mean standardized value, so the
+    # towers only have to predict how an image deviates from the shared
+    # surface. Computed after the target stats, in the same z-scored space.
+    if USE_CELL_ANCHOR:
+        anchor_t = train_cells.t[train_cells.grid_rows[0]]
+        y_grids = train_cells.y[train_cells.grid_rows]
+        anchor_values = ((y_grids - model.regressor.target_mean) / model.regressor.target_std).mean(dim=0)
+        model.regressor.set_cell_anchor(anchor_t, anchor_values)
+        print(f"Cell anchor set on {anchor_t.shape[0]} grid cells.")
+
+    # Initialize the optimizer and (optional) cosine LR schedule.
     optimizer = torch.optim.AdamW(model.regressor.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, EPOCHS)) if str(LR_SCHEDULER).lower() == "cosine" else None)
+
     y_mean, y_std = model.regressor.target_mean, model.regressor.target_std
+    loss_weights = torch.tensor([PSNR_LOSS_WEIGHT, CLIP_LOSS_WEIGHT], dtype=torch.float, device=device)
+    loss_weights = loss_weights / loss_weights.mean()
 
     # Train the model.
     weights_out = run_dir / "regressor_weights.pt"
-    best_val = float("inf")
-    device = next(model.regressor.parameters()).device
+    best_score = -float("inf")
+    best_epoch, since_improved = 0, 0
+    best_val_loss = float("inf")
+    history: list[dict] = []
     n_cells, n_samples = len(train_X), train_X[SAMPLE_ID_COL].nunique()
-    
+    grids_per_batch = max(1, int(GRIDS_PER_BATCH))
+    ema_state = {k: v.detach().clone() for k, v in model.regressor.state_dict().items()} if EMA_DECAY > 0 else None
+
     # Iterate over the epochs.
-    print("\n")
     for epoch in range(1, EPOCHS + 1):
 
         epoch_start = time.perf_counter()
         # Set the model to training mode.
         model.regressor.train()
 
-        # Iterate over the train loader.
-        for batch in train_loader:
+        for (img, mask, src, tar, t, y), baseline_idx in train_cells.iter_grids(grids_per_batch, shuffle=True):
 
-            img, mask, src, tar, t, y = model_inputs(batch, device)
-            out = model.regressor(img, mask, src, tar, t)
+            # Predict the metric values for the timestep grid.
+            out = model.regressor.forward_grid(img, mask, src, tar, t)
 
-            # Standardize targets in z-scored space for MSE loss.
-            mse = torch.nn.functional.mse_loss(out, (y - y_mean) / y_std)
-            loss = mse
+            # Standardize targets in z-scored space for MSE loss, weighting
+            # the per-target terms so one head cannot dominate the gradient.
+            se = (out - (y - y_mean) / y_std) ** 2
+            loss = (se * loss_weights).mean()
 
             # If specified, use per-sample ranking loss.
             if use_ranking:
-
-                # Same scoring (Delta then T_TARGET_PHI) for true and pred order.
-                # SampleGridBatchSampler yields one sample's full grid per batch.
                 y_hat = model.regressor.denormalize(out)
-                base_t_start = torch.as_tensor(DEFAULT_T_START, device=t.device, dtype=t.dtype)
-                base_t_end = torch.as_tensor(DEFAULT_T_END, device=t.device, dtype=t.dtype)
-                base_mask = (torch.isclose(t[:, 0], base_t_start) & torch.isclose(t[:, 1], base_t_end)).nonzero(as_tuple=False)
-                if base_mask.numel() != 1:
-                    raise ValueError(f"Expected exactly one default-(t_start,t_end) row in batch, found {int(base_mask.numel())}")
-                baseline_idx = int(base_mask[0])
-                
-                # Calculate the true and predicted metrics.
-                true_delta = calc_normalized_deltas(y, baseline_idx)
-                pred_delta = calc_normalized_deltas(y_hat, baseline_idx)
-                true_phi = T_TARGET_PHI(true_delta)
-                pred_phi = T_TARGET_PHI(pred_delta)
-                loss = loss + RANKING_LOSS_WEIGHT * pairwise_ranking_loss(pred_phi, true_phi)
-            
+                true_phi = t_target_phi_values(y, baseline_idx)
+                pred_phi = t_target_phi_values(y_hat, baseline_idx)
+                loss = loss + RANKING_LOSS_WEIGHT * pairwise_ranking_loss(pred_phi, true_phi, top_k=RANKING_TOP_K)
+
             # Backpropagate the training loss.
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
+            # Update the EMA state to maintain a smooth/stable copy of parameters.
+            if ema_state is not None:
+                with torch.no_grad():
+                    for key, value in model.regressor.state_dict().items():
+                        if value.dtype.is_floating_point:
+                            ema_state[key].mul_(EMA_DECAY).add_(value.detach(), alpha=1.0 - EMA_DECAY)
+                        else:
+                            ema_state[key].copy_(value)
+
+        if scheduler is not None:
+            scheduler.step()
+
+        # Evaluate (and checkpoint) the averaged weights when EMA is on.
+        live_state = None
+        if ema_state is not None:
+            live_state = {k: v.detach().clone() for k, v in model.regressor.state_dict().items()}
+            model.regressor.load_state_dict(ema_state)
+
         # Find val metrics every epoch and save best weights.
-        val_results = evaluate(model, val_loader, device)
-        improved = val_results["loss"] < best_val
+        val_results = evaluate(model, val_cells, device)
+        val_sel = evaluate_selection(model, val_cells)
+
+        if CKPT_METRIC == "val_phi_spearman":
+            score = val_sel.get("phi_spearman", float("nan"))
+        elif CKPT_METRIC == "val_regret":
+            score = -val_sel.get("regret_median", float("nan"))
+        else:
+            score = -val_results["loss"]
+
+        improved = score > best_score
         if improved:
-            best_val = val_results["loss"]
-            torch.save(
-                {
-                    "regressor_state_dict": model.regressor.state_dict(),
-                    "target_mean": model.regressor.target_mean.cpu(),
-                    "target_std": model.regressor.target_std.cpu(),
-                    "target_cols": list(M_TARGET_COLS),
-                    "img_dim": img_dim,
-                    "text_dim": text_dim,
-                },
-                weights_out,
-            )
-        
+            best_score, best_epoch, since_improved = score, epoch, 0
+            best_val_loss = val_results["loss"]
+            torch.save( {
+                "regressor_state_dict": model.regressor.state_dict(),
+                "target_mean": model.regressor.target_mean.cpu(),
+                "target_std": model.regressor.target_std.cpu(),
+                "target_cols": list(M_TARGET_COLS),
+                "img_dim": img_dim,
+                "text_dim": text_dim,
+            }, weights_out)
+        else:
+            since_improved += 1
+
+
+        # Evaluate the model on the train and val sets.
+        train_results = evaluate(model, train_cells, device)
+        if live_state is not None:
+            model.regressor.load_state_dict(live_state)
+        history.append({"epoch": epoch, "train": train_results, "val": val_results, "val_selection": val_sel})
+        sel_str = (
+            f"  |  phi rho={val_sel['phi_spearman']:.3f} regret={val_sel['regret_median']:.4f}"
+            if val_sel else ""
+        )
         elapsed = time.perf_counter() - epoch_start
-        train_results = evaluate(model, train_loader, device)
         print(
             f"Epoch [{epoch:03d}/{EPOCHS:03d}] | {n_cells} cells ({n_samples} samples) in {elapsed:.2f}s"
             f"\n    {'Train:':<6} {format_results(train_results)}"
-            f"\n    {'Val:':<6} {format_results(val_results)}"
+            f"\n    {'Val:':<6} {format_results(val_results)}{sel_str}"
             + ("  *" if improved else "")
         )
+
+        # Early stop if the checkpoint metric has stalled.
+        if EARLY_STOP_PATIENCE > 0 and epoch >= 5 and since_improved >= EARLY_STOP_PATIENCE:
+            print(f"Early stop at epoch {epoch}: no improvement in {since_improved} epochs.")
+            break
 
     # Load the best weights and evaluate the model on the test set.
     checkpoint = torch.load(weights_out, map_location=device, weights_only=False)
     model.regressor.load_state_dict(checkpoint["regressor_state_dict"])
-    results = evaluate(model, test_loader, device)
+    results = evaluate(model, test_cells, device)
+    test_sel = evaluate_selection(model, test_cells)
     print(f"\n    {'Test:':<6} {format_results(results)}")
+    if test_sel:
+        print(
+            f"    {'':<6} phi rho={test_sel['phi_spearman']:.3f} "
+            f"regret median={test_sel['regret_median']:.4f} p90={test_sel['regret_p90']:.4f}"
+        )
 
     # Save the splits and metrics.
     save_split_df(train_X, val_X, test_X, run_dir)
     metrics_out = run_dir / "m_train_metrics.json"
     with open(metrics_out, "w") as f:
-        json.dump({"val_best_loss": best_val, "test": results}, f, indent=4)
-    
+        json.dump({
+            "best_epoch": best_epoch,
+            "epochs_ran": len(history),
+            "ckpt_metric": str(CKPT_METRIC),
+            "val_best_loss": best_val_loss,
+            "val_best_selection": history[best_epoch - 1]["val_selection"] if history else {},
+            "test": results,
+            "test_selection": test_sel,
+            "history": history,
+        }, f, indent=4)
+
     return run_dir
 
 
 def main() -> None:
 
+    # Parse the command line arguments.
     args = parse_args()
     
+    # Set the random seeds.
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
-    # For data: load, prepare, and split into train/val/test sets.
+    # Load, prepare, and split the data into train/val/test sets.
     data_df = load_df()
     X_df, y_df = prepare_df(data_df)
     train_X, val_X, test_X, train_y, val_y, test_y = split_df(X_df, y_df)
@@ -252,7 +380,7 @@ def main() -> None:
         f"  test: {len(test_X)} cells ({test_X[SAMPLE_ID_COL].nunique()} samples)"
     )
 
-    # Initialize and train the model.
+    # Initialize the model and train it.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SurrogateModel(device=device).to(device)
     run_dir = train(

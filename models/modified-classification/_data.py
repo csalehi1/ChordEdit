@@ -104,6 +104,171 @@ class PerSampleBatchSampler(Sampler[list[int]]):
         return len(self.sample_ids)
 
 
+@dataclass(frozen=True)
+class CellTensors:
+    """One split's cells plus the shared embedding table, resident on one device.
+
+    Training reads embeddings by row index instead of collating them per cell,
+    which avoids re-copying a sample's 16k-dim image/mask embedding once per
+    grid cell. grid_rows groups the split's rows by sample so a batch can hold
+    whole timestep grids, which is what the per-sample ranking loss needs.
+    Both grid_rows and grid_baseline are required: every split must have at
+    least one complete per-sample grid that contains the default cell.
+    """
+
+    sample_idx: torch.Tensor     # (N,)
+    t: torch.Tensor              # (N, 2)
+    y: torch.Tensor              # (N, C)
+    emb_table: EmbeddingTable
+    grid_rows: torch.Tensor      # (S, n_cells) cell rows per sample grid
+    grid_baseline: torch.Tensor  # (S,) baseline position inside each grid
+
+    def __len__(self) -> int:
+        return int(self.sample_idx.shape[0])
+
+    @property
+    def n_grids(self) -> int:
+        return int(self.grid_rows.shape[0])
+
+    @property
+    def n_cells(self) -> int:
+        return int(self.grid_rows.shape[1])
+
+    def gather(self, rows: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """(img, mask, src, tar, t, y) for the given cell rows."""
+        sid = self.sample_idx[rows]
+        return (
+            self.emb_table.img[sid],
+            self.emb_table.mask[sid],
+            self.emb_table.src[sid],
+            self.emb_table.tar[sid],
+            self.t[rows],
+            self.y[rows],
+        )
+
+    def iter_flat(self, batch_size: int, shuffle: bool = False):
+        """Yield plain cell batches (used for evaluation)."""
+        n = len(self)
+        order = torch.randperm(n, device=self.t.device) if shuffle else torch.arange(n, device=self.t.device)
+        for k in range(0, n, batch_size):
+            yield self.gather(order[k : k + batch_size])
+
+    def gather_grids(self, sel: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """(img, mask, src, tar, t, y) for whole grids.
+
+        Embeddings come back one row per grid, shaped (G, D), while t and y
+        keep their grid axis at (G, n_cells, .). SurrogateRegressor.forward_grid
+        consumes this directly, so a sample's embeddings are projected once
+        rather than once per cell.
+        """
+        rows = self.grid_rows[sel]
+        sid = self.sample_idx[rows[:, 0]]
+        return (
+            self.emb_table.img[sid],
+            self.emb_table.mask[sid],
+            self.emb_table.src[sid],
+            self.emb_table.tar[sid],
+            self.t[rows],
+            self.y[rows],
+        )
+
+    def iter_grids(self, grids_per_batch: int = 1, shuffle: bool = True):
+        """Yield (grid inputs, baseline_idx) with whole grids per batch."""
+        s = self.n_grids
+        order = torch.randperm(s, device=self.grid_rows.device) if shuffle else torch.arange(s, device=self.grid_rows.device)
+        step = max(1, int(grids_per_batch))
+        for k in range(0, s, step):
+            sel = order[k : k + step]
+            yield self.gather_grids(sel), self.grid_baseline[sel]
+
+
+def _build_grid_index(
+    sample_idx: torch.Tensor,
+    t: torch.Tensor,
+    default_t: tuple[float, float],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Group rows into complete per-sample grids that contain the default cell.
+
+    A complete grid is a sample whose cell count matches the split's modal
+    size and that contains exactly one (DEFAULT_T_START, DEFAULT_T_END) cell.
+    It need not be a full rectangular mesh (e.g. a shared t_start > t_end
+    triangle qualifies). Ragged samples or samples missing the default cell
+    are excluded: their per-sample deltas are undefined (scores.calc_deltas
+    raises on a NaN baseline), so they cannot take part in the ranking loss.
+    Raises if no sample qualifies.
+    """
+    groups: dict[int, list[int]] = {}
+    for i, sid in enumerate(sample_idx.tolist()):
+        groups.setdefault(sid, []).append(i)
+    if not groups:
+        raise ValueError("cannot build grid index: split has no samples")
+
+    sizes = [len(v) for v in groups.values()]
+    n_cells = max(set(sizes), key=sizes.count)
+    is_default = (
+        torch.isclose(t[:, 0], torch.as_tensor(default_t[0], dtype=t.dtype, device=t.device))
+        & torch.isclose(t[:, 1], torch.as_tensor(default_t[1], dtype=t.dtype, device=t.device))
+    )
+
+    # Sort each grid's rows by (t_start, t_end) so cell k means the same
+    # timestep pair in every sample; the per-cell anchor relies on that.
+    t_cpu = t.detach().cpu()
+    rows, baselines, dropped = [], [], 0
+    for sid, idx in groups.items():
+        if len(idx) != n_cells:
+            dropped += 1
+            continue
+        idx = sorted(idx, key=lambda i: (float(t_cpu[i, 0]), float(t_cpu[i, 1])))
+        flags = is_default[torch.as_tensor(idx, device=t.device)]
+        hits = flags.nonzero(as_tuple=False).flatten()
+        if hits.numel() != 1:
+            dropped += 1
+            continue
+        rows.append(idx)
+        baselines.append(int(hits[0]))
+    if not rows:
+        raise ValueError(
+            f"no complete {n_cells}-cell grids with default cell "
+            f"{default_t} (dropped {dropped} sample(s))"
+        )
+    if dropped:
+        print(f"Dropped {dropped} sample(s) without a complete {n_cells}-cell grid and default cell.")
+    return (
+        torch.as_tensor(rows, dtype=torch.long, device=t.device),
+        torch.as_tensor(baselines, dtype=torch.long, device=t.device),
+    )
+
+
+def create_cell_tensors(
+    predictor: SurrogateModel,
+    splits_df: dict[str, tuple[pd.DataFrame, pd.DataFrame]],
+    device: torch.device,
+) -> dict[str, CellTensors]:
+    """Build device-resident CellTensors for each split, sharing one embedding table."""
+    frames = [X for X, _ in splits_df.values()]
+    samples = pd.concat(frames, ignore_index=True).drop_duplicates(SAMPLE_ID_COL).sort_values(SAMPLE_ID_COL)
+    sample_ids, img_emb, mask_emb, src_emb, tar_emb = get_embeddings(samples, predictor)
+    
+    # Build the shared embedding table.
+    emb_table = EmbeddingTable(
+        img=img_emb.to(device),
+        mask=mask_emb.to(device),
+        src=src_emb.to(device),
+        tar=tar_emb.to(device),
+    )
+    sid_to_idx = {sid: i for i, sid in enumerate(sample_ids)}
+
+    # Build the CellTensors for each split.
+    out: dict[str, CellTensors] = {}
+    for name, (X_df, y_df) in splits_df.items():
+        sample_idx = torch.tensor([sid_to_idx[sid] for sid in X_df[SAMPLE_ID_COL].tolist()], dtype=torch.long, device=device)
+        t = torch.tensor(X_df[[T_START_COL, T_END_COL]].values, dtype=torch.float, device=device)
+        y = torch.tensor(y_df[list(M_TARGET_COLS)].values, dtype=torch.float, device=device)
+        grid_rows, grid_baseline = _build_grid_index(sample_idx, t, (DEFAULT_T_START, DEFAULT_T_END))
+        out[name] = CellTensors(sample_idx, t, y, emb_table, grid_rows, grid_baseline)
+    return out
+
+
 """
 Dataframes.
 """
@@ -155,8 +320,6 @@ def load_df(metrics_csv: Path | None = None, inputs_csv: Path | None = None) -> 
 def prepare_df(data_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Split a loaded table into X and raw-metric y (PSNR / CLIP units)."""
     X_df = data_df.drop(columns=list(M_TARGET_COLS)).copy()
-    # Keep raw labels: no global min-max. Per-sample range norm happens later
-    # at score time (calc_normalized_deltas / LINEX). MSE still z-scores in train_m.
     y_df: pd.DataFrame = data_df.loc[:, list(M_TARGET_COLS)].copy()
     return X_df, y_df
 
@@ -165,7 +328,7 @@ def split_df(
     X_df: pd.DataFrame,
     y_df: pd.DataFrame,
     *,
-    seed: int = SEED,
+    seed: int = SPLIT_SEED,
     train_frac: float = TRAIN_FRAC,
     val_frac: float = VAL_FRAC,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:

@@ -7,6 +7,8 @@ bind constants from the per-run settings snapshot.
 from __future__ import annotations
 
 import importlib.util
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -14,9 +16,9 @@ import numpy as np
 import pandas as pd
 import torch
 
-SETTINGS_FILENAME = "settings.py"
+SETTINGS_FILENAME = "settings.json"
 _PACKAGE_DIR = Path(__file__).resolve().parent
-_LIVE_SETTINGS = _PACKAGE_DIR / SETTINGS_FILENAME
+_SETTINGS_MODULE = _PACKAGE_DIR / "settings.py"
 
 
 def _s():
@@ -25,28 +27,54 @@ def _s():
     return settings
 
 
+def current_commit_id() -> str:
+    """Short id of the most recent commit, or "nogit" outside a repository."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(_PACKAGE_DIR), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return out.stdout.strip() or "nogit"
+    except Exception:
+        return "nogit"
+
+
 def save_run_settings(run_dir: Path) -> Path:
+    """Save the config this run used, so the run can be replayed exactly."""
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     dst = run_dir / SETTINGS_FILENAME
-    dst.write_bytes(_LIVE_SETTINGS.read_bytes())
+    dst.write_text(json.dumps(_s().CONFIG, indent=2, sort_keys=True) + "\n")
     return dst
 
 
 def load_run_settings(run_dir: Path):
-    path = Path(run_dir) / SETTINGS_FILENAME
-    if not path.exists():
-        raise FileNotFoundError(f"Missing {path}. Re-run train_m.py to snapshot settings.py for this run.")
+    """Bind the settings module to a run's saved config.
+
+    Imports settings fresh under that name with the run's settings.json pinned,
+    so evaluation sees exactly the training config regardless of any
+    --settings-path on the current command line.
+    """
+    run_dir = Path(run_dir)
     already = [n for n in ("_data", "embeddings", "model_m", "model_t") if n in sys.modules]
     if already:
         raise RuntimeError(
             f"load_run_settings() must be called before importing modules that bind settings "
             f"(already imported: {', '.join(already)})."
         )
-    spec = importlib.util.spec_from_file_location("settings", path)
+
+    path = run_dir / SETTINGS_FILENAME
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Missing {path}. Re-run train_m.py to save the config for this run."
+        )
+    spec = importlib.util.spec_from_file_location("settings", _SETTINGS_MODULE)
     if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load settings from {path}")
+        raise ImportError(f"Cannot load settings from {_SETTINGS_MODULE}")
     mod = importlib.util.module_from_spec(spec)
+    # Seeded before the module body runs, where settings.py reads it in
+    # preference to --settings-path (see settings.SETTINGS_JSON).
+    mod.SETTINGS_PATH_OVERRIDE = str(path)
     sys.modules["settings"] = mod
     spec.loader.exec_module(mod)
     return mod
@@ -54,9 +82,9 @@ def load_run_settings(run_dir: Path):
 
 def load_live_settings():
     """Load package settings.py under a private module name (for OUTPUTS_DIR bootstrap)."""
-    spec = importlib.util.spec_from_file_location("_live_settings", _LIVE_SETTINGS)
+    spec = importlib.util.spec_from_file_location("_live_settings", _SETTINGS_MODULE)
     if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load live settings from {_LIVE_SETTINGS}")
+        raise ImportError(f"Cannot load live settings from {_SETTINGS_MODULE}")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod

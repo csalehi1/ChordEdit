@@ -40,6 +40,11 @@ from embeddings import mean_pool
 from settings import *
 
 
+# Upper bound on labeled grid cells the per-cell anchor can hold. Fixed so the
+# anchor buffers keep one shape and checkpoints load without special cases.
+MAX_ANCHOR_CELLS = 256
+
+
 def combine_text_embeddings(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Concat, difference, and Hadamard product of an embedding pair (4 * dim)."""
     return torch.cat([a, b, a - b, a * b], dim=-1)
@@ -88,6 +93,27 @@ def format_results(m: dict[str, float]) -> str:
     )
 
 
+# def format_results_table(train: dict[str, float], val: dict[str, float], phi_rho: float | None = None, regret: float | None = None) -> str:
+#     """Aligned Train/Val metrics table (header + two rows), indented 4 spaces."""
+#     short = lambda col: col.split("_")[0].upper()
+
+#     header = f"{'Split':<8}{'Loss':>9}"
+#     for col in M_TARGET_COLS:
+#         header += f"{short(col) + ' MAE':>11}{short(col) + ' R2':>10}"
+#     header += f"{'Phi-Rho':>10}{'Regret':>9}"
+
+#     def row(split: str, m: dict[str, float], rho, reg) -> str:
+#         r = f"{split:<8}{m['loss']:>9.4f}"
+#         for col in M_TARGET_COLS:
+#             r += f"{m[f'mae_{col}']:>11.3f}{m[f'r2_{col}']:>10.3f}"
+#         r += f"{f'{rho:.4f}' if rho is not None else '-':>10}"
+#         r += f"{f'{reg:.4f}' if reg is not None else '-':>9}"
+#         return r
+
+#     lines = [header, row("Train", train, None, None), row("Val", val, phi_rho, regret)]
+#     return "\n".join(f"    {line}" for line in lines)
+
+
 def fourier_timestep_features(t: torch.Tensor, n_freqs: int = T_FOURIER_FREQS) -> torch.Tensor:
     """Encode (t_start, t_end) with raw values, their product, and sin/cos bands."""
     # The Fourier bands allow the model to capture both coarse and
@@ -100,13 +126,27 @@ def fourier_timestep_features(t: torch.Tensor, n_freqs: int = T_FOURIER_FREQS) -
     return torch.cat(feats, dim=-1)
 
 
-def pairwise_ranking_loss(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
-    """Logistic pairwise loss: penalize pred ordering that disagrees with true."""
-    if pred.shape[0] < 2:
+def pairwise_ranking_loss(pred: torch.Tensor, true: torch.Tensor, top_k: int = 0) -> torch.Tensor:
+    """Logistic pairwise loss: penalize pred ordering that disagrees with true.
+
+    Accepts (N,) for one grid or (G, N) for a batch of grids; pairs are always
+    formed within a grid, never across grids, since phi is normalized per
+    sample. NaN (unlabeled) cells take part in no pair.
+
+    top_k > 0 keeps only the pairs whose better element is among that grid's
+    top_k true cells. Regret only depends on which cell ends up on top, so
+    concentrating the loss there beats spending it on the ordering of cells
+    nobody would ever select.
+    """
+    if pred.shape[-1] < 2:
         return pred.new_zeros(())
-    diff_true = true.unsqueeze(1) - true.unsqueeze(0)
-    diff_pred = pred.unsqueeze(1) - pred.unsqueeze(0)
+    diff_true = true.unsqueeze(-1) - true.unsqueeze(-2)
+    diff_pred = pred.unsqueeze(-1) - pred.unsqueeze(-2)
     mask = diff_true > 0
+    if top_k and top_k < true.shape[-1]:
+        idx = true.topk(top_k, dim=-1).indices
+        is_top = torch.zeros_like(true, dtype=torch.bool).scatter_(-1, idx, True)
+        mask = mask & is_top.unsqueeze(-1)
     if not mask.any():
         return pred.new_zeros(())
     return torch.nn.functional.softplus(-diff_pred[mask]).mean()
@@ -169,6 +209,40 @@ class VaeImageEncoder(nn.Module):
         )
         encoded = self._pipeline._encode_image_to_latent(pixel_values)
         return encoded.flatten(start_dim=1)
+
+
+class ConvImageProjector(nn.Module):
+    """Encode a flattened VAE latent with convolutions instead of one Linear.
+
+    The image and mask embeddings are flattened (C, S, S) VAE latents, so a
+    single Linear over 16k inputs discards all spatial structure - including
+    how large and where the edit mask is, which is most of what decides
+    PSNR-Unedited. This folds the latent back to (C, S, S) and downsamples.
+    """
+
+    def __init__(self, flat_dim: int, out_dim: int, channels: int = 4):
+        super().__init__()
+        spatial_sq = flat_dim // channels
+        side = int(round(spatial_sq ** 0.5))
+        if channels * side * side != flat_dim:
+            raise ValueError(f"{flat_dim=} is not {channels}xSxS for an integer S")
+        self.channels, self.side = channels, side
+
+        widths = [channels, 32, 64, 128, 128]
+        layers: list[nn.Module] = []
+        for a, b in zip(widths[:-1], widths[1:]):
+            layers += [nn.Conv2d(a, b, kernel_size=3, stride=2, padding=1), nn.GroupNorm(8, b), nn.SiLU()]
+        self.stem = nn.Sequential(*layers)
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(widths[-1] * (side // 2 ** (len(widths) - 1)) ** 2, out_dim),
+            nn.LayerNorm(out_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.view(x.shape[0], self.channels, self.side, self.side)
+        return self.head(self.stem(x))
 
 
 """
@@ -306,24 +380,28 @@ class SurrogateRegressor(nn.Module):
         n_wide: int = MLP_WIDE,
         n_hidden: int = MLP_HIDDEN,
         n_inner: int = MLP_INNER,
-        dropout_rate: float = MLP_DROPOUT,
+        psnr_dropout_rate: float = MLP_PSNR_DROPOUT,
         clip_dropout_rate: float = MLP_CLIP_DROPOUT,
     ):
         super().__init__()
         if n_targets != 2:
-            raise ValueError("SurrogateRegressor expects exactly two targets (psnr, clip)")
+            raise ValueError("SurrogateRegressor expects exactly two targets (PSNR, CLIP)")
 
         # Project the embeddings to the MLP input dimension.
-        self.img_proj = nn.Sequential(
-            nn.Linear(img_dim, img_proj_dim),
-            nn.LayerNorm(img_proj_dim),
-            nn.ReLU(),
-        )
-        self.mask_proj = nn.Sequential(
-            nn.Linear(img_dim, img_proj_dim),
-            nn.LayerNorm(img_proj_dim),
-            nn.ReLU(),
-        )
+        def image_projection() -> nn.Module:
+            if str(IMG_ENCODER) == "conv":
+                return ConvImageProjector(img_dim, img_proj_dim)
+            elif str(IMG_ENCODER) == "linear":
+                return nn.Sequential(
+                    nn.Linear(img_dim, img_proj_dim),
+                    nn.LayerNorm(img_proj_dim),
+                    nn.ReLU(),
+                )
+            else:
+                raise ValueError(f"Unsupported {IMG_ENCODER=}")
+
+        self.img_proj = image_projection()
+        self.mask_proj = image_projection()
         self.text_proj = nn.Sequential(
             nn.Linear(text_dim * 4, text_proj_dim),
             nn.LayerNorm(text_proj_dim),
@@ -341,7 +419,7 @@ class SurrogateRegressor(nn.Module):
 
         # PSNR-Unedited MLP body and head.
         psnr_in = img_proj_dim * 2 + text_proj_dim + t_proj_dim
-        self.psnr_body = MLPBody(psnr_in, n_wide, n_hidden, n_inner, dropout_rate)
+        self.psnr_body = MLPBody(psnr_in, n_wide, n_hidden, n_inner, psnr_dropout_rate)
         self.psnr_head = nn.Linear(n_inner, 1)
 
         # CLIP-Edited FiLM-conditioned MLP body and head.
@@ -352,14 +430,46 @@ class SurrogateRegressor(nn.Module):
         self.register_buffer("target_mean", torch.zeros(n_targets))
         self.register_buffer("target_std", torch.ones(n_targets))
 
+        # Optional per-cell anchor: the train split's average standardized
+        # value at each (t_start, t_end). Adding it inside forward() turns the
+        # towers into residual predictors, so their capacity goes to what
+        # varies between images instead of re-learning the surface every image
+        # shares. Buffers are fixed-size so checkpoints always load.
+        self.register_buffer("anchor_t", torch.zeros(MAX_ANCHOR_CELLS, 2))
+        self.register_buffer("anchor_values", torch.zeros(MAX_ANCHOR_CELLS, n_targets))
+        self.register_buffer("anchor_n", torch.zeros((), dtype=torch.long))
+
+    def denormalize(self, standardized: torch.Tensor) -> torch.Tensor:
+        """Map standardized predictions back to raw metric units."""
+        return standardized * self.target_std + self.target_mean
+
+    def set_cell_anchor(self, t_table: torch.Tensor, values: torch.Tensor) -> None:
+        """Store the standardized mean value at each grid cell."""
+        n = int(t_table.shape[0])
+        if n > MAX_ANCHOR_CELLS:
+            raise ValueError(f"{n} grid cells exceeds {MAX_ANCHOR_CELLS=}")
+        self.anchor_t.zero_()
+        self.anchor_values.zero_()
+        self.anchor_t[:n] = t_table.to(self.anchor_t)
+        self.anchor_values[:n] = values.to(self.anchor_values)
+        self.anchor_n.fill_(n)
+
+    def _anchor_for(self, t: torch.Tensor) -> torch.Tensor:
+        """Anchor value for each row of t, matched to the nearest known cell."""
+        n = int(self.anchor_n)
+        if n == 0:
+            return torch.zeros((), device=t.device, dtype=t.dtype)
+        idx = torch.cdist(t, self.anchor_t[:n]).argmin(dim=-1)
+        return self.anchor_values[:n][idx]
+
     def _get_inputs(
         self,
-        img_emb: torch.Tensor,
-        mask_emb: torch.Tensor,
-        src_emb: torch.Tensor,
-        tar_emb: torch.Tensor,
-        t: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        img_emb: torch.Tensor,  # (N, D_img)
+        mask_emb: torch.Tensor, # (N, D_img)
+        src_emb: torch.Tensor,  # (N, D_txt)
+        tar_emb: torch.Tensor,  # (N, D_txt)
+        t: torch.Tensor,        # (N, 2)
+    ) -> tuple[torch.Tensor, torch.Tensor]:  # context (N, D_ctx), t_feat (N, D_t)
         # Combine image/mask/text embeddings into a single context vector.
         text_emb = combine_text_embeddings(src_emb, tar_emb)
         context = torch.cat([self.img_proj(img_emb), self.mask_proj(mask_emb), self.text_proj(text_emb)], dim=-1)
@@ -374,22 +484,38 @@ class SurrogateRegressor(nn.Module):
 
     def forward(
         self,
-        img_emb: torch.Tensor,
-        mask_emb: torch.Tensor,
-        src_emb: torch.Tensor,
-        tar_emb: torch.Tensor,
-        t: torch.Tensor,
-    ) -> torch.Tensor:
+        img_emb: torch.Tensor,  # (N, D_img)
+        mask_emb: torch.Tensor, # (N, D_img)
+        src_emb: torch.Tensor,  # (N, D_txt)
+        tar_emb: torch.Tensor,  # (N, D_txt)
+        t: torch.Tensor,        # (N, 2)
+    ) -> torch.Tensor:          # (N, 2)
         """Return standardized metric predictions."""
         context, t_feat = self._get_inputs(img_emb, mask_emb, src_emb, tar_emb, t)
         # Predcit PSNR and CLIP from the context and timestep feature.
         psnr = self.psnr_head(self.psnr_body(torch.cat([context, t_feat], dim=-1)))
         clip = self.clip_head(self.clip_body(context, t_feat))
-        return torch.cat([psnr, clip], dim=-1) # shape (N, 2)
+        return torch.cat([psnr, clip], dim=-1) + self._anchor_for(t)
 
-    def denormalize(self, standardized: torch.Tensor) -> torch.Tensor:
-        """Map standardized predictions back to raw metric units (PSNR / CLIP)."""
-        return standardized * self.target_std + self.target_mean
+    def forward_grid(
+        self,
+        img_emb: torch.Tensor,  # (G, D_img)
+        mask_emb: torch.Tensor, # (G, D_img)
+        src_emb: torch.Tensor,  # (G, D_txt)
+        tar_emb: torch.Tensor,  # (G, D_txt)
+        t: torch.Tensor,        # (G, C, 2)
+    ) -> torch.Tensor:          # (G, C, 2)
+        """Return standardized metric predictions for a sample's timestep grid."""
+        g, c = int(t.shape[0]), int(t.shape[1])
+        t_flat = t.reshape(g * c, 2)
+        text_emb = combine_text_embeddings(src_emb, tar_emb)
+        context = torch.cat([self.img_proj(img_emb), self.mask_proj(mask_emb), self.text_proj(text_emb)], dim=-1)
+        context = context.unsqueeze(1).expand(-1, c, -1).reshape(g * c, -1)
+        t_feat = self.t_encoder(fourier_timestep_features(t_flat))
+        psnr = self.psnr_head(self.psnr_body(torch.cat([context, t_feat], dim=-1)))
+        clip = self.clip_head(self.clip_body(context, t_feat))
+        out = torch.cat([psnr, clip], dim=-1) + self._anchor_for(t_flat)
+        return out.reshape(g, c, -1)
 
 
 class SurrogateModel(nn.Module):
@@ -400,21 +526,21 @@ class SurrogateModel(nn.Module):
         device: torch.device | str | None = None,
     ):
         super().__init__()
+        
         # We reuse ChordEdit's VAE and text encoder (and their preprocess helpers)
         # so their embeddings match the runs that produced (psnr, clip) labels. Full
         # from_local_* also loads UNet/scheduler; encoder-only loading would
         # require pipeline_chord.py changes, which we avoid here.
-        if CHORD_EDIT_PIPELINE_TYPE == "flux":
-            raise NotImplementedError(
-                "CHORD_EDIT_MODEL='flux' encoder loading is not implemented in "
-                "ChordEditPipeline yet; use sd_turbo / sdxl_turbo."
-            )
-        if CHORD_EDIT_PIPELINE_TYPE not in {"sd", "sdxl"}:
-            raise ValueError(f"Unsupported CHORD_EDIT_PIPELINE_TYPE={CHORD_EDIT_PIPELINE_TYPE!r}")
+        if CHORD_EDIT_PIPELINE_TYPE == "sd":
+            pass
+        elif CHORD_EDIT_PIPELINE_TYPE == "sdxl":
+            pass
+        elif CHORD_EDIT_PIPELINE_TYPE == "flux":
+            raise NotImplementedError()
+        else:
+            raise ValueError(f"Unsupported {CHORD_EDIT_PIPELINE_TYPE=}")
 
-        component_paths = paths_from_model_root(
-            CHORD_EDIT_MODEL_ROOT, model_type=CHORD_EDIT_PIPELINE_TYPE
-        )
+        component_paths = paths_from_model_root(CHORD_EDIT_MODEL_ROOT, model_type=CHORD_EDIT_PIPELINE_TYPE)
         self.pipeline = ChordEditPipeline.from_local_weights(
             component_paths,
             model_type=CHORD_EDIT_PIPELINE_TYPE,
@@ -424,10 +550,12 @@ class SurrogateModel(nn.Module):
             use_safety_checker=False,
             device=device,
         )
+
         # VAE-encoding a full EMBED_BATCH_SIZE batch at image_size=1024 in
         # fp32 needs >40 GiB of activations (OOMs on a 48 GiB card). Slicing
         # makes the VAE encode one image at a time with identical outputs.
         self.pipeline.vae.enable_slicing()
+
         # Encoders are inherited from the ChordEdit pipeline and are never
         # trainable: freeze the VAE and text encoder weights unconditionally.
         for param in self.pipeline.vae.parameters():
@@ -455,10 +583,9 @@ class SurrogateModel(nn.Module):
 
     def release_encoders(self) -> None:
         """Free VAE/text pipeline after embeddings are precomputed."""
+        import gc
         # Drop frozen SD encoders from GPU once embeddings exist so
         # that training only keeps the small regressor on device.
-        import gc
-
         if "image_encoder" in self._modules:
             del self.image_encoder
         if "text_encoder" in self._modules:
@@ -470,30 +597,35 @@ class SurrogateModel(nn.Module):
 
     @torch.no_grad()
     def encode(
-        self, image, mask, src_prompt: str, tar_prompt: str
+        self,
+        images: list,
+        masks: list,
+        src_prompts: list[str],
+        tar_prompts: list[str],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return (img_emb, mask_emb, src_emb, tar_emb) each shape (1, D) on regressor device."""
+        """Return (img_emb, mask_emb, src_emb, tar_emb) each shape (N, D) on regressor device."""
         device = self.regressor.target_mean.device
-        img_emb = self.image_encoder([image]).to(device)
-        mask_emb = self.image_encoder([mask]).to(device)
-        src_emb = self.text_encoder([src_prompt]).to(device)
-        tar_emb = self.text_encoder([tar_prompt]).to(device)
-        return img_emb, mask_emb, src_emb, tar_emb
+        return (
+            self.image_encoder(images).to(device),
+            self.image_encoder(masks).to(device),
+            self.text_encoder(src_prompts).to(device),
+            self.text_encoder(tar_prompts).to(device),
+        )
 
     def predict_emb(
         self,
-        img_emb: torch.Tensor,
-        mask_emb: torch.Tensor,
-        src_emb: torch.Tensor,
-        tar_emb: torch.Tensor,
-        t: torch.Tensor,
-    ) -> torch.Tensor:
+        img_emb: torch.Tensor,  # (N, D_img)
+        mask_emb: torch.Tensor, # (N, D_img)
+        src_emb: torch.Tensor,  # (N, D_txt)
+        tar_emb: torch.Tensor,  # (N, D_txt)
+        t: torch.Tensor,        # (N, 2)
+    ) -> torch.Tensor:          # (N, 2)
         """Predict (psnr, clip) in raw metric units from precomputed embeddings."""
         out = self.regressor(img_emb, mask_emb, src_emb, tar_emb, t)
         return self.regressor.denormalize(out)
 
     @torch.no_grad()
-    def predict(
+    def predict_raw(
         self,
         images: list,
         masks: list,
@@ -508,13 +640,8 @@ class SurrogateModel(nn.Module):
         was_training = self.training
         self.eval()
 
-        device = self.regressor.target_mean.device
-        img_emb = self.image_encoder(images).to(device)
-        mask_emb = self.image_encoder(masks).to(device)
-        src_emb = self.text_encoder(src_prompts).to(device)
-        tar_emb = self.text_encoder(tar_prompts).to(device)
-        t = torch.tensor(list(zip(t_start, t_end)), dtype=torch.float, device=device)
-        
+        img_emb, mask_emb, src_emb, tar_emb = self.encode(images, masks, src_prompts, tar_prompts)
+        t = torch.tensor(list(zip(t_start, t_end)), dtype=torch.float, device=img_emb.device)
         out = self.predict_emb(img_emb, mask_emb, src_emb, tar_emb, t)
 
         # Restore the mode the model was in before predict().
