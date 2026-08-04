@@ -1,23 +1,33 @@
 """
-Evaluate the metrics of a grid of cells for every sample in a dataset.
+Unoptimized baseline: evaluate metrics for every cell via PnPInversion helpers.
+
+--generated-root must be a dataset folder in the shared generated layout, e.g.
+
+  /shared/ssd_30T/mirick/generated/ultra_edit/UltraEdit_Region_10/
+    id_to_inputs_ultraeditregion10.csv
+    id_to_metrics_ultraeditregion10.csv   # written by this script
+    grids/{sample_id}/cells/t_start_{X}p{Y}__t_end_{A}p{B}.jpg
 """
 
 from __future__ import annotations
 
 import os
+
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import argparse
 import csv
 import logging
-import numpy as np
 import re
 import time
 from collections import defaultdict
 from pathlib import Path
+
+import numpy as np
 from PIL import Image
 
+import settings
 from evaluation.evaluate import calculate_metric
 from evaluation.matrics_calculator import MetricsCalculator
 
@@ -33,8 +43,15 @@ METRICS = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--generated-root", required=True)
-    # parser.add_argument("--model-root", required=True)
+    parser.add_argument(
+        "--generated-root",
+        required=True,
+        help=(
+            "Dataset generated folder, e.g. "
+            "/shared/ssd_30T/mirick/generated/ultra_edit/UltraEdit_Region_10 "
+            "(expects id_to_inputs_*.csv and grids/{id}/cells/)."
+        ),
+    )
     parser.add_argument("--result-path", default=None)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--max-samples", type=int, default=None)
@@ -53,9 +70,9 @@ def _format_mask_image(mask_image: Image.Image) -> np.ndarray:
 
     # Force the border of the mask to be 1 to avoid annotation errors in boundaries.
     # Matched from https://github.com/cure-lab/PnPInversion/blob/07f97f448150e2ca220bebd54c8f687c5c50c67a/evaluation/evaluate.py#L20
-    mask_array[0, :]  = 1
+    mask_array[0, :] = 1
     mask_array[-1, :] = 1
-    mask_array[:, 0]  = 1
+    mask_array[:, 0] = 1
     mask_array[:, -1] = 1
 
     # Matched from https://github.com/cure-lab/PnPInversion/blob/07f97f448150e2ca220bebd54c8f687c5c50c67a/evaluation/evaluate.py#L258
@@ -63,29 +80,90 @@ def _format_mask_image(mask_image: Image.Image) -> np.ndarray:
     return mask_array
 
 
+def _patch_clip_for_transformers_v5(metrics_calculator: MetricsCalculator) -> None:
+    """
+    torchmetrics CLIPScore expects get_*_features() to return a plain tensor.
+    transformers >=5 (chordedit) returns BaseModelOutputWithPooling instead, so
+    CLIPScore dies on `.norm`. Match grid_eval.py: use pooler_output when present.
+    """
+    import torch
+
+    clip = metrics_calculator.clip_metric_calculator
+    device = metrics_calculator.device
+    model = clip.model
+    processor = clip.processor
+
+    def calculate_clip_similarity(img, txt, mask=None):
+        img = np.array(img)
+        if mask is not None:
+            mask = np.array(mask)
+            img = np.uint8(img * mask)
+
+        img_tensor = torch.tensor(img).permute(2, 0, 1).to(device)
+        processed = processor(text=[txt], images=img_tensor, return_tensors="pt", padding=True)
+        pixel_values = processed["pixel_values"].to(device)
+        input_ids = processed["input_ids"].to(device)
+
+        with torch.no_grad():
+            image_out = model.get_image_features(pixel_values)
+            text_out = model.get_text_features(input_ids)
+            # transformers >=5 returns BaseModelOutputWithPooling; older returned a tensor.
+            image_features = image_out.pooler_output if hasattr(image_out, "pooler_output") else image_out
+            text_features = text_out.pooler_output if hasattr(text_out, "pooler_output") else text_out
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            score = (100.0 * (image_features * text_features).sum(dim=-1)).squeeze()
+        return score.cpu().item()
+
+    metrics_calculator.calculate_clip_similarity = calculate_clip_similarity
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
-    # os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    # os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-
     args = parse_args()
     max_samples = args.max_samples
+
+    # Pin this process to one physical GPU BEFORE importing torch / MetricsCalculator.
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+
     generated_root = Path(args.generated_root).expanduser().resolve()
-    inputs_path = generated_root / f"id_to_inputs_{generated_root.name.replace('_','').lower()}{f'_n{max_samples}' if max_samples else ''}.csv"
-    result_path = generated_root / f"id_to_metrics_{generated_root.name.replace('_','').lower()}{f'_n{max_samples}' if max_samples else ''}.csv"
+    if not generated_root.is_dir():
+        raise FileNotFoundError(f"generated-root is not a directory: {generated_root}")
+    grids_dir = generated_root / settings.GRIDS_DIRNAME
+    if not grids_dir.is_dir():
+        raise FileNotFoundError(
+            f"Missing {settings.GRIDS_DIRNAME}/ under generated-root "
+            f"(expected shared layout like "
+            f"/shared/ssd_30T/mirick/generated/ultra_edit/UltraEdit_Region_10): {generated_root}"
+        )
+
+    suffix = generated_root.name.lower().replace("_", "").replace("-", "")
+    inputs_path = generated_root / f"id_to_inputs_{suffix}.csv"
+    if not inputs_path.is_file():
+        raise FileNotFoundError(f"Missing inputs CSV (expected generated layout): {inputs_path}")
+    result_path = (
+        Path(args.result_path).expanduser().resolve()
+        if args.result_path
+        else generated_root / f"id_to_metrics_{suffix}{f'_n{max_samples}' if max_samples is not None else ''}.csv"
+    )
 
     # Collect samples from the inputs CSV.
     samples: dict[str, dict[str, str]] = {}
     with open(inputs_path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
+        if reader.fieldnames != settings.ID_TO_INPUTS_FIELDS:
+            raise ValueError(
+                f"Unexpected id_to_inputs columns {reader.fieldnames}; "
+                f"expected {settings.ID_TO_INPUTS_FIELDS}"
+            )
         for row in reader:
             samples[row["sample_id"]] = {k: v for k, v in row.items() if k != "sample_id"}
 
-    # Collect cells from the generated root.
+    # Collect cells from {generated_root}/grids/{sample_id}/cells/.
     cells: defaultdict[str, list[tuple[float, float, Path]]] = defaultdict(list)
     for sample_id in samples:
-        cells_dir = generated_root / sample_id / "cells"
+        cells_dir = generated_root / settings.GRIDS_DIRNAME / sample_id / settings.CELLS_DIRNAME
         if not cells_dir.is_dir():
             continue
         for path in sorted(cells_dir.iterdir()):
@@ -95,10 +173,20 @@ def main() -> None:
             t_start, t_end = (float(x.replace("p", ".")) for x in match.groups())
             cells[sample_id].append((t_start, t_end, path.absolute()))
 
-    LOGGER.info("Found %d samples and %d total cells", len(samples), sum(len(v) for v in cells.values()))
+    sample_ids = list(cells.keys())
+    if max_samples is not None:
+        sample_ids = sample_ids[:max_samples]
+    cells = defaultdict(list, {sid: cells[sid] for sid in sample_ids})
 
-    # Initialize the metrics calculator from PnPInversion.
-    metrics_calculator = MetricsCalculator("cuda")
+    LOGGER.info("Found %d samples and %d total cells", len(cells), sum(len(v) for v in cells.values()))
+    if not cells:
+        raise FileNotFoundError(
+            f"No cells under {generated_root / settings.GRIDS_DIRNAME}/{{id}}/{settings.CELLS_DIRNAME}/"
+        )
+
+    # Initialize the metrics calculator from PnPInversion (visible device is cuda:0 after pin).
+    metrics_calculator = MetricsCalculator("cuda:0")
+    _patch_clip_for_transformers_v5(metrics_calculator)
 
     # Write the header to the result file.
     with open(result_path, "w", newline="", encoding="utf-8") as f:
@@ -120,10 +208,14 @@ def main() -> None:
             row: list = [sample_id, f"{t_start:.1f}", f"{t_end:.1f}"]
             for metric in METRICS:
                 score = calculate_metric(
-                    metrics_calculator, metric,
-                    source_image, target_image,
-                    mask_array, mask_array,
-                    sample_meta["source_prompt"], sample_meta["target_prompt"],
+                    metrics_calculator,
+                    metric,
+                    source_image,
+                    target_image,
+                    mask_array,
+                    mask_array,
+                    sample_meta["source_prompt"],
+                    sample_meta["target_prompt"],
                 )
                 row.append(score)
 
@@ -132,7 +224,14 @@ def main() -> None:
                 csv.writer(f).writerow(row)
 
         elapsed = time.perf_counter() - sample_start
-        LOGGER.info("[%d/%d] Evaluated %s (%d cells in %.2fs)", sample_idx + 1, len(cells), sample_id, len(cell_list), elapsed)
+        LOGGER.info(
+            "[%d/%d] Evaluated %s (%d cells in %.2fs)",
+            sample_idx + 1,
+            len(cells),
+            sample_id,
+            len(cell_list),
+            elapsed,
+        )
 
     LOGGER.info("Done. Metrics in %s", result_path.absolute())
 

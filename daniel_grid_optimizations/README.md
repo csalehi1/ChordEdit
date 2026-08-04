@@ -57,6 +57,14 @@ python daniel_create/grid_generate.py --diagonal-optimization --gpus 0
 
 ### Evaluation Usage
 
+`--generated-root` is the dataset folder (not the parent `ultra_edit/` dir):
+
+```text
+/shared/ssd_30T/mirick/generated/ultra_edit/UltraEdit_Region_10/
+  id_to_inputs_ultraeditregion10.csv
+  grids/{sample_id}/cells/t_start_*__t_end_*.jpg
+```
+
 ```bash
 python grid_eval.py --generated-root /shared/ssd_30T/mirick/generated/ultra_edit/UltraEdit_Region_10
 ```

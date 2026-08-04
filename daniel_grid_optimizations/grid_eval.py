@@ -1,5 +1,12 @@
 """
 Evaluate the metrics of a grid of cells for every sample in a dataset.
+
+--generated-root must be a dataset folder in the shared generated layout, e.g.
+
+  /shared/ssd_30T/mirick/generated/ultra_edit/UltraEdit_Region_10/
+    id_to_inputs_ultraeditregion10.csv
+    id_to_metrics_ultraeditregion10.csv   # written by this script
+    grids/{sample_id}/cells/t_start_{X}p{Y}__t_end_{A}p{B}.jpg
 """
 
 from __future__ import annotations
@@ -14,6 +21,8 @@ from collections import defaultdict
 from multiprocessing import get_context
 from pathlib import Path
 from typing import List
+import numpy as np
+from PIL import Image
 
 import settings
 from _helpers import cell_filename, metrics_fieldnames
@@ -28,7 +37,6 @@ LPIPS_BATCH_SIZE = 32
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--generated-root", required=True)
-    parser.add_argument("--inputs-path", default=None)
     parser.add_argument("--result-path", default=None)
     parser.add_argument("--gpus", nargs="+", type=int, default=[0])
     parser.add_argument("--max-samples", type=int, default=None)
@@ -38,17 +46,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _format_mask_image(mask_image: "Image.Image") -> "np.ndarray":
-    import numpy as np
-    from PIL import Image
-
+def _format_mask_image(mask_image: Image.Image) -> np.ndarray:
+    # Convert the mask image to a binary array
+    # Matched from https://github.com/cure-lab/PnPInversion/blob/07f97f448150e2ca220bebd54c8f687c5c50c67a/evaluation/evaluate.py#L9
+    
     mask_image = mask_image.convert("L")
     if mask_image.size != (IMAGE_SIZE, IMAGE_SIZE):
         mask_image = mask_image.resize((IMAGE_SIZE, IMAGE_SIZE))
 
     # Convert the mask image to a binary array.
     mask_array = np.array(mask_image)
-    # OPT 1: Use float32 instead of float64 to halve mask memory and avoid
+    # Use float32 instead of float64 to halve mask memory and avoid
     # extra .astype(np.float32) casts downstream when building GPU tensors.
     mask_array = (mask_array > 127).astype(np.float32)
 
@@ -136,14 +144,14 @@ def run_shard(
 
     metrics_calculator = MetricsCalculator(DEVICE)
 
-    # OPT 2: Access the internal torchmetrics calculators and the CLIP model/processor
+    # Access the internal torchmetrics calculators and the CLIP model/processor
     # directly from MetricsCalculator, so we can call them with pre-built GPU tensors
     # instead of going through the PIL->numpy->tensor conversion on every call.
     psnr_calc = metrics_calculator.psnr_metric_calculator
     lpips_calc = metrics_calculator.lpips_metric_calculator
     clip_model = metrics_calculator.clip_metric_calculator.model
 
-    # OPT 3: Split text tokenization from image preprocessing so the image side can
+    # Split text tokenization from image preprocessing so the image side can
     # use TorchvisionBackend explicitly. `use_fast=True` on the combined AutoProcessor
     # silently no-ops on this transformers version (both paths resolve to the same
     # slow CPU-bound class) -- TorchvisionBackend is only actually fast when it runs
@@ -159,13 +167,13 @@ def run_shard(
     with open(result_path, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow(fieldnames)
 
-    # OPT 4: Keep the result file open for the entire evaluation instead of
+    # Keep the result file open for the entire evaluation instead of
     # re-opening and closing it for every single cell row, eliminating thousands
     # of open()/close() syscall pairs. Flush after each sample for crash safety.
     with open(result_path, "a", newline="", encoding="utf-8") as result_file:
         result_writer = csv.writer(result_file)
 
-        # OPT 5: Wrap the entire evaluation in a single torch.no_grad() context
+        # Wrap the entire evaluation in a single torch.no_grad() context
         # instead of entering/exiting it per-cell for CLIP. No metric computation
         # here requires gradients, so one outer context eliminates repeated
         # context-manager overhead and ensures PSNR/LPIPS also skip grad tracking.
@@ -178,14 +186,14 @@ def run_shard(
                 mask_image = Image.open(sample_meta["mask_image_path"])
                 mask_array = _format_mask_image(mask_image)
 
-                # OPT 6: Precompute masked source tensors once per sample.
+                # Precompute masked source tensors once per sample.
                 # The source image and inverse mask are constant across all cells in a sample.
                 # We bypass MetricsCalculator's PIL-accepting methods and call its internal
                 # torchmetrics calculators (psnr_metric_calculator, lpips_metric_calculator)
                 # directly with pre-built GPU tensors, eliminating redundant PIL->numpy->tensor
                 # conversion and mask application that would otherwise repeat for every cell.
                 src_np = np.array(source_image).astype(np.float32) / 255.0
-                # OPT 1 (cont.): mask_array is already float32 from _format_mask_image,
+                # mask_array is already float32 from _format_mask_image,
                 # so no extra .astype(np.float32) cast is needed here.
                 inv_mask = 1.0 - mask_array
                 has_unedit_part = inv_mask.sum() > 0
@@ -195,7 +203,7 @@ def run_shard(
                 src_lpips_tensor = torch.empty(0)
                 text_features = torch.empty(0)
 
-                # OPT 7: torch.from_numpy() shares memory with the numpy array
+                # torch.from_numpy() shares memory with the numpy array
                 # instead of copying like torch.tensor(), avoiding a redundant
                 # CPU-side memcpy before the .to(DEVICE) GPU transfer.
                 if (include_psnr or include_lpips) and has_unedit_part:
@@ -203,7 +211,7 @@ def run_shard(
                     src_psnr_tensor = torch.from_numpy(src_masked_np).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
                     src_lpips_tensor = src_psnr_tensor * 2 - 1
 
-                # OPT 8: Encode the target prompt through CLIP's text encoder once per sample.
+                # Encode the target prompt through CLIP's text encoder once per sample.
                 # We access the CLIPScore metric's internal model (clip_metric_calculator.model)
                 # to extract text features, then compute image-text cosine similarity manually
                 # for each cell, avoiding N-1 redundant text forward passes per sample.
@@ -220,7 +228,7 @@ def run_shard(
                     text_features = text_out.pooler_output if hasattr(text_out, "pooler_output") else text_out
                     text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-                # OPT 9: Batch CLIP and LPIPS neural-network forward passes across
+                # Batch CLIP and LPIPS neural-network forward passes across
                 # all cells in a sample. Instead of running these networks once per cell
                 # (N separate GPU kernel launches at batch_size=1), we collect all cell
                 # images in a first pass (computing the cheap PSNR metric inline), then
@@ -232,7 +240,7 @@ def run_shard(
 
                 for t_start, t_end, cell_path in cell_list:
                     target_image = Image.open(cell_path).convert("RGB").resize((IMAGE_SIZE, IMAGE_SIZE))
-                    # OPT 9: Convert the target image to numpy once per cell and derive
+                    # Convert the target image to numpy once per cell and derive
                     # all tensor variants, instead of repeating PIL->numpy->tensor per metric.
                     target_arr = np.array(target_image)
 
@@ -263,7 +271,7 @@ def run_shard(
                         )
                     )
 
-                # OPT 9 (cont.): Batched LPIPS -- run SqueezeNet on stacked target tensors.
+                # Batched LPIPS -- run SqueezeNet on stacked target tensors.
                 # We call lpips_calc.net directly to get per-sample LPIPS scores;
                 # the torchmetrics wrapper would average across the batch.
                 lpips_scores: list = []
@@ -281,7 +289,7 @@ def run_shard(
                     else:
                         lpips_scores = ["nan"] * len(cell_meta)
 
-                # OPT 9 (cont.): Batched CLIP -- run the CLIP image encoder on all collected
+                # Batched CLIP -- run the CLIP image encoder on all collected
                 # masked cell images at once. clip_image_processor handles resizing and
                 # normalization; clip_model.get_image_features encodes the whole batch
                 # in one forward pass. Cosine similarities are computed vectorially.
@@ -334,19 +342,17 @@ def main() -> None:
     max_samples = args.max_samples
     gpus = args.gpus
     generated_root = Path(args.generated_root).expanduser().resolve()
-    # Check that the generated root is a directory.
     if not generated_root.is_dir():
         raise FileNotFoundError(f"generated-root is not a directory: {generated_root}")
+    grids_dir = generated_root / settings.GRIDS_DIRNAME
+    if not grids_dir.is_dir():
+        raise FileNotFoundError(f"Missing {settings.GRIDS_DIRNAME} under {generated_root=}")
+
     suffix = generated_root.name.lower().replace("_", "").replace("-", "")
-    # Check that the inputs CSV exists.
-    inputs_path = generated_root / f"id_to_inputs_{generated_root.name.lower().replace('_', '').replace('-', '')}.csv"
+    inputs_path = Path(args.inputs_path).expanduser().resolve() if args.inputs_path else generated_root / f"id_to_inputs_{suffix}.csv"
     if not inputs_path.is_file():
         raise FileNotFoundError(f"Missing inputs CSV (expected generated layout): {inputs_path}")
-    metrics_path = (
-        Path(args.result_path).expanduser().resolve()
-        if args.result_path
-        else generated_root / f"id_to_metrics_{suffix}{f'_n{max_samples}' if max_samples is not None else ''}.csv"
-    )
+    metrics_path = Path(args.result_path).expanduser().resolve() if args.result_path else generated_root / f"id_to_metrics_{suffix}{f'_n{max_samples}' if max_samples is not None else ''}.csv"
 
     include_psnr = args.include_psnr
     include_lpips = args.include_lpips
@@ -363,7 +369,7 @@ def main() -> None:
         metrics.append("clip_similarity_target_image_edit_part")
     fieldnames = metrics_fieldnames(metrics)
 
-    # OPT 10: Multi-GPU sharding -- distribute samples round-robin across GPUs.
+    # Multi-GPU sharding: distribute samples round-robin across GPUs,
     # Each GPU runs an independent spawned process with its own CUDA context,
     # MetricsCalculator, and CLIP/LPIPS models. Every shard writes to its own
     # temporary CSV (avoiding write races), and main() merges them at the end.
