@@ -39,6 +39,7 @@ Every key is required — a missing key raises `KeyError` at import. Keys starti
 | `DIR_NAME` | Dataset folder name under the generated/datasets/embeddings roots (also names `OUTPUTS_DIR`). |
 | `CHORD_EDIT_MODEL` | `"sd_turbo"`, `"sdxl_turbo"`, or `"flux"`. Selects the encoder stack, image size, and which embedding caches apply. |
 | `TARGET_T_DELTA` | `t_delta` value used to select rows from the data. Reflects $\delta$ values used to generate images. `null` uses every `t_delta`. |
+| `CELL_SUBSET` | Candidate grid cells: `"all"` (all 121 positions) or `"lower"` (the 55 with `t_end < t_start`, the only region labeled before the annotation pass). Changes the labels and phi's scale, not just the argmax domain. |
 | `TRAIN_FRAC` / `VAL_FRAC` / `TEST_FRAC` | Sample-level split ratios (split is by `sample_id`, seeded by `SPLIT_SEED`). |
 
 `GRID_T_START` / `GRID_T_END` (the fixed bucket grids) live in `settings.py` as code constants. Missing cells in the CSV are fine (those classes simply get no labels); off-grid values raise at load time.
@@ -80,7 +81,6 @@ If wanted, further edit [settings.json](settings.json) to adjust the model and t
 |---|---|
 | `C_TARGET_FN` / `C_TARGET_ALPHA` | Active score function and its risk-aversion $\alpha$ (larger values penalize regressions harder). |
 | `DEFAULT_T_START` / `DEFAULT_T_END` | Baseline $(t^*, t^{**})$ cell that deltas are measured against. Exactly one row per `sample_id` must match, or scoring raises. |
-| `USE_CENTER_CROP` / `EMBED_BATCH_SIZE` | Encoder preprocessing and batching used when embeddings must be (re)computed; both are part of the packed-cache identity. |
 | `IMG_ENCODER` | `"linear"` (one Linear over the flat VAE latent) or `"conv"` (fold back to $(C, S, S)$ and downsample). |
 | `IMG_PROJ_DIM` / `TEXT_PROJ_DIM` | Widths of the image/mask and text projections. |
 | `HEAD_TYPE` | `"CE"` (multiclass, default), `"CORAL"` (ordinal), or `"MSE"` (regression). |
@@ -108,7 +108,7 @@ python train.py
 
 This loads the CSVs, computes the score column if the metrics CSV does not already carry it, selects the best cell per sample, materializes the embeddings, trains the model, and saves to `OUTPUTS_DIR/<run>/`: the exact `settings.json` used, `classifier_weights.pt`, and the `id_to_split.csv` sample-to-split mapping.
 
-Embeddings are served by [embeddings.py](embeddings.py) from a packed table under `.cache/packed_embeddings/` when one matches the current settings, else packed on the fly from the scattered per-sample files under `EMBEDDINGS_DIR`. Training never loads the ChordEdit encoders; if neither cache can cover the requested samples, `get_embeddings` raises with instructions.
+Embeddings are served by [embeddings.py](embeddings.py) from a packed table under `.cache/packed_embeddings/` when one matches the current settings, else packed on the fly from the scattered per-sample files under `EMBEDDINGS_DIR`. If neither cache can cover the requested samples, `get_embeddings` raises with instructions.
 
 ### 6. Evaluate in `eval_model.ipynb`
 
@@ -127,7 +127,7 @@ Open [eval_model.ipynb](eval_model.ipynb) to inspect model performance after tra
 | `settings.py` | Reads `settings.json` and derives paths, column names, and score partials |
 | `_helpers.py` | Run-settings snapshot/replay, run-dir and device resolution, inputs loader |
 | `_data.py` | Data loading, per-sample label selection, splits, and training tensors |
-| `embeddings.py` | Packed/scattered embedding caches and (fallback) encoder embedding |
+| `embeddings.py` | Packed/scattered embedding caches |
 | `model.py` | `OrdinalPairClassifier`, embedding projections, and shared decode helpers |
 | `head_ce.py` | CE multiclass head (default) |
 | `head_coral.py` | CORAL ordinal head |

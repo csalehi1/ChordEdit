@@ -340,15 +340,14 @@ class SampleTensors:
 def create_sample_tensors(
     splits: dict[str, pd.DataFrame],
     device: torch.device,
-    predictor=None,
 ) -> dict[str, SampleTensors]:
     """Build device-resident SampleTensors for each split, sharing one embedding load.
 
-    predictor defaults to None: embeddings must come from the packed or
-    scattered caches (get_embeddings raises with instructions otherwise).
+    Embeddings come from the packed or scattered caches (get_embeddings raises
+    with instructions otherwise).
     """
     samples = pd.concat(list(splits.values()), ignore_index=True).drop_duplicates(SAMPLE_ID_COL).sort_values(SAMPLE_ID_COL)
-    sample_ids, img_emb, mask_emb, src_emb, tar_emb = get_embeddings(samples, predictor)
+    sample_ids, img_emb, mask_emb, src_emb, tar_emb = get_embeddings(samples)
     emb_table = EmbeddingTable(
         img=img_emb.to(device),
         mask=mask_emb.to(device),

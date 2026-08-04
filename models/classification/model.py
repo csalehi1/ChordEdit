@@ -62,6 +62,7 @@ def decode_head_pair(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Map raw head outputs to bucket indices for both targets."""
+    
     if predict_start:
         if out1 is None:
             raise ValueError("out1 is required when t_start has >1 bucket")
@@ -171,8 +172,7 @@ class OrdinalPairClassifier(nn.Module):
         self.predict_start = len(buckets1) > 1
         self.predict_end = len(buckets2) > 1
 
-        # Project the embeddings to the MLP input dimension (mirrors the
-        # modified model's SurrogateRegressor input side).
+        # Project the embeddings to the MLP input dimension.
         def image_projection() -> nn.Module:
             if IMG_ENCODER == "conv":
                 return ConvImageProjector(img_dim, img_proj_dim)
@@ -193,7 +193,7 @@ class OrdinalPairClassifier(nn.Module):
         )
 
         # Shared MLP body over the concatenated projections. LayerNorm after
-        # the first linear stabilises training against embedding-norm spread.
+        # the first linear stabilizes training against embedding-norm spread.
         body_in = img_proj_dim * 2 + text_proj_dim
         self.body = nn.Sequential(
             nn.Linear(body_in, mlp_wide),

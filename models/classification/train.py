@@ -323,11 +323,15 @@ def train() -> OrdinalPairClassifier:
     best_epoch = 0
     history: list[dict] = []
 
+    # Iterate over the number of epochs
     for epoch in range(1, EPOCHS + 1):
         epoch_start = time.perf_counter()
         model.train()
         epoch_loss = 0.0
+        
+        # Iterate over the training cells
         for img, mask, src, tar, y1, y2 in train_cells.iter_batches(BATCH_SIZE, shuffle=True):
+            # Forward pass
             l1, l2 = model(img, mask, src, tar)
             loss = _compute_loss(
                 model, l1, l2, y1, y2,
@@ -336,11 +340,13 @@ def train() -> OrdinalPairClassifier:
                 n_buckets_start=n_buckets_start,
                 n_buckets_end=n_buckets_end,
             )
+            # Backward pass
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item() * len(y1)
 
+        # Evaluate the training metrics
         train_metrics = eval_split(
             model, train_cells,
             class_w_start=class_w_start,
@@ -349,6 +355,8 @@ def train() -> OrdinalPairClassifier:
             n_buckets_start=n_buckets_start,
         )
         train_metrics["loss"] = epoch_loss / len(train_cells)
+
+        # Evaluate the validation metrics
         val_metrics = eval_split(
             model, val_cells,
             class_w_start=class_w_start,
@@ -360,19 +368,19 @@ def train() -> OrdinalPairClassifier:
         val_score = ckpt_sign * val_metrics[checkpoint_metric]
         improved = val_score > best_val_score
         if improved:
+            # Save the best checkpoint
             best_val_score = val_score
             best_epoch = epoch
-            torch.save(
-                {
-                    "state_dict": model.state_dict(),
-                    "buckets1": buckets_start.tolist(),
-                    "buckets2": buckets_end.tolist(),
-                    "img_dim": img_dim,
-                    "text_dim": text_dim,
-                    "config": {"run_dir": str(run_dir), **settings.CONFIG},
-                },
-                weights_out,
-            )
+            torch.save({
+                "state_dict": model.state_dict(),
+                "buckets1": buckets_start.tolist(),
+                "buckets2": buckets_end.tolist(),
+                "img_dim": img_dim,
+                "text_dim": text_dim,
+                "config": {"run_dir": str(run_dir), **settings.CONFIG},
+            }, weights_out)
+        
+        # Update the learning rate
         lr_now = optimizer.param_groups[0]["lr"]
         if scheduler is not None:
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -400,8 +408,10 @@ def train() -> OrdinalPairClassifier:
         strict=False,
     )
 
+    # Save the split dataframes
     save_split_df(train_df, val_df, test_df, run_dir)
 
+    # Evaluate the best-model metrics
     best_metrics = {
         name: eval_split(
             model, split_cells,
