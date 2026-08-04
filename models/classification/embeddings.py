@@ -35,104 +35,19 @@ def _prep_embedding_path(embedding_path: str) -> str:
     return str(_SCATTERED_EMBEDDINGS_DIR / path)
 
 
-"""
-Per-model text extraction for packing scattered embeddings.
-"""
+def _text_dim(probe: torch.Tensor, path) -> int:
+    """Validate a stored packing-ready text vector and return its dim.
 
-def _get_text_pooling() -> str:
-    """Text pooling name for CHORD_EDIT_PIPELINE_TYPE."""
-    if CHORD_EDIT_PIPELINE_TYPE == "sd":
-        return "masked_mean"
-    if CHORD_EDIT_PIPELINE_TYPE == "sdxl":
-        return "pooled_embeds"
-    if CHORD_EDIT_PIPELINE_TYPE == "flux":
-        raise NotImplementedError()
-    raise ValueError(f"Unsupported CHORD_EDIT_PIPELINE_TYPE={CHORD_EDIT_PIPELINE_TYPE!r}")
-
-
-def mean_pool(last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    """Mask-weighted mean over the token dimension."""
-    mask = attention_mask.unsqueeze(-1).expand_as(last_hidden).float()
-    return (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
-
-
-class SdMaskedMeanTextExtractor:
-    """SD branch: mask-weighted mean over the stored last_hidden_state sequence.
-
-    Attention masks come from re-tokenizing the prompts (tokenizer only, no
-    encoder weights), since the scattered files do not store them. Reuses
-    mean_pool so this cannot drift from model_m.encode_text_pooled.
+    Scattered files store one pre-pooled float32 vector per prompt (written by
+    the annotation pipeline from the same tensors that condition generation),
+    so packing never needs prompts, tokenizers, or pooling.
     """
-
-    name = "masked_mean"
-
-    def __init__(self, src_prompts: list[str], tar_prompts: list[str]):
-        from transformers import CLIPTokenizer
-
-        tokenizer = CLIPTokenizer.from_pretrained(str(CHORD_EDIT_MODEL_ROOT / "tokenizer"))
-        self.seq_len = int(tokenizer.model_max_length)
-
-        def _attn(prompts: list[str]) -> torch.Tensor:
-            enc = tokenizer(
-                list(prompts),
-                padding="max_length",
-                truncation=True,
-                max_length=self.seq_len,
-                return_tensors="pt",
-            )
-            return enc.attention_mask
-
-        self._attn = {"src": _attn(src_prompts), "tar": _attn(tar_prompts)}
-
-    def text_dim(self, probe: torch.Tensor, path) -> int:
-        """Validate a stored text tensor's shape and return the hidden dim."""
-        if probe.ndim != 3 or probe.shape[0] != 1:
-            raise ValueError(f"Expected text sequence (1, T, D), got {tuple(probe.shape)} in {path}")
-        if int(probe.shape[1]) != self.seq_len:
-            raise ValueError(
-                f"Stored sequence length {int(probe.shape[1])} != tokenizer max length "
-                f"{self.seq_len} in {path}; scattered embeddings do not match this model's tokenizer"
-            )
-        return int(probe.shape[2])
-
-    def __call__(self, t: torch.Tensor, i: int, kind: str, dim: int) -> torch.Tensor:
-        """Collapse sample i's stored sequence for kind in {'src', 'tar'} to (dim,)."""
-        hidden = t.reshape(1, self.seq_len, dim)
-        return mean_pool(hidden, self._attn[kind][i].unsqueeze(0))[0]
-
-
-class SdxlPooledTextExtractor:
-    """SDXL branch: scattered files must already store text_encoder_2's pooled
-    embeds (1, D); pooling cannot be redone from sequences without weights."""
-
-    name = "pooled_embeds"
-
-    def __init__(self, src_prompts: list[str], tar_prompts: list[str]):
-        pass
-
-    def text_dim(self, probe: torch.Tensor, path) -> int:
-        if probe.numel() != probe.shape[-1]:
-            raise ValueError(
-                f"Expected pooled text embeds (1, D) or (D,), got {tuple(probe.shape)} in {path}. "
-                f"SDXL pooled embeds (text_encoder_2 text_embeds) cannot be reconstructed from "
-                f"hidden-state sequences; re-run the annotation pipeline storing pooled embeds."
-            )
-        return int(probe.shape[-1])
-
-    def __call__(self, t: torch.Tensor, i: int, kind: str, dim: int) -> torch.Tensor:
-        if t.numel() != dim:
-            raise ValueError(f"Pooled text embeds numel {t.numel()} != {dim}")
-        return t.reshape(-1)
-
-
-def make_text_extractor(src_prompts: list[str], tar_prompts: list[str]):
-    """Text extractor matching CHORD_EDIT_PIPELINE_TYPE (see expected_text_pooling)."""
-    pooling = _get_text_pooling()
-    extractor_cls = {
-        SdMaskedMeanTextExtractor.name: SdMaskedMeanTextExtractor,
-        SdxlPooledTextExtractor.name: SdxlPooledTextExtractor,
-    }[pooling]
-    return extractor_cls(src_prompts, tar_prompts)
+    if probe.numel() != probe.shape[-1]:
+        raise ValueError(
+            f"Expected a pooled text vector (D,) or (1, D), got {tuple(probe.shape)} in {path}. "
+            f"Re-run the annotation pipeline to produce packing-ready embeddings."
+        )
+    return int(probe.shape[-1])
 
 
 """
@@ -147,11 +62,15 @@ def _get_packed_path() -> Path:
 
 
 def _expected_packed_meta() -> dict:
-    """Meta that a valid packed cache must carry (primitives only: survives weights_only)."""
+    """Meta that a valid packed cache must carry (primitives only: survives weights_only).
+
+    "layout" identifies the packing-ready schema (img/src/tar tables, no mask);
+    caches from the legacy sequence+mask format lack it and repack automatically.
+    """
     return {
         "model": CHORD_EDIT_MODEL,
         "pipeline_type": CHORD_EDIT_PIPELINE_TYPE,
-        "text_pooling": _get_text_pooling(),
+        "layout": "img_src_tar_v2",
         "image_size": int(CHORD_EDIT_IMAGE_SIZE),
         "dir_name": DIR_NAME,
         "target_t_delta": TARGET_T_DELTA,
@@ -169,7 +88,7 @@ def _load_pt(path: str) -> torch.Tensor:
 def _load_packed_cache(
     packed_path: Path,
     sample_ids: list[str],
-) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor] | None:
     """Packed tables sliced to sample_ids, or None (missing / bad meta / coverage)."""
     if not packed_path.exists():
         return None
@@ -198,7 +117,6 @@ def _load_packed_cache(
     return (
         sample_ids,
         data["img"][idxs].contiguous(),
-        data["mask"][idxs].contiguous(),
         data["src"][idxs].contiguous(),
         data["tar"][idxs].contiguous(),
     )
@@ -225,11 +143,13 @@ def _save_packed_cache(
 def _pack_scattered_cache(
     samples: pd.DataFrame,
     packed_path: Path,
-) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor] | None:
     """Pack scattered per-sample .pt files into packed tables; None if CSV cannot cover.
 
     Scattered embeddings stay per-sample on disk to best support symlinks between
-    dataset sizes, but loading them is slow, so the packed table is cached.
+    dataset sizes, but loading them is slow, so the packed table is cached. The
+    scattered files are packing-ready (one flat float32 vector per file), so
+    packing is a pure stack.
     """
     sample_ids = samples[SAMPLE_ID_COL].tolist()
     if not sample_ids:
@@ -242,7 +162,7 @@ def _pack_scattered_cache(
     if emb_df.isna().any().any():
         raise ValueError(f"Missing values found in {EMBEDDINGS_CSV}")
     emb_df[SAMPLE_ID_COL] = emb_df[SAMPLE_ID_COL].map(_prep_sample_id)
-    emb_cols = [IMAGE_EMB_COL, MASK_EMB_COL, SOURCE_EMB_COL, TARGET_EMB_COL]
+    emb_cols = [IMAGE_EMB_COL, SOURCE_EMB_COL, TARGET_EMB_COL]
     for col in emb_cols:
         if col not in emb_df.columns:
             raise ValueError(f"Missing column {col!r} in {EMBEDDINGS_CSV}")
@@ -258,62 +178,44 @@ def _pack_scattered_cache(
         return None
     path_rows = list(id_to_row[emb_cols].itertuples(index=False, name=None))
 
-    # Prompts feed the tokenizer for attention masks; the left merge in load_df
-    # can leave NaN prompts for ids absent from the inputs CSV.
-    prompt_na = samples[[SOURCE_PROMPT_COL, TARGET_PROMPT_COL]].isna().any(axis=1)
-    if prompt_na.any():
-        bad = samples.loc[prompt_na, SAMPLE_ID_COL].tolist()
-        raise ValueError(
-            f"NaN prompts for {len(bad)} sample_id(s) (missing from {INPUTS_CSV}?): {bad[:5]}"
-        )
-    extract_text = make_text_extractor(
-        samples[SOURCE_PROMPT_COL].tolist(),
-        samples[TARGET_PROMPT_COL].tolist(),
-    )
-
     # Probe dims from the first sample, then preallocate the packed tables so
     # peak memory stays ~1x table size (no row lists + torch.stack copy).
     n = len(sample_ids)
     img_dim = _load_pt(path_rows[0][0]).numel()
-    text_dim = extract_text.text_dim(_load_pt(path_rows[0][2]), path_rows[0][2])
+    text_dim = _text_dim(_load_pt(path_rows[0][1]), path_rows[0][1])
     img_emb = torch.empty((n, img_dim), dtype=torch.float32)
-    mask_emb = torch.empty((n, img_dim), dtype=torch.float32)
     src_emb = torch.empty((n, text_dim), dtype=torch.float32)
     tar_emb = torch.empty((n, text_dim), dtype=torch.float32)
 
     def _load_row(i: int):
-        img_p, mask_p, src_p, tar_p = path_rows[i]
-        return i, _load_pt(img_p), _load_pt(mask_p), _load_pt(src_p), _load_pt(tar_p)
+        img_p, src_p, tar_p = path_rows[i]
+        return i, _load_pt(img_p), _load_pt(src_p), _load_pt(tar_p)
 
-    def _check_image(t: torch.Tensor, i: int, kind: str) -> torch.Tensor:
-        if t.numel() != img_dim:
-            raise ValueError(f"{kind} numel {t.numel()} != {img_dim} for sample {sample_ids[i]}")
-        return t
+    def _check(t: torch.Tensor, i: int, kind: str, dim: int) -> torch.Tensor:
+        if t.numel() != dim:
+            raise ValueError(f"{kind} numel {t.numel()} != {dim} for sample {sample_ids[i]}")
+        return t.reshape(-1)
 
     with ThreadPoolExecutor(max_workers=32) as pool:
         # Load the embeddings in parallel using a thread pool; rows fill in-place.
-        for i, img_t, mask_t, src_t, tar_t in tqdm(pool.map(_load_row, range(n)), total=n, desc="Packing embeddings", unit="sample"):
-            img_emb[i] = _check_image(img_t, i, "image").reshape(-1)
-            mask_emb[i] = _check_image(mask_t, i, "mask").reshape(-1)
-            src_emb[i] = extract_text(src_t, i, "src", text_dim)
-            tar_emb[i] = extract_text(tar_t, i, "tar", text_dim)
+        for i, img_t, src_t, tar_t in tqdm(pool.map(_load_row, range(n)), total=n, desc="Packing embeddings", unit="sample"):
+            img_emb[i] = _check(img_t, i, "image", img_dim)
+            src_emb[i] = _check(src_t, i, "source", text_dim)
+            tar_emb[i] = _check(tar_t, i, "target", text_dim)
 
-    tables = {"img": img_emb, "mask": mask_emb, "src": src_emb, "tar": tar_emb}
+    tables = {"img": img_emb, "src": src_emb, "tar": tar_emb}
     _save_packed_cache(packed_path, sample_ids, tables)
-    return sample_ids, img_emb, mask_emb, src_emb, tar_emb
+    return sample_ids, img_emb, src_emb, tar_emb
 
 
 def get_embeddings(
     samples: pd.DataFrame,
-) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return CPU embedding tables (img, mask, src, tar), packed for training.
+) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return CPU embedding tables (img, src, tar), packed for training.
 
     Tries the packed cache, then packs scattered files. Raises if neither covers
     the requested samples.
     """
-    # Validate the ChordEdit model type up front: flux raises NotImplementedError
-    # here regardless of cache state.
-    _get_text_pooling()
     packed_path = _get_packed_path()
     sample_ids = samples[SAMPLE_ID_COL].tolist()
 
@@ -340,11 +242,10 @@ def get_embeddings_by_sample(
 ) -> dict[str, dict[str, torch.Tensor]]:
     """Embeddings keyed by sample_id, on device."""
     samples = df.drop_duplicates(subset=SAMPLE_ID_COL).sort_values(SAMPLE_ID_COL)
-    sample_ids, img_emb, mask_emb, src_emb, tar_emb = get_embeddings(samples)
-    img_emb, mask_emb, src_emb, tar_emb = img_emb.to(device), mask_emb.to(device), src_emb.to(device), tar_emb.to(device)
+    sample_ids, img_emb, src_emb, tar_emb = get_embeddings(samples)
+    img_emb, src_emb, tar_emb = img_emb.to(device), src_emb.to(device), tar_emb.to(device)
     return {sid:{
         "img": img_emb[i],
-        "mask": mask_emb[i],
         "src": src_emb[i],
         "tar": tar_emb[i]
         } for i, sid in enumerate(sample_ids)

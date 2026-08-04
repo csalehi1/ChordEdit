@@ -1,4 +1,4 @@
-"""Data loading, splits, and training tensors for the classifier (embeddings live in embeddings.py)."""
+"""Data loading, splits, training tensors, and prediction dumps (embeddings live in embeddings.py)."""
 
 from __future__ import annotations
 
@@ -298,7 +298,6 @@ class EmbeddingTable:
     """One embedding row per unique sample_id; shared across train/val/test."""
 
     img: torch.Tensor   # (n_samples, img_dim)
-    mask: torch.Tensor  # (n_samples, img_dim)
     src: torch.Tensor   # (n_samples, text_dim)
     tar: torch.Tensor   # (n_samples, text_dim)
 
@@ -307,12 +306,11 @@ class EmbeddingTable:
 class SampleTensors:
     """One split's samples, resident on one device.
 
-    One row per sample (the best grid cell): the four embeddings plus the
+    One row per sample (the best grid cell): the three embeddings plus the
     bucket-index labels y1 (t_start) and y2 (t_end).
     """
 
     img: torch.Tensor   # (N, img_dim)
-    mask: torch.Tensor  # (N, img_dim)
     src: torch.Tensor   # (N, text_dim)
     tar: torch.Tensor   # (N, text_dim)
     y1: torch.Tensor    # (N,) t_start bucket index
@@ -322,14 +320,13 @@ class SampleTensors:
         return int(self.y1.shape[0])
 
     def iter_batches(self, batch_size: int, shuffle: bool = False):
-        """Yield (img, mask, src, tar, y1, y2) batches."""
+        """Yield (img, src, tar, y1, y2) batches."""
         n = len(self)
         order = torch.randperm(n, device=self.y1.device) if shuffle else torch.arange(n, device=self.y1.device)
         for k in range(0, n, batch_size):
             rows = order[k : k + batch_size]
             yield (
                 self.img[rows],
-                self.mask[rows],
                 self.src[rows],
                 self.tar[rows],
                 self.y1[rows],
@@ -347,10 +344,9 @@ def create_sample_tensors(
     with instructions otherwise).
     """
     samples = pd.concat(list(splits.values()), ignore_index=True).drop_duplicates(SAMPLE_ID_COL).sort_values(SAMPLE_ID_COL)
-    sample_ids, img_emb, mask_emb, src_emb, tar_emb = get_embeddings(samples)
+    sample_ids, img_emb, src_emb, tar_emb = get_embeddings(samples)
     emb_table = EmbeddingTable(
         img=img_emb.to(device),
-        mask=mask_emb.to(device),
         src=src_emb.to(device),
         tar=tar_emb.to(device),
     )
@@ -361,10 +357,114 @@ def create_sample_tensors(
         rows = torch.tensor([sample_id_to_idx[sid] for sid in df[SAMPLE_ID_COL].tolist()], dtype=torch.long, device=device)
         out[name] = SampleTensors(
             img=emb_table.img[rows],
-            mask=emb_table.mask[rows],
             src=emb_table.src[rows],
             tar=emb_table.tar[rows],
             y1=torch.tensor(df[T_START_IDX_COL].values, dtype=torch.long, device=device),
             y2=torch.tensor(df[T_END_IDX_COL].values, dtype=torch.long, device=device),
         )
     return out
+
+
+"""
+Prediction dumps.
+"""
+
+ID_TO_PREDS_NAME = "id_to_preds.csv"
+_SPLITS = ("train", "val", "test")
+
+
+def write_id_to_preds(
+    model,
+    tensors: dict[str, SampleTensors],
+    splits: dict[str, pd.DataFrame],
+    sel,
+    grid: GridTable,
+    out_path: Path,
+    batch_size: int,
+) -> Path:
+    """Write per-sample joint cell picks to CSV; returns out_path.
+
+    One row per sample across the given splits: sample_id, split, pred_t_start,
+    pred_t_end. Batches are not shuffled, so row order matches each split df.
+    """
+    from selection import cell_labels  # avoid import cycle with selection
+
+    labels = cell_labels(sel, grid)
+    frames = []
+    model.eval()
+    with torch.no_grad():
+        for name, cells in tensors.items():
+            picks = []
+            for img, src, tar, _, _ in cells.iter_batches(batch_size):
+                out1, out2 = model(img, src, tar)
+                picks.append(model.decode_cells(out1, out2, sel.cell_start_idx, sel.cell_end_idx))
+            picked = torch.cat(picks).cpu().numpy()
+            frames.append(pd.DataFrame({
+                SAMPLE_ID_COL: splits[name][SAMPLE_ID_COL].to_numpy(),
+                "split": name,
+                PRED_T_START_COL: [labels[c][0] for c in picked],
+                PRED_T_END_COL: [labels[c][1] for c in picked],
+            }))
+    out = pd.concat(frames, ignore_index=True).sort_values(SAMPLE_ID_COL)
+    out_path = Path(out_path)
+    out.to_csv(out_path, index=False)
+    return out_path
+
+
+def dump_predictions(
+    run_dir: Path,
+    device: torch.device,
+    *,
+    cells: str | None = None,
+    batch_size: int | None = None,
+) -> Path:
+    """Load a run's checkpoint and write id_to_preds.csv (or cells-override name).
+
+    cells overrides CELL_SUBSET for the argmax domain only; the run's training
+    settings still define the model. Pass cells when evaluating a lower-triangle
+    model over all 121 cells (or the reverse).
+    """
+    # load_df / build_grid_table read this module's CELL_SUBSET.
+    global CELL_SUBSET
+
+    import settings as settings_mod
+    from model import OrdinalPairClassifier
+    from selection import slice_grid
+
+    run_dir = Path(run_dir)
+    train_subset = CELL_SUBSET
+    if cells is not None and cells != CELL_SUBSET:
+        CELL_SUBSET = cells
+        settings_mod.CELL_SUBSET = cells
+
+    grid = build_grid_table(add_target_score(drop_missing_inputs(load_df())))
+    splits = load_split_df(run_dir)
+    sel = slice_grid(grid, splits["test"][SAMPLE_ID_COL].to_numpy(), device)
+
+    ckpt = torch.load(run_dir / "classifier_weights.pt", map_location=device, weights_only=False)
+    model = OrdinalPairClassifier(
+        ckpt["img_dim"], ckpt["text_dim"],
+        buckets1=torch.tensor(ckpt["buckets1"]), buckets2=torch.tensor(ckpt["buckets2"]),
+        head_type=HEAD_TYPE,
+    ).to(device)
+    model.load_state_dict(ckpt["state_dict"], strict=False)
+
+    tensors = create_sample_tensors({name: splits[name] for name in _SPLITS}, device)
+    if cells is not None and cells != train_subset:
+        out_name = f"id_to_preds_cells{cells}.csv"
+    else:
+        out_name = ID_TO_PREDS_NAME
+    out_path = write_id_to_preds(
+        model, tensors, splits, sel, grid, run_dir / out_name, batch_size or BATCH_SIZE,
+    )
+
+    out = pd.read_csv(out_path)
+    counts = out["split"].value_counts()
+    pairs = out[[PRED_T_START_COL, PRED_T_END_COL]].apply(tuple, axis=1)
+    print(f"{run_dir.name}  device={device}  cells={sel.n_cells} "
+          f"(trained on {train_subset}, selected over {CELL_SUBSET})")
+    print(f"  rows={len(out)} ({', '.join(f'{k} {counts[k]}' for k in _SPLITS)})  "
+          f"distinct cells picked={pairs.nunique()}")
+    print(f"  most common: {', '.join(f'{c} x{n}' for c, n in pairs.value_counts().head(3).items())}")
+    print(f"wrote {out_path}")
+    return out_path

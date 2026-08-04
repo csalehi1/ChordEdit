@@ -86,16 +86,16 @@ METRICS_CSV = GENERATED_DIR / f"id_to_metrics_{_SLUG}.csv"
 EMBEDDINGS_CSV = EMBEDDINGS_DIR / f"id_to_embeddings_{_SLUG}.csv"
 
 # Package root: settings.py sits next to model.py, except for the copy saved
-# under outputs/<DIR_NAME>/<run>/ (parents[2] == package dir).
+# under runs/<DIR_NAME>/<run>/ (parents[2] == package dir).
 _HERE = Path(__file__).resolve().parent
 _PACKAGE_DIR = _HERE if (_HERE / "model.py").exists() else _HERE.parents[2]
 
-# NOTE: Set this to the directory where the model outputs will be saved.
-OUTPUTS_DIR = _PACKAGE_DIR / "outputs" / DIR_NAME
-OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-_outputs_gitignore = OUTPUTS_DIR.parent / ".gitignore"
-if not _outputs_gitignore.exists():
-    _outputs_gitignore.write_text("*\n!.gitignore\n", encoding="utf-8")
+# NOTE: Set this to the directory where the model runs will be saved.
+RUNS_DIR = _PACKAGE_DIR / "runs" / DIR_NAME
+RUNS_DIR.mkdir(parents=True, exist_ok=True)
+_runs_gitignore = RUNS_DIR.parent / ".gitignore"
+if not _runs_gitignore.exists():
+    _runs_gitignore.write_text("*\n!.gitignore\n", encoding="utf-8")
 
 # Shared column name for sample IDs.
 SAMPLE_ID_COL = "sample_id"
@@ -110,7 +110,6 @@ MASK_PATH_COL = "mask_image_path"
 SOURCE_EMB_COL = "source_embedding"
 TARGET_EMB_COL = "target_embedding"
 IMAGE_EMB_COL = "image_embedding"
-MASK_EMB_COL = "mask_embedding"
 
 # Column names in the id_to_metrics_*.csv file.
 CATEGORY_COL = "category"
@@ -162,9 +161,9 @@ SPLIT_SEED = int(_cfg("SPLIT_SEED"))
 """
 C model settings.
 
-Classifier C(img_emb, mask_emb, src_emb, tar_emb) -> (t_start, t_end),
+Classifier C(img_emb, src_emb, tar_emb) -> (t_start, t_end),
 predicting the grid cell with the best C_TARGET_COL score for each sample.
-Code's t_start/t_end are the paper's (t*, t**); mask is the edit mask m_obj.
+Code's t_start/t_end are the paper's (t*, t**).
 """
 
 # Metric columns scalarized into the per-sample selection target.
@@ -216,7 +215,7 @@ LR_MIN_FACTOR = float(_cfg("LR_MIN_FACTOR"))
 # the selection metric the pipeline actually consumes.
 CKPT_METRIC = str(_cfg("CKPT_METRIC"))
 
-# Run directory name under OUTPUTS_DIR; empty string means use a timestamp.
+# Run directory name under RUNS_DIR; empty string means use a timestamp.
 RUN_NAME = str(_cfg("RUN_NAME"))
 
 

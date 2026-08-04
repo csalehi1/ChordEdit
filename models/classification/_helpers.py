@@ -9,7 +9,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -26,18 +25,6 @@ def _s():
     """Current settings module (live or per-run snapshot in sys.modules)."""
     import settings
     return settings
-
-
-def current_commit_id() -> str:
-    """Short id of the most recent commit, or "nogit" outside a repository."""
-    try:
-        out = subprocess.run(
-            ["git", "-C", str(_PACKAGE_DIR), "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=10,
-        )
-        return out.stdout.strip() or "nogit"
-    except Exception:
-        return "nogit"
 
 
 def save_run_settings(run_dir: Path) -> Path:
@@ -80,7 +67,7 @@ def load_run_settings(run_dir: Path):
 
 
 def load_live_settings():
-    """Load package settings.py under a private module name (for OUTPUTS_DIR bootstrap)."""
+    """Load package settings.py under a private module name (for RUNS_DIR bootstrap)."""
     spec = importlib.util.spec_from_file_location("_live_settings", _SETTINGS_MODULE)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load live settings from {_SETTINGS_MODULE}")
@@ -89,15 +76,15 @@ def load_live_settings():
     return mod
 
 
-def resolve_run_dir(outputs_dir: Path, run_dir: Path | None = None) -> Path:
+def resolve_run_dir(runs_dir: Path, run_dir: Path | None = None) -> Path:
     if run_dir is not None:
         run_dir = Path(run_dir)
         if not run_dir.is_dir():
             raise FileNotFoundError(f"Run directory not found: {run_dir}")
         return run_dir
-    candidates = sorted(p for p in Path(outputs_dir).iterdir() if p.is_dir())
+    candidates = sorted(p for p in Path(runs_dir).iterdir() if p.is_dir())
     if not candidates:
-        raise FileNotFoundError(f"No run directories in {outputs_dir}")
+        raise FileNotFoundError(f"No run directories in {runs_dir}")
     return candidates[-1]
 
 

@@ -1,11 +1,11 @@
 """
 Ordinal Embedding-Pair Classifier. Accepts precomputed ChordEdit embeddings
-(image, mask, source prompt, target prompt) and predicts two independent
+(image, source prompt, target prompt) and predicts two independent
 values (t_start and t_end), each from their respective set of discrete values.
 
-    C(img_emb, mask_emb, src_emb, tar_emb) -> (t_start, t_end)
+    C(img_emb, src_emb, tar_emb) -> (t_start, t_end)
 
-    1.  Image and mask projections bottleneck the flattened VAE latents;
+    1.  The image projection bottlenecks the flattened VAE latent;
         the text projection consumes [src | tar | src-tar | src*tar]
         (mirroring the modified model's SurrogateRegressor input side).
     2.  Shared MLP body produces a common feature vector.
@@ -102,9 +102,9 @@ Embedding projections.
 class ConvImageProjector(nn.Module):
     """Encode a flattened VAE latent with convolutions instead of one Linear.
 
-    The image and mask embeddings are flattened (C, S, S) VAE latents, so a
-    single Linear over 16k inputs discards all spatial structure - including
-    how large and where the edit mask is. This folds the latent back to
+    The image embedding is a flattened (C, S, S) VAE latent, so a single
+    Linear over 16k inputs discards all spatial structure - including how
+    large and where the edited region is. This folds the latent back to
     (C, S, S) and downsamples.
     """
 
@@ -142,7 +142,7 @@ class OrdinalPairClassifier(nn.Module):
     """
     Full embedding-pair classifier.
 
-    Given the four precomputed embeddings for a sample, predicts two
+    Given the three precomputed embeddings for a sample, predicts two
     independent scalar values (t_start and t_end). Head type is selected at
     construction time: 'CORAL' for cumulative-threshold ordinal decoding,
     'MSE' for scalar regression snapped to the nearest bucket, or 'CE' for
@@ -185,7 +185,6 @@ class OrdinalPairClassifier(nn.Module):
             raise ValueError(f"Unknown {IMG_ENCODER=}")
 
         self.img_proj = image_projection()
-        self.mask_proj = image_projection()
         self.text_proj = nn.Sequential(
             nn.Linear(text_dim * 4, text_proj_dim),
             nn.LayerNorm(text_proj_dim),
@@ -194,7 +193,7 @@ class OrdinalPairClassifier(nn.Module):
 
         # Shared MLP body over the concatenated projections. LayerNorm after
         # the first linear stabilizes training against embedding-norm spread.
-        body_in = img_proj_dim * 2 + text_proj_dim
+        body_in = img_proj_dim + text_proj_dim
         self.body = nn.Sequential(
             nn.Linear(body_in, mlp_wide),
             nn.LayerNorm(mlp_wide),
@@ -231,13 +230,12 @@ class OrdinalPairClassifier(nn.Module):
     def _get_context(
         self,
         img_emb: torch.Tensor,
-        mask_emb: torch.Tensor,
         src_emb: torch.Tensor,
         tar_emb: torch.Tensor,
     ) -> torch.Tensor:
-        """Combine image/mask/text embeddings into a single context vector."""
+        """Combine image/text embeddings into a single context vector."""
         text_emb = combine_text_embeddings(src_emb, tar_emb)
-        return torch.cat([self.img_proj(img_emb), self.mask_proj(mask_emb), self.text_proj(text_emb)], dim=-1)
+        return torch.cat([self.img_proj(img_emb), self.text_proj(text_emb)], dim=-1)
 
     def decode_bucket_indices(
         self,
@@ -322,7 +320,6 @@ class OrdinalPairClassifier(nn.Module):
     def forward(
         self,
         img_emb: torch.Tensor,
-        mask_emb: torch.Tensor,
         src_emb: torch.Tensor,
         tar_emb: torch.Tensor,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -330,7 +327,7 @@ class OrdinalPairClassifier(nn.Module):
         Compute raw head outputs for targets with >1 bucket.
         Skipped heads return None.
         """
-        features = self.body(self._get_context(img_emb, mask_emb, src_emb, tar_emb))
+        features = self.body(self._get_context(img_emb, src_emb, tar_emb))
         out1 = self.head1(features) if self.predict_start else None
         out2 = self.head2(features) if self.predict_end else None
         return out1, out2
@@ -338,7 +335,6 @@ class OrdinalPairClassifier(nn.Module):
     def predict(
         self,
         img_emb: torch.Tensor,
-        mask_emb: torch.Tensor,
         src_emb: torch.Tensor,
         tar_emb: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -348,7 +344,7 @@ class OrdinalPairClassifier(nn.Module):
         training = self.training
         self.eval()
         with torch.no_grad():
-            l1, l2 = self(img_emb, mask_emb, src_emb, tar_emb)
+            l1, l2 = self(img_emb, src_emb, tar_emb)
         self.train(training)
 
         idx1, idx2 = self.decode_bucket_indices(l1, l2, batch_size=img_emb.shape[0])

@@ -36,7 +36,7 @@ Every key is required — a missing key raises `KeyError` at import. Keys starti
 
 | Key | What to set |
 |---|---|
-| `DIR_NAME` | Dataset folder name under the generated/datasets/embeddings roots (also names `OUTPUTS_DIR`). |
+| `DIR_NAME` | Dataset folder name under the generated/datasets/embeddings roots (also names `RUNS_DIR`). |
 | `CHORD_EDIT_MODEL` | `"sd_turbo"`, `"sdxl_turbo"`, or `"flux"`. Selects the encoder stack, image size, and which embedding caches apply. |
 | `TARGET_T_DELTA` | `t_delta` value used to select rows from the data. Reflects $\delta$ values used to generate images. `null` uses every `t_delta`. |
 | `CELL_SUBSET` | Candidate grid cells: `"all"` (all 121 positions) or `"lower"` (the 55 with `t_end < t_start`, the only region labeled before the annotation pass). Changes the labels and phi's scale, not just the argmax domain. |
@@ -96,7 +96,7 @@ If wanted, further edit [settings.json](settings.json) to adjust the model and t
 | `CKPT_METRIC` | Validation metric that selects the checkpoint: `"bal_acc_t_start"`, `"bal_acc_t_end"`, `"acc_both"`, `"loss"`, `"regret_median"`, or `"top1_hit_rate"`. |
 | `MLP_WIDE`, `MLP_HIDDEN`, `MLP_INNER` | Hidden layer widths of the MLP body. |
 | `MLP_DROPOUT` | Dropout rate applied inside the MLP body. |
-| `RUN_NAME` | Run directory name under `OUTPUTS_DIR`; empty string means use a timestamp. |
+| `RUN_NAME` | Run directory name under `RUNS_DIR`; empty string means use a timestamp. |
 
 ### 5. Train the model
 
@@ -106,7 +106,16 @@ From this directory:
 python train.py
 ```
 
-This loads the CSVs, computes the score column if the metrics CSV does not already carry it, selects the best cell per sample, materializes the embeddings, trains the model, and saves to `OUTPUTS_DIR/<run>/`: the exact `settings.json` used, `classifier_weights.pt`, and the `id_to_split.csv` sample-to-split mapping.
+This loads the CSVs, computes the score column if the metrics CSV does not already carry it, selects the best cell per sample, materializes the embeddings, trains the model, and saves to `RUNS_DIR/<run>/`:
+
+| File | Role |
+|---|---|
+| `settings.json` | Exact config used for the run |
+| `classifier_weights.pt` | Best checkpoint |
+| `id_to_split.csv` | Sample-to-split mapping |
+| `train_metrics.json` | Best-epoch + val/test metrics |
+| `id_to_preds.csv` | Per-sample `(pred_t_start, pred_t_end)` picks |
+| `train.log` | Full training stdout/stderr |
 
 Embeddings are served by [embeddings.py](embeddings.py) from a packed table under `.cache/packed_embeddings/` when one matches the current settings, else packed on the fly from the scattered per-sample files under `EMBEDDINGS_DIR`. If neither cache can cover the requested samples, `get_embeddings` raises with instructions.
 

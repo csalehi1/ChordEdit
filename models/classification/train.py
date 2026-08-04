@@ -1,6 +1,6 @@
 """
 Train OrdinalPairClassifier to predict t_start and t_end from precomputed
-ChordEdit embeddings (image, mask, source prompt, target prompt).
+ChordEdit embeddings (image, source prompt, target prompt).
 
 Rows are filtered to those matching TARGET_T_DELTA for t_delta, then for each
 sample_id the row with the highest C_TARGET_COL is selected. The resulting
@@ -11,10 +11,12 @@ Embeddings come from the packed/scattered caches via embeddings.get_embeddings.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -23,6 +25,7 @@ import torch
 
 from _data import (
     SampleTensors,
+    ID_TO_PREDS_NAME,
     add_target_score,
     build_grid_table,
     create_sample_tensors,
@@ -31,17 +34,25 @@ from _data import (
     save_split_df,
     select_best_rows,
     split_df,
+    write_id_to_preds,
 )
 from _helpers import save_run_settings
 from model import OrdinalPairClassifier, mae_buckets
 from head_coral import ordinal_loss
 from head_mse import regression_loss
 from head_ce import cost_sensitive_ce_loss, one_hot_ce_loss
-from selection import SelectionSplit, selection_metrics, slice_grid
+from selection import (
+    SelectionSplit,
+    selection_metrics,
+    slice_grid,
+)
 import settings
 from settings import *
 
 TRAIN_METRICS_NAME = "train_metrics.json"
+TRAIN_LOG_NAME = "train.log"
+
+log = logging.getLogger(__name__)
 
 # Checkpoint criteria, mapped to (metric key, +1 if higher is better else -1).
 CKPT_METRICS = {
@@ -52,6 +63,17 @@ CKPT_METRICS = {
     "regret_median": ("regret_median", -1.0),
     "top1_hit_rate": ("top1_hit_rate", 1.0),
 }
+
+
+def _setup_logging(log_path: Path) -> None:
+    """Log INFO to console and train.log (message-only, matching prior print style)."""
+    log.handlers.clear()
+    log.setLevel(logging.INFO)
+    log.propagate = False
+    fmt = logging.Formatter("%(message)s")
+    for handler in (logging.StreamHandler(sys.stdout), logging.FileHandler(log_path, mode="w")):
+        handler.setFormatter(fmt)
+        log.addHandler(handler)
 
 
 def _make_scheduler(optimizer: torch.optim.Optimizer):
@@ -198,8 +220,8 @@ def eval_split(
     val_loss = 0.0
     n_samples = 0
     with torch.no_grad():
-        for img, mask, src, tar, l1, l2 in cells.iter_batches(BATCH_SIZE):
-            out1, out2 = model(img, mask, src, tar)
+        for img, src, tar, l1, l2 in cells.iter_batches(BATCH_SIZE):
+            out1, out2 = model(img, src, tar)
             batch_loss = _compute_loss(
                 model, out1, out2, l1, l2,
                 class_w_start=class_w_start,
@@ -243,14 +265,21 @@ def eval_split(
 
 
 def train() -> OrdinalPairClassifier:
-    """Train the classifier and save weights + splits to a run directory.
+    """Train the classifier and save artifacts to a run directory.
 
     Each epoch logs train and val loss, bucket accuracy (t_start / t_end / both
     correct), and median selection regret. Checkpoints are selected by
-    CKPT_METRIC on the validation split.
+    CKPT_METRIC on the validation split. Writes settings, weights, splits,
+    metrics, id_to_preds.csv, and train.log under RUNS_DIR/<RUN_NAME>/.
     """
     torch.manual_seed(SEED)
     np.random.seed(SEED)
+
+    run_name = RUN_NAME or datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = RUNS_DIR / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    save_run_settings(run_dir)
+    _setup_logging(run_dir / TRAIN_LOG_NAME)
 
     # Score once: select_best_rows and build_grid_table would each otherwise
     # recompute the per-sample delta normalization over every grid cell.
@@ -258,24 +287,21 @@ def train() -> OrdinalPairClassifier:
     df = select_best_rows(cells_df)
     grid = build_grid_table(cells_df)
     train_df, val_df, test_df = split_df(df)
+    splits = {"train": train_df, "val": val_df, "test": test_df}
 
-    run_name = RUN_NAME or datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = OUTPUTS_DIR / run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
-    save_run_settings(run_dir)
-
-    print(
+    log.info(
         f"Dataset: {len(df)} samples  (t_delta={TARGET_T_DELTA}, target={C_TARGET_COL})"
         f"  split: train={len(train_df)} / val={len(val_df)} / test={len(test_df)}"
         f"  grid: {grid.phi.shape[1]} cells"
     )
+    log.info(f"Run dir: {run_dir}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tensors = create_sample_tensors({"train": train_df, "val": val_df, "test": test_df}, device)
+    tensors = create_sample_tensors(splits, device)
     train_cells, val_cells, test_cells = tensors["train"], tensors["val"], tensors["test"]
     sel = {
         name: slice_grid(grid, split[SAMPLE_ID_COL].to_numpy(), device)
-        for name, split in (("train", train_df), ("val", val_df), ("test", test_df))
+        for name, split in splits.items()
     }
     img_dim = int(train_cells.img.shape[1])
     text_dim = int(train_cells.src.shape[1])
@@ -296,7 +322,7 @@ def train() -> OrdinalPairClassifier:
     )
     model = model.to(device)
     active_heads = [name for name, on in (("t_start", model.predict_start), ("t_end", model.predict_end)) if on]
-    print(f"Training heads: {', '.join(active_heads)}  (img_dim={img_dim}, text_dim={text_dim})")
+    log.info(f"Training heads: {', '.join(active_heads)}  (img_dim={img_dim}, text_dim={text_dim})")
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = _make_scheduler(optimizer)
 
@@ -305,10 +331,10 @@ def train() -> OrdinalPairClassifier:
         class_w_end = None
         if model.predict_start:
             class_w_start = _class_weights(train_cells.y1, n_buckets_start).to(device)
-            print(f"Class weights  t_start: {[f'{w:.2f}' for w in class_w_start.tolist()]}")
+            log.info(f"Class weights  t_start: {[f'{w:.2f}' for w in class_w_start.tolist()]}")
         if model.predict_end:
             class_w_end = _class_weights(train_cells.y2, n_buckets_end).to(device)
-            print(f"Class weights  t_end:   {[f'{w:.2f}' for w in class_w_end.tolist()]}")
+            log.info(f"Class weights  t_end:   {[f'{w:.2f}' for w in class_w_end.tolist()]}")
     else:
         class_w_start = class_w_end = None
 
@@ -328,11 +354,11 @@ def train() -> OrdinalPairClassifier:
         epoch_start = time.perf_counter()
         model.train()
         epoch_loss = 0.0
-        
+
         # Iterate over the training cells
-        for img, mask, src, tar, y1, y2 in train_cells.iter_batches(BATCH_SIZE, shuffle=True):
+        for img, src, tar, y1, y2 in train_cells.iter_batches(BATCH_SIZE, shuffle=True):
             # Forward pass
-            l1, l2 = model(img, mask, src, tar)
+            l1, l2 = model(img, src, tar)
             loss = _compute_loss(
                 model, l1, l2, y1, y2,
                 class_w_start=class_w_start,
@@ -379,7 +405,7 @@ def train() -> OrdinalPairClassifier:
                 "text_dim": text_dim,
                 "config": {"run_dir": str(run_dir), **settings.CONFIG},
             }, weights_out)
-        
+
         # Update the learning rate
         lr_now = optimizer.param_groups[0]["lr"]
         if scheduler is not None:
@@ -394,13 +420,13 @@ def train() -> OrdinalPairClassifier:
             "train_loss": train_metrics["loss"],
             **{f"val_{k}": v for k, v in val_metrics.items()},
         })
-        print(
+        log.info(
             f"Epoch [{epoch:02d}/{EPOCHS:02d}] ({elapsed:.2f}s)  Train: {_fmt_split_metrics(train_metrics)}"
             f"  Val: {_fmt_split_metrics(val_metrics)}"
             + ("  *" if improved else "")
         )
 
-    print(f"Saved {weights_out}  (best val {checkpoint_metric}={ckpt_sign * best_val_score:.4f} at epoch {best_epoch})")
+    log.info(f"Saved {weights_out}  (best val {checkpoint_metric}={ckpt_sign * best_val_score:.4f} at epoch {best_epoch})")
     if not weights_out.exists():
         raise RuntimeError(f"No checkpoint was written to {weights_out}")
     model.load_state_dict(
@@ -448,8 +474,11 @@ def train() -> OrdinalPairClassifier:
             "history": history,
         }, indent=2) + "\n")
 
-    print(f"\nTest: {_fmt_split_metrics(best_metrics['test'])}")
-    print(
+    preds_path = write_id_to_preds(model, tensors, splits, sel["test"], grid, run_dir / ID_TO_PREDS_NAME, BATCH_SIZE)
+    log.info(f"Wrote {preds_path}")
+
+    log.info(f"Test: {_fmt_split_metrics(best_metrics['test'])}")
+    log.info(
         f"Test selection: regret median={best_metrics['test']['regret_median']:.4f}"
         f" mean={best_metrics['test']['regret_mean']:.4f}"
         f"  vs default-cell median={default_metrics['test']['regret_median']:.4f}"
