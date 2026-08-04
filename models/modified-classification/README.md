@@ -94,7 +94,7 @@ python train_m.py --skip-model  # CPU-only; builds the caches, then exits.
 
 Encoder behavior always matches the ChordEdit model type: for `sd` models the stored text sequences are collapsed with the same mask-weighted mean pooling as encoding (tokenizer-only, no weights); `sdxl` scattered files must already store `text_encoder_2` pooled embeds; `flux` raises `NotImplementedError`. Each packed cache carries a `meta` dict (model, pipeline type, pooling, dims, provenance).
 
-Later `train_m` and eval reuse the packed cache. Encoders are inherited from the ChordEdit pipeline and are never trainable. If no cache can satisfy a request, `embeddings.get_embeddings` falls back to encoding on the fly with the frozen encoders (and raises if the caller provides no encoder-bearing predictor).
+Later `train_m` and eval reuse the packed cache. Encoders are inherited from the ChordEdit pipeline and are never trainable. If no packed or scattered cache can cover the request, `embeddings.get_embeddings` raises.
 
 ### 1. Train
 

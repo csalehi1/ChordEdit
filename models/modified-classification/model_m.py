@@ -551,9 +551,9 @@ class SurrogateModel(nn.Module):
             device=device,
         )
 
-        # VAE-encoding a full EMBED_BATCH_SIZE batch at image_size=1024 in
-        # fp32 needs >40 GiB of activations (OOMs on a 48 GiB card). Slicing
-        # makes the VAE encode one image at a time with identical outputs.
+        # VAE-encoding a full batch at image_size=1024 in fp32 needs >40 GiB of
+        # activations (OOMs on a 48 GiB card). Slicing makes the VAE encode one
+        # image at a time with identical outputs.
         self.pipeline.vae.enable_slicing()
 
         # Encoders are inherited from the ChordEdit pipeline and are never

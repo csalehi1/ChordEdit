@@ -191,13 +191,11 @@ the paper's (t*, t**); mask is the edit mask m_obj.
 M_TARGET_COLS = (PSNR_COL, CLIP_COL)
 M_TARGET_LABELS = {PSNR_COL: "PSNR-Unedited", CLIP_COL: "CLIP-Edited"}
 
-# ChordEdit encoders loaded from CHORD_EDIT_MODEL_ROOT for image/text embedding.
-# Encoders are inherited from the ChordEdit pipeline and are always frozen;
-# embeddings come from the packed/scattered caches, with on-the-fly encoding
-# only as an explicit (warned) fallback in embeddings.get_embeddings.
+# ChordEdit encoders loaded from CHORD_EDIT_MODEL_ROOT for image/text embedding
+# dims and live encode/predict_raw. Encoders are inherited from the ChordEdit
+# pipeline and are always frozen; training/eval embeddings come from the
+# packed/scattered caches.
 USE_CENTER_CROP = bool(_cfg("USE_CENTER_CROP"))
-# chunk size for batched VAE/text embedding precompute (peak VRAM vs throughput).
-EMBED_BATCH_SIZE = int(_cfg("EMBED_BATCH_SIZE"))
 
 # How the flattened VAE latents are projected: "linear" (one Linear over the
 # 16k flat vector) or "conv" (fold back to (C, S, S) and downsample). The

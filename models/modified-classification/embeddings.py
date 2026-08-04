@@ -1,19 +1,7 @@
+# embeddings.py
+
 """
-Embedding caches: load packed tables, pack scattered files, or encode fresh.
-
-Scattered: many per-sample .pt files indexed by EMBEDDINGS_CSV (slow to load).
-Packed: one stacked table at .cache/packed_embeddings/<CHORD_EDIT_MODEL>-<t_delta>-<dir_slug>.pt
-(fast to load), tagged with a "meta" dict recording the model type, text pooling,
-and pack provenance. A cache whose meta is missing or does not match the current
-settings is treated as a miss and repacked. Text extraction from scattered files
-is dispatched on CHORD_EDIT_PIPELINE_TYPE (see make_text_extractor) so packed
-caches always correspond to the CHORD_EDIT_MODEL.
-
-This module depends only on settings.py so it can be reused by other model
-designs. The predictor argument is duck-typed: encoding needs callables
-predictor.image_encoder(images) and predictor.text_encoder(prompts) that return
-(N, dim) tensors; get_embeddings_by_sample's default device additionally reads
-predictor.regressor.target_mean.device.
+Embedding caches: load packed tables or pack scattered files.
 """
 
 from __future__ import annotations
@@ -25,7 +13,6 @@ from pathlib import Path
 
 import pandas as pd
 import torch
-from PIL import Image
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -55,11 +42,11 @@ Per-model text extraction for packing scattered embeddings.
 
 Scattered text files store whatever the annotation pipeline emitted; collapsing
 them to one vector per prompt must match model_m.encode_text_pooled for the
-current CHORD_EDIT_MODEL so packed caches and on-the-fly encoding agree per
-model type: sd stores full last_hidden_state sequences (pooled here with
-mean_pool), sdxl must store text_encoder_2's pooled embeds directly
-(text_embeds is a projection of the EOS token and cannot be reconstructed from
-hidden-state sequences), flux is not implemented.
+current CHORD_EDIT_MODEL so packed caches agree per model type: sd stores full
+last_hidden_state sequences (pooled here with mean_pool), sdxl must store
+text_encoder_2's pooled embeds directly (text_embeds is a projection of the
+EOS token and cannot be reconstructed from hidden-state sequences), flux is
+not implemented.
 """
 
 def _get_text_pooling() -> str:
@@ -159,7 +146,7 @@ def make_text_extractor(src_prompts: list[str], tar_prompts: list[str]):
 
 
 """
-Packed/scattered caches and encoding.
+Packed/scattered caches.
 """
 
 def _get_packed_path() -> Path:
@@ -235,11 +222,10 @@ def _save_packed_cache(
     *,
     source: str,
 ) -> None:
-    """Atomically write the packed table dict with meta; prints diff vs any old file.
+    """Atomically write the packed table dict with meta.
 
     image_size/use_center_crop in meta describe the settings the cache was packed
-    under; for source='scattered' the tensor content comes from the annotation
-    pipeline, for source='encoder' from the frozen ChordEdit encoders.
+    under; source='scattered' means tensor content comes from the annotation pipeline.
     """
     meta = _expected_packed_meta() | {
         "source": source,
@@ -334,92 +320,13 @@ def _pack_scattered_cache(
     return sample_ids, img_emb, mask_emb, src_emb, tar_emb
 
 
-def _encode_embeddings(
-    samples: pd.DataFrame,
-    predictor,
-    packed_path: Path,
-    *,
-    batch_size: int = EMBED_BATCH_SIZE,
-    cache_scattered: bool = True,
-    cache_packed: bool = True,
-) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Encode with the frozen ChordEdit encoders; optionally write both caches."""
-    sample_ids = samples[SAMPLE_ID_COL].tolist()
-    n_samples = len(sample_ids)
-    image_paths = samples[IMAGE_PATH_COL].tolist()
-    mask_paths = samples[MASK_PATH_COL].tolist()
-    src_prompts = samples[SOURCE_PROMPT_COL].tolist()
-    tar_prompts = samples[TARGET_PROMPT_COL].tolist()
-    img_batches: list[torch.Tensor] = []
-    mask_batches: list[torch.Tensor] = []
-    src_batches: list[torch.Tensor] = []
-    tar_batches: list[torch.Tensor] = []
-
-    print(f"Encoding embeddings for {n_samples} samples (batch_size={batch_size})...")
-    # Encode the embeddings in batches.
-    for start in tqdm(range(0, n_samples, batch_size), desc="Encoding embeddings", unit="batch"):
-        end = min(start + batch_size, n_samples)
-        images = [Image.open(p).convert("RGB") for p in image_paths[start:end]]
-        masks = [Image.open(p).convert("RGB") for p in mask_paths[start:end]]
-        with torch.no_grad():
-            img_batches.append(predictor.image_encoder(images).float().cpu())
-            mask_batches.append(predictor.image_encoder(masks).float().cpu())
-            src_batches.append(predictor.text_encoder(src_prompts[start:end]).float().cpu())
-            tar_batches.append(predictor.text_encoder(tar_prompts[start:end]).float().cpu())
-        del images, masks
-
-    img_emb = torch.cat(img_batches, dim=0)
-    mask_emb = torch.cat(mask_batches, dim=0)
-    src_emb = torch.cat(src_batches, dim=0)
-    tar_emb = torch.cat(tar_batches, dim=0)
-
-    if cache_scattered:
-        # Write many per-sample .pt files indexed by EMBEDDINGS_CSV.
-        print(f"Caching scattered embeddings ({n_samples} samples) -> {_SCATTERED_EMBEDDINGS_DIR}")
-        rows: list[dict[str, str]] = []
-        for i, sid in enumerate(tqdm(sample_ids, desc="Caching scattered", unit="sample")):
-            sample_dir = _SCATTERED_EMBEDDINGS_DIR / sid
-            sample_dir.mkdir(parents=True, exist_ok=True)
-            img_path = sample_dir / "image.pt"
-            mask_path = sample_dir / "mask.pt"
-            src_path = sample_dir / "source.pt"
-            tar_path = sample_dir / "target.pt"
-            torch.save(img_emb[i].contiguous(), img_path)
-            torch.save(mask_emb[i].contiguous(), mask_path)
-            torch.save(src_emb[i].contiguous(), src_path)
-            torch.save(tar_emb[i].contiguous(), tar_path)
-            rows.append({
-                SAMPLE_ID_COL: sid,
-                SOURCE_EMB_COL: str(src_path),
-                TARGET_EMB_COL: str(tar_path),
-                IMAGE_EMB_COL: str(img_path),
-                MASK_EMB_COL: str(mask_path),
-            })
-        if EMBEDDINGS_CSV is not None:
-            csv_path = Path(EMBEDDINGS_CSV)
-            csv_path.parent.mkdir(parents=True, exist_ok=True)
-            pd.DataFrame(rows).sort_values(SAMPLE_ID_COL).to_csv(csv_path, index=False)
-            print(f"Saved scattered embeddings CSV: {csv_path}")
-
-    if cache_packed:
-        # Pack encoder outputs into one packed training table.
-        tables = {"img": img_emb, "mask": mask_emb, "src": src_emb, "tar": tar_emb}
-        _save_packed_cache(packed_path, sample_ids, tables, source="encoder")
-
-    return sample_ids, img_emb, mask_emb, src_emb, tar_emb
-
-
 def get_embeddings(
     samples: pd.DataFrame,
-    predictor,
-    *,
-    batch_size: int = EMBED_BATCH_SIZE,
 ) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return CPU embedding tables (img, mask, src, tar), packed for training.
 
-    Tries the packed cache, then packs scattered files, and only then encodes
-    with the (always frozen) ChordEdit encoders. Encoding requires a predictor
-    with live encoders; predictor=None is pack-only and raises instead.
+    Tries the packed cache, then packs scattered files. Raises if neither can
+    cover the requested samples.
     """
     # Validate the ChordEdit model type up front: flux raises NotImplementedError
     # here regardless of cache state, matching SurrogateModel.__init__.
@@ -437,15 +344,11 @@ def get_embeddings(
         print("Loaded scattered embeddings from cache.")
         return packed
 
-    if getattr(predictor, "image_encoder", None) is None:
-        raise RuntimeError(
-            f"Embeddings unavailable: {packed_path} cannot cover {len(sample_ids)} requested "
-            f"samples and scattered embeddings ({EMBEDDINGS_CSV}) are missing or incomplete. "
-            f"No encoder-bearing predictor was provided (predictor=None or encoders released), "
-            f"so on-the-fly encoding is not possible. Produce scattered embeddings with the "
-            f"annotation pipeline, or pass a predictor with live encoders (e.g. SurrogateModel)."
-        )
-    return _encode_embeddings(samples, predictor, packed_path, batch_size=batch_size)
+    raise RuntimeError(
+        f"Embeddings unavailable: {packed_path} cannot cover {len(sample_ids)} requested "
+        f"samples and scattered embeddings ({EMBEDDINGS_CSV}) are missing or incomplete. "
+        f"Produce scattered embeddings with the annotation pipeline."
+    )
 
 
 def get_embeddings_by_sample(
@@ -459,7 +362,7 @@ def get_embeddings_by_sample(
             raise ValueError("No predictor provided, no device to embed on")
         device = predictor.regressor.target_mean.device
     samples = df.drop_duplicates(subset=SAMPLE_ID_COL).sort_values(SAMPLE_ID_COL)
-    sample_ids, img_emb, mask_emb, src_emb, tar_emb = get_embeddings(samples, predictor)
+    sample_ids, img_emb, mask_emb, src_emb, tar_emb = get_embeddings(samples)
     img_emb, mask_emb, src_emb, tar_emb = img_emb.to(device), mask_emb.to(device), src_emb.to(device), tar_emb.to(device)
     return {sid:{
         "img": img_emb[i],

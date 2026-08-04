@@ -247,7 +247,7 @@ def create_cell_tensors(
     """Build device-resident CellTensors for each split, sharing one embedding table."""
     frames = [X for X, _ in splits_df.values()]
     samples = pd.concat(frames, ignore_index=True).drop_duplicates(SAMPLE_ID_COL).sort_values(SAMPLE_ID_COL)
-    sample_ids, img_emb, mask_emb, src_emb, tar_emb = get_embeddings(samples, predictor)
+    sample_ids, img_emb, mask_emb, src_emb, tar_emb = get_embeddings(samples)
     
     # Build the shared embedding table.
     emb_table = EmbeddingTable(
@@ -433,7 +433,7 @@ def create_dataloaders(
 ) -> tuple[DataLoader[CellItem], DataLoader[CellItem], DataLoader[CellItem]]:
     """Build train/val/test DataLoaders from split feature and target tables."""
     samples = pd.concat([train_X, val_X, test_X], ignore_index=True).drop_duplicates(SAMPLE_ID_COL).sort_values(SAMPLE_ID_COL)
-    sample_ids, img_emb, mask_emb, src_emb, tar_emb = get_embeddings(samples, predictor)
+    sample_ids, img_emb, mask_emb, src_emb, tar_emb = get_embeddings(samples)
     emb_table = EmbeddingTable(img=img_emb, mask=mask_emb, src=src_emb, tar=tar_emb)
     sample_id_to_idx = {sid: i for i, sid in enumerate(sample_ids)}
 
