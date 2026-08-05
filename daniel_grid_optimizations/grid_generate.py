@@ -60,8 +60,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--generated-root", default=None)
     parser.add_argument("--gpus", nargs="+", type=int, default=[0])
     parser.add_argument("--max-samples", type=int, default=None)
-    # Optional flags: --add-plots, --skip-embeddings, --skip-generated, --diagonal-optimization.
+    # Optional flags: --add-plots, --cache-masks, --skip-embeddings, --skip-generated, --diagonal-optimization.
     parser.add_argument("--add-plots", action="store_true")
+    parser.add_argument("--cache-masks", action="store_true")
     parser.add_argument("--skip-embeddings", action="store_true")
     parser.add_argument("--skip-generated", action="store_true")
     parser.add_argument("--diagonal-optimization", action="store_true")
@@ -77,6 +78,7 @@ def run_shard(
     max_samples: int | None,
     write_plots: bool,
     diagonal_optimization: bool,
+    cache_masks: bool,
     skip_embeddings: bool,
     skip_generated: bool,
     num_shards: int,
@@ -106,7 +108,7 @@ def run_shard(
     # Only shard 0 writes the full-dataset embeddings/inputs CSVs (avoids races).
     if shard == 0:
         if not skip_embeddings:
-            emb_dest = write_id_to_embeddings(embeddings_root, mapping_path)
+            emb_dest = write_id_to_embeddings(embeddings_root, mapping_path, cache_masks=cache_masks)
             LOGGER.info("Wrote %s", emb_dest)
         if not skip_generated:
             dest = write_id_to_inputs(generated_root, data_root, mapping_path)
@@ -139,15 +141,15 @@ def run_shard(
         emb_dir = embeddings_root / settings.SAMPLES_DIRNAME / sample_id
         sample_dir = generated_root / settings.GRIDS_DIRNAME / sample_id
         cells_dir = sample_dir / settings.CELLS_DIRNAME
-        mask_rel = meta.get(settings.FIELD_MASK_IMAGE_PATH, "")
+        mask_rel = meta.get(settings.FIELD_MASK_IMAGE_PATH, "") if cache_masks else ""
 
         # Determine if sample embeddings are already complete (i.e., partially generated).
         need_embeddings = False
         if not skip_embeddings:
-            emb_paths = [emb_dir / name for name in ("source.pt", "target.pt", "image.pt")]
-            # Masks are optional, but if present they are expected under the sample embeddings dir.
+            emb_paths = [emb_dir / name for name in settings.EMBEDDING_FILENAMES]
+            # Masks are optional per sample; when caching them, an existing trio without mask.pt is incomplete.
             if mask_rel:
-                emb_paths.append(emb_dir / "mask.pt")
+                emb_paths.append(emb_dir / settings.MASK_FILENAME)
             need_embeddings = not all(path.exists() for path in emb_paths)
 
         # Determine if sample cells are already complete (i.e., partially generated).
@@ -243,6 +245,8 @@ def main() -> None:
         raise SystemExit("--skip-generated cannot be combined with --add-plots")
     if args.skip_embeddings and args.skip_generated:
         raise SystemExit("--skip-embeddings cannot be combined with --skip-generated")
+    if args.cache_masks and args.skip_embeddings:
+        raise SystemExit("--cache-masks cannot be combined with --skip-embeddings")
     data_root = Path(args.data_root).expanduser().resolve()
     validate_dataset_root(data_root)
     gpus = args.gpus
@@ -280,6 +284,7 @@ def main() -> None:
         max_samples=args.max_samples,
         write_plots=args.add_plots,
         diagonal_optimization=args.diagonal_optimization,
+        cache_masks=args.cache_masks,
         skip_embeddings=args.skip_embeddings,
         skip_generated=args.skip_generated,
         num_shards=len(gpus),

@@ -98,15 +98,23 @@ def load_samples(
     return [(sid, mapping[sid]) for sid in sample_ids]
 
 
-def write_id_to_embeddings(embeddings_root: Path, mapping_path: Path) -> Path:
-    """Write id_to_embeddings_<suffix>.csv with absolute paths to per-sample .pt files."""
+def write_id_to_embeddings(embeddings_root: Path, mapping_path: Path, cache_masks: bool = False) -> Path:
+    """Write id_to_embeddings_<suffix>.csv with absolute paths to per-sample .pt files.
+
+    With cache_masks, a mask_embedding column is appended; it is empty for
+    samples whose mapping entry has no mask.
+    """
     mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
     suffix = embeddings_root.name.lower().replace("_", "").replace("-", "")
     dest = embeddings_root / f"id_to_embeddings_{suffix}.csv"
     embeddings_root.mkdir(parents=True, exist_ok=True)
 
+    fieldnames = list(settings.ID_TO_EMBEDDINGS_FIELDS)
+    if cache_masks:
+        fieldnames.append("mask_embedding")
+
     with dest.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=settings.ID_TO_EMBEDDINGS_FIELDS)
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for sample_id in sorted(mapping):
             meta = mapping[sample_id]
@@ -114,15 +122,16 @@ def write_id_to_embeddings(embeddings_root: Path, mapping_path: Path) -> Path:
                 continue
             sid = str(sample_id).zfill(settings.SAMPLE_ID_WIDTH)
             sample_dir = embeddings_root / settings.SAMPLES_DIRNAME / sid
-            writer.writerow(
-                {
-                    "sample_id": sid,
-                    "source_embedding": str(sample_dir / "source.pt"),
-                    "target_embedding": str(sample_dir / "target.pt"),
-                    "image_embedding": str(sample_dir / "image.pt"),
-                    "mask_embedding": str(sample_dir / "mask.pt"),
-                }
-            )
+            row = {
+                "sample_id": sid,
+                "source_embedding": str(sample_dir / "source.pt"),
+                "target_embedding": str(sample_dir / "target.pt"),
+                "image_embedding": str(sample_dir / "image.pt"),
+            }
+            if cache_masks:
+                has_mask = bool(meta.get(settings.FIELD_MASK_IMAGE_PATH, ""))
+                row["mask_embedding"] = str(sample_dir / settings.MASK_FILENAME) if has_mask else ""
+            writer.writerow(row)
     return dest
 
 

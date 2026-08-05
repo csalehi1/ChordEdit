@@ -13,10 +13,13 @@ Expected dataset layout under --data-root:
 Expected embeddings layout under --embeddings-root/<dataset-name>/:
 
   id_to_embeddings_<suffix>.csv
-  annotation_embeddings/{id}/source.pt
-  annotation_embeddings/{id}/target.pt
-  annotation_embeddings/{id}/image.pt
-  annotation_embeddings/{id}/mask.pt
+  annotation_embeddings/{id}/source.pt   # pooled CLIP vector, (1024,) float32
+  annotation_embeddings/{id}/target.pt   # pooled CLIP vector, (1024,) float32
+  annotation_embeddings/{id}/image.pt    # flat VAE latent, (16384,) float32
+  annotation_embeddings/{id}/mask.pt     # flat VAE latent of the RGB mask, only with --cache-masks
+
+All embedding files are packing-ready: one flat float32 vector per file,
+derived from the same pipeline tensors that condition generation.
 
 Expected generated layout under --generated-root/<dataset-name>/:
 
@@ -55,7 +58,9 @@ CELLS_DIRNAME = "cells"
 
 # Per-sample embedding layout under --embeddings-root/<dataset-name>/.
 SAMPLES_DIRNAME = "annotation_embeddings"
-EMBEDDING_FILENAMES: Tuple[str, ...] = ("source.pt", "target.pt", "image.pt", "mask.pt")
+EMBEDDING_FILENAMES: Tuple[str, ...] = ("source.pt", "target.pt", "image.pt")
+# Written per sample only with --cache-masks (and only when the sample has a mask).
+MASK_FILENAME = "mask.pt"
 
 # CSV schemas.
 SAMPLE_ID_WIDTH = 8
@@ -64,7 +69,6 @@ ID_TO_EMBEDDINGS_FIELDS = [
     "source_embedding",
     "target_embedding",
     "image_embedding",
-    "mask_embedding",
 ]
 ID_TO_INPUTS_FIELDS = [
     "sample_id",

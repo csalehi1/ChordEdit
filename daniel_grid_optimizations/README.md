@@ -19,7 +19,7 @@ The evaluation metrics come from [PnPInversion](https://github.com/cure-lab/PnPI
 | --- | --- |
 | `--data-root` | |
 | `--model-root` | |
-| `--embeddings-root` | |
+| `--embeddings-root` | Parent dir for per-sample embeddings; the dataset dir name is appended (e.g. `.../embeddings/sd_turbo` -> `.../embeddings/sd_turbo/UltraEdit_Region_10000`). |
 | `--generated-root` | |
 | `--gpus` | |
 | `--max-samples` | |
@@ -27,9 +27,26 @@ The evaluation metrics come from [PnPInversion](https://github.com/cure-lab/PnPI
 | Flag | Meaning |
 | --- | --- |
 | `--add-plots` | |
-| `--skip-embeddings` | |
-| `--skip-generated` | |
+| `--cache-masks` | Also save `mask.pt` per sample (flat VAE latent of the RGB annotation mask). Incompatible with `--skip-embeddings`. |
+| `--skip-embeddings` | Do not write per-sample embedding files. |
+| `--skip-generated` | Encode-only mode: save embeddings, skip all UNet/grid work. |
 | `--diagonal-optimization` | |
+
+### Embedding format
+
+Saved embeddings are packing-ready: one flat float32 vector per file,
+derived from the same pipeline tensors that condition generation.
+
+- `image.pt`: flattened VAE latent, `(16384,)` for sd-turbo at 512px.
+- `source.pt` / `target.pt`: masked-mean-pooled CLIP text vectors, `(1024,)`,
+  numerically identical to the classification repo's `mean_pool` /
+  `encode_text_pooled` (attention masks from re-tokenizing the
+  bracket-stripped prompts).
+- `mask.pt` (only with `--cache-masks`): flattened VAE latent of the
+  RGB-converted annotation mask, same shape as `image.pt`; encoded in the
+  same batch=2 VAE forward as the image. Skipped for samples without a
+  mask, and the `id_to_embeddings` CSV gains a `mask_embedding` column
+  (empty for maskless samples).
 
 ### Generation Usage
 

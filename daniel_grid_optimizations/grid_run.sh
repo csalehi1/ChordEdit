@@ -31,3 +31,18 @@ CUDA_VISIBLE_DEVICES=0 python grid_generate.py \
     --add-plots \
     --skip-embeddings \
     --diagonal-optimization
+
+
+# Regenerate packing-ready scattered embeddings (no grids) on GPUs 5,6,7.
+# Add --cache-masks to also save per-sample mask.pt VAE latents.
+python grid_generate.py \
+    --data-root /shared/ssd_30T/mirick/datasets/ultra_edit/UltraEdit_Region_10000 \
+    --model-root /shared/ssd_30T/mirick/models/sd-turbo \
+    --embeddings-root /shared/ssd_30T/mirick/embeddings/sd_turbo \
+    --skip-generated --gpus 5 6 7
+
+python grid_generate.py \
+    --data-root /shared/ssd_30T/mirick/datasets/ultra_edit/UltraEdit_Background_1000_v2 \
+    --model-root /shared/ssd_30T/mirick/models/sd-turbo \
+    --embeddings-root /shared/ssd_30T/mirick/embeddings/sd_turbo \
+    --skip-generated --gpus 5 6 7

@@ -8,7 +8,7 @@ import sys
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Tuple, Union
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -115,11 +115,37 @@ def _cleanup_decode_row(x_transport, edit_embed, noise, t_end_values, cleanup: b
     return [pil_images[i * batch] for i in range(n)]
 
 
-def _cpu_tensor(embed: Any) -> torch.Tensor:
-    """Detach a prompt embed or latent to CPU for torch.save."""
-    if torch.is_tensor(embed):
-        return embed.detach().cpu()
-    return embed.hidden_states.detach().cpu()
+def _flat_cpu(tensor: torch.Tensor) -> torch.Tensor:
+    """Flatten to a compact 1-D float32 CPU tensor safe for torch.save.
+
+    torch.save serializes the tensor's entire underlying storage; views that
+    slice a batch share that storage, so saving a view would embed every
+    sample's data in each file. reshape(-1) + clone guarantees a private
+    buffer holding exactly numel elements.
+    """
+    return tensor.detach().reshape(-1).float().cpu().clone()
+
+
+def _pool_text_embeds(hidden: Any, prompts: List[str]) -> torch.Tensor:
+    """Masked-mean pool CLIP hidden states to one vector per prompt, (N, dim).
+
+    Matches the classification repo's mean_pool / encode_text_pooled exactly:
+    attention masks come from re-tokenizing the prompts (the pipeline is built
+    with use_attention_mask=False, so encode_prompt retains no mask), then a
+    mask-weighted mean over the token dimension.
+    """
+    if not torch.is_tensor(hidden):
+        raise NotImplementedError("Pooled text saving is implemented for SD hidden states only")
+    pipeline = _get_pipeline()
+    inputs = pipeline.tokenizer(
+        list(prompts),
+        padding="max_length",
+        truncation=True,
+        max_length=pipeline.tokenizer.model_max_length,
+        return_tensors="pt",
+    )
+    mask = inputs.attention_mask.to(hidden.device).unsqueeze(-1).expand_as(hidden).float()
+    return (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
 
 
 def _split_prompt_batch(embeds: Any, index: int) -> Any:
@@ -141,9 +167,17 @@ def _save_sample_embeddings(
     src_cpu: torch.Tensor,
     tgt_cpu: torch.Tensor,
     image_cpu: torch.Tensor,
-    mask_cpu: Optional[torch.Tensor],
+    mask_cpu: torch.Tensor | None = None,
 ) -> None:
-    """Write per-sample .pt files from host tensors (safe to call from a background thread)."""
+    """Write packing-ready per-sample .pt files (safe to call from a background thread).
+
+    Format: one flat float32 vector per file. image.pt (and mask.pt, when
+    --cache-masks provides one) is the flattened VAE latent (C*H*W, e.g. 16384
+    for sd-turbo at 512px); source.pt / target.pt are masked-mean-pooled CLIP
+    vectors (hidden_dim, e.g. 1024).
+    """
+    assert src_cpu.ndim == 1 and tgt_cpu.ndim == 1 and image_cpu.ndim == 1
+    assert mask_cpu is None or mask_cpu.ndim == 1
     embeddings_dir.mkdir(parents=True, exist_ok=True)
     torch.save(src_cpu, embeddings_dir / "source.pt")
     torch.save(tgt_cpu, embeddings_dir / "target.pt")
@@ -197,17 +231,18 @@ def run_factorized_grid(
             tgt_embed = _split_prompt_batch(prompt_batch, 1)
 
             if embeddings_dir is not None:
+                # Saved embeddings derive from the same tensors that condition
+                # generation: the UNet's full-sequence hidden states pooled to
+                # one vector per prompt, and the flattened VAE latent.
                 # Copy to CPU before save so the background writer does not touch GPU tensors.
-                src_cpu = _cpu_tensor(src_embed)
-                tgt_cpu = _cpu_tensor(tgt_embed)
-                image_cpu = _cpu_tensor(latents)
-                mask_cpu = _cpu_tensor(mask_latents) if mask_latents is not None else None
+                hidden = prompt_batch if torch.is_tensor(prompt_batch) else prompt_batch.hidden_states
+                pooled = _pool_text_embeds(hidden, [record.source_prompt, record.target_prompt])
                 save_kwargs = dict(
                     embeddings_dir=embeddings_dir,
-                    src_cpu=src_cpu,
-                    tgt_cpu=tgt_cpu,
-                    image_cpu=image_cpu,
-                    mask_cpu=mask_cpu,
+                    src_cpu=_flat_cpu(pooled[0]),
+                    tgt_cpu=_flat_cpu(pooled[1]),
+                    image_cpu=_flat_cpu(latents),
+                    mask_cpu=_flat_cpu(mask_latents) if mask_latents is not None else None,
                 )
                 if skip_generated:
                     # Encode-only (--skip-generated): nothing to overlap with, write synchronously.
