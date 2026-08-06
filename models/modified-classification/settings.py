@@ -1,5 +1,9 @@
 # settings.py
 
+"""
+Load settings from the settings.json file.
+"""
+
 import json as _json
 import sys as _sys
 from functools import partial
@@ -8,21 +12,6 @@ from pathlib import Path
 
 from scores import cara_score, linex_score, naive_score, score_df
 
-
-"""
-Configuration.
-
-Every tunable lives in settings.json; this module reads that file and derives
-the rest (paths, column names, the phi partials) from it. Nothing here reads
-the environment - to run a different configuration, edit settings.json or pass
---settings-path pointing at another copy of it:
-
-    python train_m.py --settings-path /tmp/my_config.json
-
-Each run saves the exact config it used to <run_dir>/settings.json, and
-_helpers.load_run_settings replays a run from that snapshot, so evaluating a
-run reproduces its training config.
-"""
 
 _SETTINGS_DIR = Path(__file__).resolve().parent
 _SETTINGS_ARG = "--settings-path"
@@ -71,83 +60,51 @@ def _cfg(name):
 Dataset settings.
 """
 
-DIR_NAME = str(_cfg("DIR_NAME"))  # UltraEdit_Background_1000_v2 | UltraEdit_Region_<N> | UltraEdit_Style_1000_v2
-CHORD_EDIT_MODEL = str(_cfg("CHORD_EDIT_MODEL"))  # "sd_turbo" | "sdxl_turbo" | "flux"
-
-CHORD_EDIT_MODEL_CONFIGS = {
-    "sd_turbo": {
-        "root": Path("/shared/ssd_30T/mirick/models/sd-turbo"),
-        "image_size": 512,
-        "pipeline_type": "sd",
-    },
-    "sdxl_turbo": {
-        "root": Path("/shared/ssd_30T/zarageddes/models/sdxl-turbo"),
-        "image_size": 1024,
-        "pipeline_type": "sdxl",
-    },
-    "flux": {
-        "root": Path("/shared/ssd_30T/zarageddes/models/flux1-schnell"),
-        "image_size": 1024,
-        "pipeline_type": "flux",
-    },
+_CHORD_EDIT_MODEL_CONFIGS = {
+    "sd_turbo": (Path("/shared/ssd_30T/mirick/models/sd-turbo"), 512, "sd"),
+    "sdxl_turbo": (Path("/shared/ssd_30T/zarageddes/models/sdxl-turbo"), 1024, "sdxl"),
+    "flux": (Path("/shared/ssd_30T/zarageddes/models/flux1-schnell"), 1024, "flux"),
 }
-if CHORD_EDIT_MODEL not in CHORD_EDIT_MODEL_CONFIGS:
-    raise ValueError(
-        f"Unknown CHORD_EDIT_MODEL={CHORD_EDIT_MODEL!r}; "
-        f"expected one of {sorted(CHORD_EDIT_MODEL_CONFIGS)}"
-    )
-_CHORD_CFG = CHORD_EDIT_MODEL_CONFIGS[CHORD_EDIT_MODEL]
-CHORD_EDIT_MODEL_ROOT = _CHORD_CFG["root"]
-CHORD_EDIT_IMAGE_SIZE = int(_CHORD_CFG["image_size"])
-CHORD_EDIT_PIPELINE_TYPE = str(_CHORD_CFG["pipeline_type"])
+# NOTE: Choose from "sd_turbo", "sdxl_turbo", or "flux".
+CHORD_EDIT_MODEL = str(_cfg("CHORD_EDIT_MODEL"))  
+if CHORD_EDIT_MODEL not in _CHORD_EDIT_MODEL_CONFIGS:
+    raise ValueError(f"Unknown {CHORD_EDIT_MODEL=}")
+CHORD_EDIT_MODEL_ROOT, CHORD_EDIT_IMAGE_SIZE, CHORD_EDIT_PIPELINE_TYPE = _CHORD_EDIT_MODEL_CONFIGS[CHORD_EDIT_MODEL]
 
+# NOTE: Choose from "UltraEdit_Region_<N>", "UltraEdit_Background_1000_v2", or "UltraEdit_Style_1000_v2".
+DIR_NAME = str(_cfg("DIR_NAME"))
 GENERATED_DIR = Path(f"/shared/ssd_30T/mirick/generated/{CHORD_EDIT_MODEL}/0p0/{DIR_NAME}")
 DATASET_DIR = Path(f"/shared/ssd_30T/mirick/datasets/ultra_edit/{DIR_NAME}")
-# Scattered per-sample embeddings written by the annotation pipeline.
-EMBEDDINGS_DIR = Path(f"/shared/ssd_30T/mirick/embeddings/{CHORD_EDIT_MODEL}/{DIR_NAME}")
-EMBEDDINGS_SAMPLES_DIRNAME = "annotation_embeddings"
+SCATTERED_DIR = Path(f"/shared/ssd_30T/mirick/embeddings/{CHORD_EDIT_MODEL}/{DIR_NAME}")
 
-_SLUG = DIR_NAME.replace("_", "").lower()
-INPUTS_CSV = GENERATED_DIR / f"id_to_inputs_{_SLUG}.csv"
-METRICS_CSV = GENERATED_DIR / f"id_to_metrics_{_SLUG}.csv"
-EMBEDDINGS_CSV = EMBEDDINGS_DIR / f"id_to_embeddings_{_SLUG}.csv"
+# Map the package root from next to train_m.py or the copy saved under runs/.
+_here = Path(__file__).resolve().parent
+_package_dir = _here if (_here / "model_m.py").exists() else _here.parents[2]
 
-# Package root: settings.py sits next to model_m.py, except for the copy saved
-# under outputs/<DIR_NAME>/<run>/ (parents[2] == package dir).
-_HERE = Path(__file__).resolve().parent
-_PACKAGE_DIR = _HERE if (_HERE / "model_m.py").exists() else _HERE.parents[2]
-
-# NOTE: Set this to the directory where the model outputs will be saved.
-OUTPUTS_DIR = _PACKAGE_DIR / "outputs" / DIR_NAME
-OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-_outputs_gitignore = OUTPUTS_DIR.parent / ".gitignore"
-if not _outputs_gitignore.exists():
-    _outputs_gitignore.write_text("*\n!.gitignore\n", encoding="utf-8")
+# NOTE: Set this to the directory where the model runs will be saved.
+RUNS_DIR = _package_dir / "runs" / DIR_NAME
+RUNS_DIR.mkdir(parents=True, exist_ok=True)
+_runs_gitignore = RUNS_DIR.parent / ".gitignore"
+if not _runs_gitignore.exists():
+    _runs_gitignore.write_text("*\n!.gitignore\n", encoding="utf-8")
 
 # Shared column name for sample IDs.
 SAMPLE_ID_COL = "sample_id"
 
 # Column names in the id_to_inputs_*.csv file.
+INPUTS_CSV = GENERATED_DIR / f"id_to_inputs_{DIR_NAME.replace("_", "").lower()}.csv"
 SOURCE_PROMPT_COL = "source_prompt"
 TARGET_PROMPT_COL = "target_prompt"
 IMAGE_PATH_COL = "image_path"
 MASK_PATH_COL = "mask_image_path"
 
-# Column names in the id_to_embeddings_*.csv file.
-SOURCE_EMB_COL = "source_embedding"
-TARGET_EMB_COL = "target_embedding"
-IMAGE_EMB_COL = "image_embedding"
-MASK_EMB_COL = "mask_embedding"
-
 # Column names in the id_to_metrics_*.csv file.
-CATEGORY_COL = "category"
+METRICS_CSV = GENERATED_DIR / f"id_to_metrics_{DIR_NAME.replace("_", "").lower()}.csv"
 T_START_COL = "t_start"
 T_END_COL = "t_end"
 T_DELTA_COL = "t_delta"
 PSNR_COL = "psnr_unedit_part"
-LPIPS_COL = "lpips_unedit_part"
 CLIP_COL = "clip_similarity_target_image_edit_part"
-CELL_PATH_COL = "cell_path"
 
 # Column names in the id_to_predictions_*.csv file written after selection.
 PRED_T_START_COL = "pred_t_start"
@@ -159,29 +116,19 @@ Shared model settings.
 """
 
 # Values of t_delta column to train models on. Set to `null` to use every t_delta.
-# t_delta is the paper's transport-estimator parameter delta; paper results use delta = 0.
 TARGET_T_DELTA = _cfg("TARGET_T_DELTA")
 
-# Sample-level split ratios (by sample_id, not individual grid rows).
 TRAIN_FRAC = float(_cfg("TRAIN_FRAC"))
 VAL_FRAC = float(_cfg("VAL_FRAC"))
-TEST_FRAC = float(_cfg("TEST_FRAC"))
 
-# Seeds model init and batch order.
+# SEED and SPLIT_SEED are kept separate so that model init can be
+# reseeded without moving samples between splits.
 SEED = int(_cfg("SEED"))
-
-# Seed for the sample-level train/val/test split. Kept separate from SEED so
-# model init can be reseeded (variance estimates, ensembles) without moving
-# samples between splits.
 SPLIT_SEED = int(_cfg("SPLIT_SEED"))
 
 
 """
 M model settings.
-
-Paper: surrogate model M_hat(x_src, c_src, c_tar, t*, t**) -> s = (s_1, s_2),
-predicting s_1 = PSNR-Unedited and s_2 = CLIP-Edited. Code's t_start/t_end are
-the paper's (t*, t**); mask is the edit mask m_obj.
 
     Model architecture:
     M(img_emb, mask_emb, src_emb, tar_emb, t_start, t_end) -> (psnr, clip)
@@ -191,16 +138,22 @@ the paper's (t*, t**); mask is the edit mask m_obj.
 M_TARGET_COLS = (PSNR_COL, CLIP_COL)
 M_TARGET_LABELS = {PSNR_COL: "PSNR-Unedited", CLIP_COL: "CLIP-Edited"}
 
-# ChordEdit encoders loaded from CHORD_EDIT_MODEL_ROOT for image/text embedding
-# dims and live encode/predict_raw. Encoders are inherited from the ChordEdit
-# pipeline and are always frozen; training/eval embeddings come from the
-# packed/scattered caches.
+# Select from "residual" or "delta". Targets are always per-sample normalized
+# deltas Delta (scores.calc_normalized_deltas); "residual" additionally
+# subtracts the train split's mean true delta surface (saved to the run as
+# mean_surface.pt), so the towers regress how an image deviates from the
+# population surface and T adds the surface back at selection time. "delta"
+# regresses the full deltas with no offset.
+M_TARGET_SPACE = str(_cfg("M_TARGET_SPACE"))
+if M_TARGET_SPACE not in ("residual", "delta"):
+    raise ValueError(f"Unknown {M_TARGET_SPACE=}; expected 'residual' or 'delta'")
+
+
 USE_CENTER_CROP = bool(_cfg("USE_CENTER_CROP"))
 
-# How the flattened VAE latents are projected: "linear" (one Linear over the
-# 16k flat vector) or "conv" (fold back to (C, S, S) and downsample). The
-# latent's spatial layout carries the mask's size and position, which a flat
-# Linear cannot see.
+# Select from "linear" or "conv". "Linear" projects the flattened VAE
+# latents with a single Linear layer. "conv" projects with a
+# convolutional layer.
 IMG_ENCODER = str(_cfg("IMG_ENCODER"))
 
 # Regressor MLP architecture.
@@ -214,7 +167,6 @@ MLP_CLIP_DROPOUT = float(_cfg("MLP_CLIP_DROPOUT"))
 T_FOURIER_FREQS = int(_cfg("T_FOURIER_FREQS"))
 T_PROJ_DIM = int(_cfg("T_PROJ_DIM"))
 
-# M training hyperparameters.
 EPOCHS = int(_cfg("EPOCHS"))
 BATCH_SIZE = int(_cfg("BATCH_SIZE"))
 LR = float(_cfg("LR"))
@@ -222,44 +174,31 @@ WEIGHT_DECAY = float(_cfg("WEIGHT_DECAY"))
 NORMALIZE_TARGETS = bool(_cfg("NORMALIZE_TARGETS"))
 RANKING_LOSS_WEIGHT = float(_cfg("RANKING_LOSS_WEIGHT"))
 
-# Restrict the ranking loss to pairs whose better cell is in the true top-k of
-# its grid. 0 uses every pair. Regret only cares about the top of the grid.
+# Restrict ranking loss to pairs in the true top-k of its grid.
 RANKING_TOP_K = int(_cfg("RANKING_TOP_K"))
-
-# Per-target weights on the z-scored MSE loss (train-time only; evaluate()
-# reports the unweighted loss so runs stay comparable).
+# Per-target weights on the z-scored MSE loss.
 PSNR_LOSS_WEIGHT = float(_cfg("PSNR_LOSS_WEIGHT"))
 CLIP_LOSS_WEIGHT = float(_cfg("CLIP_LOSS_WEIGHT"))
-
-# LR schedule over epochs: "none" | "cosine".
+# Select from "none" or "cosine".
 LR_SCHEDULER = str(_cfg("LR_SCHEDULER"))
-
-# Stop when the checkpoint metric has not improved for this many epochs
-# (after a minimum of 5 epochs). 0 disables early stopping.
+# Stop when the checkpoint metric has not improved for this many epochs.
 EARLY_STOP_PATIENCE = int(_cfg("EARLY_STOP_PATIENCE"))
-
 # Metric used to pick the best-epoch checkpoint:
-#   "val_phi_spearman" - median per-sample Spearman between predicted and
-#       true phi over each val sample's grid (aligned with T selection),
-#   "val_regret" - median per-sample regret on the same grids,
-#   "val_loss" - summed z-scored MSE over both targets.
+#   "val_phi_spearman" is the median per-sample Spearman between predicted and
+#       true phi over each val sample's grid (the model's own ordering,
+#       blind to the level of predicted phi).
+#   "val_regret" is the median per-sample regret of the deployed selector
+#       (predictions plus the mean surface in "residual" space) on the same grids.
+#   "val_gain_mean" is the mean true phi at the deployed selector's pick, i.e.
+#       the mean gain over the default cell (level-sensitive, sign matters).
+#   "val_loss" is the summed z-scored MSE over both targets.
 CKPT_METRIC = str(_cfg("CKPT_METRIC"))
-
 # Number of sample grids concatenated per training batch.
 GRIDS_PER_BATCH = int(_cfg("GRIDS_PER_BATCH"))
-
-# Exponential moving average of the weights, evaluated and checkpointed in
-# place of the live weights. 0 disables it. Val phi-Spearman swings by a few
-# points between neighboring epochs, so an averaged iterate is a steadier
-# thing to select on.
+# Exponential moving average of the weights.
 EMA_DECAY = float(_cfg("EMA_DECAY"))
 
-# Anchor predictions on the train split's average value at each grid cell, so
-# the towers predict the per-image deviation from the shared surface rather
-# than re-deriving that surface.
-USE_CELL_ANCHOR = bool(_cfg("USE_CELL_ANCHOR"))
-
-# Run directory name under OUTPUTS_DIR; empty string means use a timestamp.
+# Run directory name under RUNS_DIR; empty string means use a timestamp.
 RUN_NAME = str(_cfg("RUN_NAME"))
 
 
@@ -307,21 +246,9 @@ T_TARGET_COL = f"{T_TARGET_FN}_score"
 DEFAULT_T_START = float(_cfg("DEFAULT_T_START"))
 DEFAULT_T_END = float(_cfg("DEFAULT_T_END"))
 
-# Discrete grid axes for T (timestep selector).
-GRID_T_START = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
-GRID_T_END = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
-
-# Which grid cells the dataset exposes:
-#   "all"   - every labeled (t_start, t_end), i.e. the full 11 x 11 mesh
-#   "lower" - only t_start > t_end, the strict lower triangle the annotation
-#             pipeline covered before it filled the rest in
-# Restricting this changes both what the model trains on and what T can pick,
-# and phi is normalized over whichever candidate set is present, so runs on
-# different regions are not directly comparable.
-CELL_REGIONS = ("all", "lower")
-CELL_REGION = str(_cfg("CELL_REGION"))
-if CELL_REGION not in CELL_REGIONS:
-    raise ValueError(f"Unknown {CELL_REGION=}; expected one of {CELL_REGIONS}")
+# The candidate (t_start, t_end) grid is not configured: the cells labeled in
+# METRICS_CSV define it. phi is normalized over that candidate set, so runs on
+# datasets labeling different regions are not directly comparable.
 
 # Deviate-or-default gate: minimum predicted phi gain to leave baseline timesteps.
 NOISE_FLOOR_PHI = float(_cfg("NOISE_FLOOR_PHI"))

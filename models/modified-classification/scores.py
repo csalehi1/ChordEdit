@@ -1,3 +1,5 @@
+# scores.py
+
 """
 Scalarization of the score vector s = (s_1, s_2) into a single objective phi,
 following the paper's notation: s_1 = PSNR-Unedited, s_2 = CLIP-Edited.
@@ -28,9 +30,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
-
-
-_EPS = 1e-8
 
 
 def naive_score(
@@ -130,56 +129,20 @@ def linex_score(
     return 0.5 * (combined * weights).sum(dim=-1)
 
 
-def calc_normalized(
-    values: torch.Tensor,
-    *,
-    per_sample: bool = True,
-) -> torch.Tensor:
-    """
-    Min-max normalize metric columns. If per_sample is True (default),
-    each leading sample is scaled independently over its N candidates.
-    When False, each metric uses a single min/max over all non-metric
-    dimensions.
-
-    NaN marks an unlabeled candidate (e.g. a sparse timestep grid). NaN cells
-    are excluded from the min/max - one missing cell cannot poison the rest of
-    the sample - and stay NaN in the output. NaN support is for scoring/eval
-    only: backprop through a NaN-sparse tensor yields NaN gradients (0 * NaN
-    in elementwise backwards), so training must use dense labeled-only
-    batches, as train_m's ranking loss does.
-
-    values: (..., N, C)
-    per_sample: bool = True
-
-    Returns: (..., N, C)
-    """
-    if values.ndim < 2:
-        raise ValueError(f"values must be (..., N, C), got shape {tuple(values.shape)}")
-
-    if per_sample:
-        # Independent range per sample along candidate axis N. Torch has no
-        # nanmin/nanmax, so mask NaN with +/-inf sentinels that can never win
-        # the reduction.
-        vmin = values.nan_to_num(nan=math.inf).amin(dim=-2, keepdim=True)
-        vmax = values.nan_to_num(nan=-math.inf).amax(dim=-2, keepdim=True)
-    else:
-        # One global range per metric across every leading / candidate dim.
-        reduce_dims = tuple(range(values.ndim - 1))
-        vmin = values.nan_to_num(nan=math.inf).amin(dim=reduce_dims, keepdim=True)
-        vmax = values.nan_to_num(nan=-math.inf).amax(dim=reduce_dims, keepdim=True)
-
-    return (values - vmin) / (vmax - vmin + _EPS)
-
-
-def calc_deltas(
+def calc_norm_deltas(
     values: torch.Tensor,
     baseline_idx: int | torch.Tensor,
 ) -> torch.Tensor:
     """
-    Subtract the baseline (default) edit along the candidate axis.
+    Per-sample-normalized score deltas relative to a default edit.
+    Because metrics live on different scales, scoring uses deltas
 
-    Every delta is relative to the baseline, so a NaN (unlabeled) baseline
-    cell would silently invalidate the whole sample; raise instead.
+        Delta_i = (s_i - s_i^0) / (max_T s_i - min_T s_i)
+
+    where min/max are over the same sample's candidate edits T and s_i^0 is
+    the baseline (default) edit. When the per-metric range is positive,
+    Delta_i is in [-1, 1]; Delta_i > 0 is an improvement over the default and
+    Delta_i < 0 a regression.
 
     values: (..., N, C)
     baseline_idx: int or LongTensor matching values.shape[:-2]
@@ -189,52 +152,71 @@ def calc_deltas(
     if values.ndim < 2:
         raise ValueError(f"values must be (..., N, C), got shape {tuple(values.shape)}")
 
-    def _gather_baseline(values: torch.Tensor, baseline_idx: int | torch.Tensor) -> torch.Tensor:
-        if isinstance(baseline_idx, torch.Tensor):
-            leading = values.shape[:-2]
-            if tuple(baseline_idx.shape) != tuple(leading):
-                raise ValueError(f"baseline_idx shape {tuple(baseline_idx.shape)} must match {tuple(leading)}")
-            c = values.shape[-1]
-            idx = baseline_idx.to(dtype=torch.long, device=values.device)
-            idx = idx.unsqueeze(-1).unsqueeze(-1).expand(*leading, 1, c)
-            return torch.gather(values, dim=-2, index=idx)
+    # Min-max normalize each sample independently over its N candidates.
+    vmin = values.nan_to_num(nan=math.inf).amin(dim=-2, keepdim=True)
+    vmax = values.nan_to_num(nan=-math.inf).amax(dim=-2, keepdim=True)
+    normalized = (values - vmin) / (vmax - vmin + 1e-8)
+
+    # Subtract the baseline (default) edit along the candidate axis.
+    if isinstance(baseline_idx, torch.Tensor):
+        leading = values.shape[:-2]
+        if tuple(baseline_idx.shape) != tuple(leading):
+            raise ValueError(f"baseline_idx shape {tuple(baseline_idx.shape)} must match {tuple(leading)}")
+        c = values.shape[-1]
+        idx = baseline_idx.to(dtype=torch.long, device=values.device)
+        idx = idx.unsqueeze(-1).unsqueeze(-1).expand(*leading, 1, c)
+        baseline = torch.gather(normalized, dim=-2, index=idx)
+    else:
         i = int(baseline_idx)
-        return values[..., i : i + 1, :]
-
-    baseline = _gather_baseline(values, baseline_idx)
+        baseline = normalized[..., i : i + 1, :]
     if torch.isnan(baseline).any():
-        raise ValueError("baseline (default) cell is NaN/unlabeled for at least one sample")
-    return values - baseline
+        raise ValueError("Invalid NaN baseline cell")
+    return normalized - baseline
 
 
-def calc_normalized_deltas(
-    values: torch.Tensor,
-    baseline_idx: int | torch.Tensor,
-    *,
-    per_sample: bool = True,
-) -> torch.Tensor:
+def _group_norm_deltas(
+    df: pd.DataFrame,
+    metric_cols: list[str],
+) -> tuple[torch.Tensor, list[np.ndarray]]:
+    """Pack a metrics DataFrame into per-sample normalized deltas.
+
+    Groups by sample_id, packs equal-sized grids to (B, N, C), and applies
+    calc_normalized_deltas in one batched call. Returns the (B, N, C) deltas
+    and the df row indices per sample, aligned with the B axis.
     """
-    Per-sample-normalized score deltas relative to a default edit.
-    Because metrics live on different scales, scoring uses deltas
+    from settings import DEFAULT_T_END, DEFAULT_T_START, SAMPLE_ID_COL, T_END_COL, T_START_COL
 
-        Delta_i = (s_i - s_i^0) / (max_T s_i - min_T s_i)
+    if not metric_cols:
+        raise ValueError("expected one or more metric column names")
 
-    where min/max are over the same sample's candidate edits T when
-    per_sample=True, and s_i^0 is the baseline (default) edit. When the
-    per-metric range is positive, Delta_i is in [-1, 1]; Delta_i > 0 is an
-    improvement over the default and Delta_i < 0 a regression.
+    index_lists: list[np.ndarray] = []
+    values_list: list[np.ndarray] = []
+    baseline_list: list[int] = []
 
-    Equivalent to calc_deltas(calc_normalized(values, per_sample=...), ...).
-    NaN (unlabeled) cells stay NaN without affecting labeled cells; the
-    baseline cell itself must be labeled (calc_deltas raises otherwise).
+    for _, group in df.groupby(SAMPLE_ID_COL, sort=True):
+        index_lists.append(group.index.to_numpy())
+        values_list.append(group.loc[:, metric_cols].to_numpy(dtype=np.float64, copy=True))
+        base_mask_t_start = np.isclose(group[T_START_COL].to_numpy(dtype=float), DEFAULT_T_START)
+        base_mask_t_end = np.isclose(group[T_END_COL].to_numpy(dtype=float), DEFAULT_T_END)
+        base_mask = base_mask_t_start & base_mask_t_end
+        if int(base_mask.sum()) != 1:
+            raise ValueError(f"Expected exactly one base row, found {int(base_mask.sum())}")
+        # Append the index of the base row to both lists.
+        baseline_list.append(int(np.flatnonzero(np.asarray(base_mask))[0]))
 
-    values: (..., N, C)
-    baseline_idx: int or LongTensor matching values.shape[:-2]
-    per_sample: bool = True
+    values = torch.as_tensor(np.stack(values_list), dtype=torch.float64)
+    baseline_idx = torch.as_tensor(baseline_list, dtype=torch.long)
+    return calc_norm_deltas(values, baseline_idx), index_lists
 
-    Returns: (..., N, C)
-    """
-    return calc_deltas(calc_normalized(values, per_sample=per_sample), baseline_idx)
+
+def compute_delta_df(df: pd.DataFrame, *cols: str) -> pd.DataFrame:
+    """Compute the delta target space for M: per-sample normalized deltas."""
+    deltas, index_lists = _group_norm_deltas(df, list(cols))
+    out = pd.DataFrame(np.nan, index=df.index, columns=list(cols), dtype=np.float64)
+    deltas_np = deltas.detach().cpu().numpy()
+    for k, idxs in enumerate(index_lists):
+        out.loc[idxs, :] = deltas_np[k]
+    return out
 
 
 def score_df(
@@ -250,44 +232,13 @@ def score_df(
     calc_normalized_deltas then score_fn in one batched call, and returns a
     Series aligned to df.index.
     """
-    from settings import DEFAULT_T_END, DEFAULT_T_START, SAMPLE_ID_COL, T_END_COL, T_START_COL
-
-    if not cols:
-        raise ValueError("expected one or more metric column names")
-
-    metric_cols = list(cols)
-    index_lists: list[np.ndarray] = []
-    values_list: list[np.ndarray] = []
-    baseline_list: list[int] = []
-
-    for _, group in df.groupby(SAMPLE_ID_COL, sort=True):
-        # Get the index of the group.
-        index_lists.append(group.index.to_numpy())
-        # Get the values of the group.
-        values_list.append(group.loc[:, metric_cols].to_numpy(dtype=np.float64, copy=True))
-        # Get the mask for the base row.
-        base_mask_t_start = np.isclose(group[T_START_COL].to_numpy(dtype=float), DEFAULT_T_START)
-        base_mask_t_end = np.isclose(group[T_END_COL].to_numpy(dtype=float), DEFAULT_T_END)
-        base_mask = base_mask_t_start & base_mask_t_end
-        # Verify that there is exactly one base row.
-        if int(base_mask.sum()) != 1:
-            raise ValueError(f"Expected exactly one base row, found {int(base_mask.sum())}")
-        # Append the index of the base row to both lists.
-        baseline_list.append(int(np.flatnonzero(np.asarray(base_mask))[0]))
-
-    n_rows = {v.shape[0] for v in values_list}
-    if len(n_rows) != 1:
-        raise ValueError(f"ragged candidate counts across samples: {sorted(n_rows)}")
-
-    values = torch.as_tensor(np.stack(values_list), dtype=torch.float64)
-    baseline_idx = torch.as_tensor(baseline_list, dtype=torch.long)
-    deltas = calc_normalized_deltas(values, baseline_idx)
+    deltas, index_lists = _group_norm_deltas(df, list(cols))
 
     # Process the score kwargs.
     score_kwargs = dict(kwargs)
     weights = score_kwargs.get("weights")
     if weights is not None and not isinstance(weights, torch.Tensor):
-        score_kwargs["weights"] = torch.as_tensor(weights, dtype=values.dtype)
+        score_kwargs["weights"] = torch.as_tensor(weights, dtype=deltas.dtype)
 
     scores = score_fn(deltas, **score_kwargs)
     scores_np = scores.detach().cpu().numpy()

@@ -8,37 +8,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset, Sampler
 
-from model_m import SurrogateModel
-from embeddings import _prep_sample_id, get_embeddings
+from embeddings import get_embeddings
 from settings import *
 
-METRICS_COLS = [SAMPLE_ID_COL, T_START_COL, T_END_COL, T_DELTA_COL, *M_TARGET_COLS]
-INPUTS_COLS = [SAMPLE_ID_COL, SOURCE_PROMPT_COL, TARGET_PROMPT_COL, IMAGE_PATH_COL, MASK_PATH_COL]
-DATA_COLS = list(dict.fromkeys(METRICS_COLS + INPUTS_COLS))
 ID_TO_SPLIT_NAME = "id_to_split.csv"
 
-# CellItem: (sample_idx, img, mask, src, tar, t, y); model uses indices 1..6.
-MODEL_BATCH_SLICE = slice(1, 7)
 
-CellItem = tuple[
-    torch.Tensor,  # sample_idx
-    torch.Tensor,  # img
-    torch.Tensor,  # mask
-    torch.Tensor,  # src
-    torch.Tensor,  # tar
-    torch.Tensor,  # t
-    torch.Tensor,  # y
-]
-
-
-# --- Dataset and loaders ----------------------------------------------------------
-
-def model_inputs(batch: CellItem, device: torch.device) -> tuple[torch.Tensor, ...]:
-    """Return (img, mask, src, tar, t, y) on device."""
-    return tuple(x.to(device) for x in batch[MODEL_BATCH_SLICE])
-
+# --- Training tensors -------------------------------------------------------------
 
 @dataclass(frozen=True)
 class EmbeddingTable:
@@ -48,60 +25,6 @@ class EmbeddingTable:
     mask: torch.Tensor  # (n_samples, img_dim)
     src: torch.Tensor   # (n_samples, text_dim)
     tar: torch.Tensor   # (n_samples, text_dim)
-
-
-class CellDataset(Dataset[CellItem]):
-    """One row per (sample_id, t_start, t_end); embeddings looked up by sample_idx."""
-
-    def __init__(
-        self,
-        sample_idx: torch.Tensor,
-        emb_tables: EmbeddingTable,
-        t: torch.Tensor,
-        y: torch.Tensor,
-    ):
-        self.sample_idx = sample_idx
-        self.emb_tables = emb_tables
-        self.t = t
-        self.y = y
-
-    def __len__(self) -> int:
-        return self.sample_idx.shape[0]
-
-    def __getitem__(self, i: int) -> CellItem:
-        sid = int(self.sample_idx[i])
-        return (
-            self.sample_idx[i],
-            self.emb_tables.img[sid],
-            self.emb_tables.mask[sid],
-            self.emb_tables.src[sid],
-            self.emb_tables.tar[sid],
-            self.t[i],
-            self.y[i],
-        )
-
-
-# Used for per-sample ranking loss.
-# Create batches of cells that belong to the same sample_id.
-class PerSampleBatchSampler(Sampler[list[int]]):
-    """One sample_id's full timestep grid per batch for per-sample ranking loss."""
-
-    def __init__(self, sample_idx: torch.Tensor, shuffle: bool = True):
-        self.shuffle = shuffle
-        self.sample_to_indices: dict[int, list[int]] = {}
-        for i, sid in enumerate(sample_idx.tolist()):
-            self.sample_to_indices.setdefault(sid, []).append(i)
-        self.sample_ids = list(self.sample_to_indices.keys())
-
-    def __iter__(self):
-        ids = self.sample_ids.copy()
-        if self.shuffle:
-            ids = [ids[i] for i in torch.randperm(len(ids)).tolist()]
-        for sid in ids:
-            yield self.sample_to_indices[sid]
-
-    def __len__(self) -> int:
-        return len(self.sample_ids)
 
 
 @dataclass(frozen=True)
@@ -193,8 +116,9 @@ def _build_grid_index(
     size and that contains exactly one (DEFAULT_T_START, DEFAULT_T_END) cell.
     It need not be a full rectangular mesh (e.g. a shared t_start > t_end
     triangle qualifies). Ragged samples or samples missing the default cell
-    are excluded: their per-sample deltas are undefined (scores.calc_deltas
-    raises on a NaN baseline), so they cannot take part in the ranking loss.
+    are excluded: their per-sample deltas are undefined
+    (scores.calc_normalized_deltas raises on a NaN baseline), so they cannot
+    take part in the ranking loss.
     Raises if no sample qualifies.
     """
     groups: dict[int, list[int]] = {}
@@ -240,7 +164,6 @@ def _build_grid_index(
 
 
 def create_cell_tensors(
-    predictor: SurrogateModel,
     splits_df: dict[str, tuple[pd.DataFrame, pd.DataFrame]],
     device: torch.device,
 ) -> dict[str, CellTensors]:
@@ -273,8 +196,17 @@ def create_cell_tensors(
 Dataframes.
 """
 
+def _prep_sample_id(value) -> str:
+    return f"{int(value):08d}"
+
 def load_df(metrics_csv: Path | None = None, inputs_csv: Path | None = None) -> pd.DataFrame:
-    """Load metrics, attach source-image paths and prompts, one row per cell."""
+    """Load metrics, attach source-image paths and prompts, one row per cell.
+
+    The (t_start, t_end) cells labeled in the metrics CSV define the candidate
+    grid; there is no region setting.
+    """
+    metrics_cols = [SAMPLE_ID_COL, T_START_COL, T_END_COL, T_DELTA_COL, *M_TARGET_COLS]
+    inputs_cols = [SAMPLE_ID_COL, SOURCE_PROMPT_COL, TARGET_PROMPT_COL, IMAGE_PATH_COL, MASK_PATH_COL]
 
     # Clean metrics CSV: drop rows that do not have target component metrics or t_delta.
     metrics_csv = metrics_csv or METRICS_CSV
@@ -288,12 +220,6 @@ def load_df(metrics_csv: Path | None = None, inputs_csv: Path | None = None) -> 
         if TARGET_T_DELTA not in metrics_df[T_DELTA_COL].values:
             raise ValueError(f"{TARGET_T_DELTA=} not found in {T_DELTA_COL}")
         metrics_df = metrics_df.loc[metrics_df[T_DELTA_COL] == TARGET_T_DELTA].copy()
-
-    # Restrict to the requested region of the grid before anything counts cells.
-    if CELL_REGION == "lower":
-        n_before = len(metrics_df)
-        metrics_df = metrics_df.loc[metrics_df[T_START_COL] > metrics_df[T_END_COL]].copy()
-        print(f"CELL_REGION=lower: kept {len(metrics_df)} of {n_before} cell rows (t_start > t_end).")
 
     # Keep only samples with a complete grid. A sample missing cells cannot take
     # part in the ranking loss or in T selection: its per-sample deltas are
@@ -318,7 +244,7 @@ def load_df(metrics_csv: Path | None = None, inputs_csv: Path | None = None) -> 
     inputs_df = inputs_df.dropna(subset=[MASK_PATH_COL]).reset_index(drop=True)
     if len(inputs_df) < n_before:
         print(f"Dropped {n_before - len(inputs_df)} input rows with no mask path.")
-    if inputs_df[INPUTS_COLS].isna().to_numpy().any():
+    if inputs_df[inputs_cols].isna().to_numpy().any():
         raise ValueError(f"Missing values found in {inputs_csv}.")
     inputs_df[SAMPLE_ID_COL] = inputs_df[SAMPLE_ID_COL].map(_prep_sample_id)
     for col in (IMAGE_PATH_COL, MASK_PATH_COL):
@@ -328,18 +254,19 @@ def load_df(metrics_csv: Path | None = None, inputs_csv: Path | None = None) -> 
         ]
 
     return pd.merge(
-        metrics_df.loc[:, METRICS_COLS],
-        inputs_df.loc[:, INPUTS_COLS],
+        metrics_df.loc[:, metrics_cols],
+        inputs_df.loc[:, inputs_cols],
         on=SAMPLE_ID_COL,
         how="left",
     ).reset_index(drop=True)
 
 
 def prepare_df(data_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split a loaded table into X and raw-metric y (PSNR / CLIP units)."""
+    """Split a loaded table into X and y."""
+    from scores import compute_delta_df
+
     X_df = data_df.drop(columns=list(M_TARGET_COLS)).copy()
-    y_df: pd.DataFrame = data_df.loc[:, list(M_TARGET_COLS)].copy()
-    return X_df, y_df
+    return X_df, compute_delta_df(data_df, *M_TARGET_COLS)
 
 
 def split_df(
@@ -414,45 +341,6 @@ def load_split_df(run_dir: Path) -> dict[str, pd.DataFrame]:
         split_ids = splits_df.loc[splits_df["split"] == name, SAMPLE_ID_COL]
         out[name] = df.loc[df[SAMPLE_ID_COL].isin(split_ids)].reset_index(drop=True)
     return out
-
-
-"""
-Dataloader utilities.
-"""
-
-def create_dataloaders(
-    predictor: SurrogateModel,
-    train_X: pd.DataFrame,
-    train_y: pd.DataFrame,
-    val_X: pd.DataFrame,
-    val_y: pd.DataFrame,
-    test_X: pd.DataFrame,
-    test_y: pd.DataFrame,
-    *,
-    group_train_by_sample: bool = False,
-) -> tuple[DataLoader[CellItem], DataLoader[CellItem], DataLoader[CellItem]]:
-    """Build train/val/test DataLoaders from split feature and target tables."""
-    samples = pd.concat([train_X, val_X, test_X], ignore_index=True).drop_duplicates(SAMPLE_ID_COL).sort_values(SAMPLE_ID_COL)
-    sample_ids, img_emb, mask_emb, src_emb, tar_emb = get_embeddings(samples)
-    emb_table = EmbeddingTable(img=img_emb, mask=mask_emb, src=src_emb, tar=tar_emb)
-    sample_id_to_idx = {sid: i for i, sid in enumerate(sample_ids)}
-
-    def _dataloader(X_df: pd.DataFrame, y_df: pd.DataFrame, shuffle: bool, by_sample: bool = False) -> DataLoader[CellItem]:
-        dataset = CellDataset(
-            torch.tensor([sample_id_to_idx[sid] for sid in X_df[SAMPLE_ID_COL].tolist()], dtype=torch.long),
-            emb_table,
-            torch.tensor(X_df[[T_START_COL, T_END_COL]].values, dtype=torch.float),
-            torch.tensor(y_df[list(M_TARGET_COLS)].values, dtype=torch.float),
-        )
-        if by_sample:
-            return DataLoader(dataset, batch_sampler=PerSampleBatchSampler(dataset.sample_idx, shuffle=shuffle))
-        return DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=shuffle)
-
-    return (
-        _dataloader(train_X, train_y, shuffle=True, by_sample=group_train_by_sample),
-        _dataloader(val_X, val_y, shuffle=False),
-        _dataloader(test_X, test_y, shuffle=False),
-    )
 
 
 def df_to_metric_grids(

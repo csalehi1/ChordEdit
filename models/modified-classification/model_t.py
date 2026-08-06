@@ -4,8 +4,10 @@ Timestep selector T over the discrete (t_start, t_end) grid.
 Paper: selector model T(s) -> (t*, t**). Given (img, c_src, c_tar), T predicts
 the best (t_start, t_end) by batched forward through the surrogate M_hat,
 scalarizing per-sample-normalized deltas Delta of (PSNR, CLIP) into phi
-(settings.T_TARGET_PHI), argmax, and applying a deviate-or-default gate.
-Code's t_start/t_end are the paper's (t*, t**).
+(settings.T_TARGET_PHI), argmax, and applying a deviate-or-default gate. In
+the "residual" target space M_hat predicts deviations from the train split's
+mean delta surface, which T adds back before phi (see
+_helpers.compute_mean_surface). Code's t_start/t_end are the paper's (t*, t**).
 """
 
 from __future__ import annotations
@@ -18,14 +20,44 @@ import torch
 from scipy.stats import spearmanr
 
 from model_m import SurrogateModel
-from _helpers import resolve_device, score_metric_grids
+from _helpers import (
+    MEAN_SURFACE_NAME,
+    load_mean_surface,
+    nearest_indices,
+    phi_from_delta_grids,
+    resolve_device,
+)
 from settings import (
     DEFAULT_T_END,
     DEFAULT_T_START,
-    GRID_T_END,
-    GRID_T_START,
+    M_TARGET_SPACE,
     NOISE_FLOOR_PHI,
 )
+
+
+def mean_surface_from_sidecar(
+    surface: dict,
+    t_start_values: np.ndarray,
+    t_end_values: np.ndarray,
+) -> np.ndarray:
+    """Sidecar dict -> (n_start, n_end, 2) mean true delta grid for T.
+
+    Raises when the sidecar's grid axes do not match the selector's, so a
+    stale sidecar can never be silently applied to the wrong grid.
+    """
+    cal_start = np.asarray(surface["t_start_values"], dtype=np.float64)
+    cal_end = np.asarray(surface["t_end_values"], dtype=np.float64)
+    if not (
+        len(cal_start) == len(t_start_values)
+        and len(cal_end) == len(t_end_values)
+        and np.allclose(cal_start, np.asarray(t_start_values, dtype=np.float64))
+        and np.allclose(cal_end, np.asarray(t_end_values, dtype=np.float64))
+    ):
+        raise ValueError(
+            f"mean_surface axes {cal_start.tolist()} x {cal_end.tolist()} do not match "
+            f"the selector's grid; recompute it with calibrate_t.py"
+        )
+    return np.asarray(surface["mean_true_delta"], dtype=np.float64)
 
 
 def per_image_spearman(true_grid: np.ndarray, pred_grid: np.ndarray) -> np.ndarray:
@@ -93,14 +125,8 @@ class TimestepSelection:
     clip_grid: np.ndarray
 
 
-def _nearest_indices(values: np.ndarray, targets: np.ndarray) -> np.ndarray:
-    """Index in `values` nearest each entry of `targets`, vectorized."""
-    targets = np.asarray(targets, dtype=np.float64).reshape(-1)
-    return np.abs(values[None, :] - targets[:, None]).argmin(axis=1)
-
-
 def _nearest_index(values: np.ndarray, target: float) -> int:
-    return int(_nearest_indices(values, [target])[0])
+    return int(nearest_indices(values, [target])[0])
 
 
 class TimestepSelector:
@@ -109,16 +135,25 @@ class TimestepSelector:
     def __init__(
         self,
         surrogate_model: SurrogateModel,
-        t_start_values: tuple[float, ...] | list[float] | np.ndarray = GRID_T_START,
-        t_end_values: tuple[float, ...] | list[float] | np.ndarray = GRID_T_END,
+        t_start_values: tuple[float, ...] | list[float] | np.ndarray,
+        t_end_values: tuple[float, ...] | list[float] | np.ndarray,
         default_t_start: float = DEFAULT_T_START,
         default_t_end: float = DEFAULT_T_END,
+        mean_surface: np.ndarray | None = None,
     ):
+        # The grid axes come from the data (the labeled cells of the run's
+        # dataset), typically via _helpers.timestep_pairs_from_df or the run's
+        # mean_surface sidecar; there is no package-level default grid.
+        # mean_surface = (n_start, n_end, 2) mean true delta grid from the
+        # run's sidecar (see _helpers.compute_mean_surface), added to predicted
+        # residuals in the "residual" target space; None ("delta" space)
+        # selects on the predicted deltas directly.
         self.surrogate = surrogate_model
         self.t_start_values = np.asarray(t_start_values, dtype=np.float64)
         self.t_end_values = np.asarray(t_end_values, dtype=np.float64)
         self.default_t_start = default_t_start
         self.default_t_end = default_t_end
+        self.mean_surface = None if mean_surface is None else np.asarray(mean_surface, dtype=np.float64)
         self._default_i = _nearest_index(self.t_start_values, default_t_start)
         self._default_j = _nearest_index(self.t_end_values, default_t_end)
 
@@ -179,15 +214,23 @@ class TimestepSelector:
             psnr = pred[:, 0].reshape(n1, n2)
             clip = pred[:, 1].reshape(n1, n2)
         else:
-            i = _nearest_indices(self.t_start_values, t1)
-            j = _nearest_indices(self.t_end_values, t2)
+            i = nearest_indices(self.t_start_values, t1)
+            j = nearest_indices(self.t_end_values, t2)
             psnr = np.full((n1, n2), np.nan)
             clip = np.full((n1, n2), np.nan)
             psnr[i, j] = pred[:, 0]
             clip[i, j] = pred[:, 1]
 
-        baseline_idx = self._default_i * n2 + self._default_j
-        phi = score_metric_grids(psnr[None], clip[None], baseline_idx)[0]
+        # The towers predict per-sample normalized deltas (minus the mean
+        # surface in the "residual" target space); adding the surface back
+        # gives the full deltas phi consumes, so the predicted grid is never
+        # renormalized. Axis cells the surface leaves NaN (unlabeled during
+        # training) stay NaN, so selection never picks a cell it cannot pin.
+        if self.mean_surface is not None:
+            psnr = psnr + self.mean_surface[..., 0]
+            clip = clip + self.mean_surface[..., 1]
+        deltas = np.stack([psnr, clip], axis=-1)[None]
+        phi = phi_from_delta_grids(deltas)[0]
         return TimestepGridResult(psnr, clip, phi, self.t_start_values, self.t_end_values)
 
     @torch.no_grad()
@@ -240,7 +283,13 @@ def load_timestep_selector(
     device: torch.device | str | None = None,
     gpu: int | str | None = None,
 ) -> TimestepSelector:
-    """Load M_hat checkpoint and wrap with the selector T."""
+    """Load M_hat checkpoint and wrap with the selector T.
+
+    T requires the run's mean_surface sidecar: it carries the training grid's
+    axes, and in the "residual" target space it is the constant the predicted
+    residuals deviate from. train_m.py writes it for new runs; calibrate_t.py
+    retrofits older ones.
+    """
     weights_path = Path(weights_path)
     if device is None:
         device = resolve_device(gpu)
@@ -249,4 +298,25 @@ def load_timestep_selector(
     model.regressor.load_state_dict(ckpt["regressor_state_dict"])
     model.regressor.set_target_stats(ckpt["target_mean"], ckpt["target_std"])
     model.regressor.to(device).eval()
-    return TimestepSelector(model)
+
+    surface = load_mean_surface(weights_path.parent)
+    if surface is None:
+        raise FileNotFoundError(f"Missing T mean surface: {weights_path.parent / MEAN_SURFACE_NAME}")
+    if str(surface.get("target_space")) != M_TARGET_SPACE:
+        raise ValueError(
+            f"mean_surface was saved for target_space={surface.get('target_space')!r} but the run "
+            f"settings say {M_TARGET_SPACE!r}; recompute it with calibrate_t.py"
+        )
+    # The sidecar carries the training grid's axes, so the selector's grid is
+    # the data's by construction.
+    t_start_values = np.asarray(surface["t_start_values"], dtype=np.float64)
+    t_end_values = np.asarray(surface["t_end_values"], dtype=np.float64)
+    mean_surface = (
+        mean_surface_from_sidecar(surface, t_start_values, t_end_values)
+        if M_TARGET_SPACE == "residual" else None
+    )
+    print(
+        f"Loaded mean_surface ({surface['split']} split, {surface['n_samples']} samples): "
+        f"T selects {'residual + mean surface' if mean_surface is not None else 'predicted deltas'}."
+    )
+    return TimestepSelector(model, t_start_values=t_start_values, t_end_values=t_end_values, mean_surface=mean_surface)

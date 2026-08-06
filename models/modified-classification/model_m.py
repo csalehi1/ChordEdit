@@ -36,18 +36,18 @@ from PIL import Image
 from pipeline_chord import ChordEditPipeline, DEFAULT_COMPUTE_DTYPE
 from run_pie_bench import paths_from_model_root
 
-from embeddings import mean_pool
 from settings import *
-
-
-# Upper bound on labeled grid cells the per-cell anchor can hold. Fixed so the
-# anchor buffers keep one shape and checkpoints load without special cases.
-MAX_ANCHOR_CELLS = 256
 
 
 def combine_text_embeddings(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Concat, difference, and Hadamard product of an embedding pair (4 * dim)."""
     return torch.cat([a, b, a - b, a * b], dim=-1)
+
+
+def mean_pool(last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Mask-weighted mean over the token dimension."""
+    mask = attention_mask.unsqueeze(-1).expand_as(last_hidden).float()
+    return (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
 
 
 def encode_text_pooled(pipeline: ChordEditPipeline, prompts: list[str]) -> torch.Tensor:
@@ -85,33 +85,45 @@ def encode_text_pooled(pipeline: ChordEditPipeline, prompts: list[str]) -> torch
     return mean_pool(hidden, attn_mask).to(device=device, dtype=dtype)
 
 
-def format_results(m: dict[str, float]) -> str:
-    """Fixed-width metric line so Train/Val columns stay aligned."""
-    return f"loss={m['loss']:7.4f}  " + "  ".join(
-        f"{col}: MAE={m[f'mae_{col}']:6.3f} R2={m[f'r2_{col}']:7.3f}"
+def format_metric_table(
+    rows: list[tuple[str, dict[str, float], dict[str, float] | None]],
+) -> str:
+    """Aligned split table: loss, per-target MAE/R2, and optional phi/regret."""
+
+    def _mae_r2(m: dict[str, float], col: str) -> str:
+        return f"MAE {m[f'mae_{col}']:.3f} R2 {m[f'r2_{col}']:.3f}"
+
+    def _sel(sel: dict[str, float] | None, key: str, fmt: str) -> str:
+        if not sel or key not in sel:
+            return ""
+        return format(sel[key], fmt)
+
+    split_w = max(5, *(len(name) for name, _, _ in rows))
+    loss_w = max(4, *(len(f"{m['loss']:.4f}") for _, m, _ in rows))
+    target_ws = [
+        max(len(col), *(len(_mae_r2(m, col)) for _, m, _ in rows))
         for col in M_TARGET_COLS
+    ]
+    phi_vals = [_sel(sel, "phi_spearman", ".3f") for _, _, sel in rows]
+    reg_vals = [_sel(sel, "regret_median", ".3f") for _, _, sel in rows]
+    phi_w = max(len("phi rho"), *(len(v) for v in phi_vals))
+    reg_w = max(len("regret"), *(len(v) for v in reg_vals))
+
+    header = (
+        f"{'split':<{split_w}}  {'loss':<{loss_w}}  "
+        + "  ".join(f"{col:<{w}}" for col, w in zip(M_TARGET_COLS, target_ws))
+        + f"  {'phi rho':<{phi_w}}  {'regret':<{reg_w}}"
     )
-
-
-# def format_results_table(train: dict[str, float], val: dict[str, float], phi_rho: float | None = None, regret: float | None = None) -> str:
-#     """Aligned Train/Val metrics table (header + two rows), indented 4 spaces."""
-#     short = lambda col: col.split("_")[0].upper()
-
-#     header = f"{'Split':<8}{'Loss':>9}"
-#     for col in M_TARGET_COLS:
-#         header += f"{short(col) + ' MAE':>11}{short(col) + ' R2':>10}"
-#     header += f"{'Phi-Rho':>10}{'Regret':>9}"
-
-#     def row(split: str, m: dict[str, float], rho, reg) -> str:
-#         r = f"{split:<8}{m['loss']:>9.4f}"
-#         for col in M_TARGET_COLS:
-#             r += f"{m[f'mae_{col}']:>11.3f}{m[f'r2_{col}']:>10.3f}"
-#         r += f"{f'{rho:.4f}' if rho is not None else '-':>10}"
-#         r += f"{f'{reg:.4f}' if reg is not None else '-':>9}"
-#         return r
-
-#     lines = [header, row("Train", train, None, None), row("Val", val, phi_rho, regret)]
-#     return "\n".join(f"    {line}" for line in lines)
+    lines = [f"    {header}"]
+    for (name, metrics, sel), phi, reg in zip(rows, phi_vals, reg_vals):
+        cells = "  ".join(
+            f"{_mae_r2(metrics, col):<{w}}" for col, w in zip(M_TARGET_COLS, target_ws)
+        )
+        lines.append(
+            f"    {name:<{split_w}}  {metrics['loss']:<{loss_w}.4f}  {cells}"
+            f"  {phi:<{phi_w}}  {reg:<{reg_w}}"
+        )
+    return "\n".join(lines)
 
 
 def fourier_timestep_features(t: torch.Tensor, n_freqs: int = T_FOURIER_FREQS) -> torch.Tensor:
@@ -127,17 +139,7 @@ def fourier_timestep_features(t: torch.Tensor, n_freqs: int = T_FOURIER_FREQS) -
 
 
 def pairwise_ranking_loss(pred: torch.Tensor, true: torch.Tensor, top_k: int = 0) -> torch.Tensor:
-    """Logistic pairwise loss: penalize pred ordering that disagrees with true.
-
-    Accepts (N,) for one grid or (G, N) for a batch of grids; pairs are always
-    formed within a grid, never across grids, since phi is normalized per
-    sample. NaN (unlabeled) cells take part in no pair.
-
-    top_k > 0 keeps only the pairs whose better element is among that grid's
-    top_k true cells. Regret only depends on which cell ends up on top, so
-    concentrating the loss there beats spending it on the ordering of cells
-    nobody would ever select.
-    """
+    """Logistic pairwise loss: penalize pred ordering that disagrees with true."""
     if pred.shape[-1] < 2:
         return pred.new_zeros(())
     diff_true = true.unsqueeze(-1) - true.unsqueeze(-2)
@@ -430,37 +432,9 @@ class SurrogateRegressor(nn.Module):
         self.register_buffer("target_mean", torch.zeros(n_targets))
         self.register_buffer("target_std", torch.ones(n_targets))
 
-        # Optional per-cell anchor: the train split's average standardized
-        # value at each (t_start, t_end). Adding it inside forward() turns the
-        # towers into residual predictors, so their capacity goes to what
-        # varies between images instead of re-learning the surface every image
-        # shares. Buffers are fixed-size so checkpoints always load.
-        self.register_buffer("anchor_t", torch.zeros(MAX_ANCHOR_CELLS, 2))
-        self.register_buffer("anchor_values", torch.zeros(MAX_ANCHOR_CELLS, n_targets))
-        self.register_buffer("anchor_n", torch.zeros((), dtype=torch.long))
-
     def denormalize(self, standardized: torch.Tensor) -> torch.Tensor:
         """Map standardized predictions back to raw metric units."""
         return standardized * self.target_std + self.target_mean
-
-    def set_cell_anchor(self, t_table: torch.Tensor, values: torch.Tensor) -> None:
-        """Store the standardized mean value at each grid cell."""
-        n = int(t_table.shape[0])
-        if n > MAX_ANCHOR_CELLS:
-            raise ValueError(f"{n} grid cells exceeds {MAX_ANCHOR_CELLS=}")
-        self.anchor_t.zero_()
-        self.anchor_values.zero_()
-        self.anchor_t[:n] = t_table.to(self.anchor_t)
-        self.anchor_values[:n] = values.to(self.anchor_values)
-        self.anchor_n.fill_(n)
-
-    def _anchor_for(self, t: torch.Tensor) -> torch.Tensor:
-        """Anchor value for each row of t, matched to the nearest known cell."""
-        n = int(self.anchor_n)
-        if n == 0:
-            return torch.zeros((), device=t.device, dtype=t.dtype)
-        idx = torch.cdist(t, self.anchor_t[:n]).argmin(dim=-1)
-        return self.anchor_values[:n][idx]
 
     def _get_inputs(
         self,
@@ -495,7 +469,7 @@ class SurrogateRegressor(nn.Module):
         # Predcit PSNR and CLIP from the context and timestep feature.
         psnr = self.psnr_head(self.psnr_body(torch.cat([context, t_feat], dim=-1)))
         clip = self.clip_head(self.clip_body(context, t_feat))
-        return torch.cat([psnr, clip], dim=-1) + self._anchor_for(t)
+        return torch.cat([psnr, clip], dim=-1)
 
     def forward_grid(
         self,
@@ -514,8 +488,7 @@ class SurrogateRegressor(nn.Module):
         t_feat = self.t_encoder(fourier_timestep_features(t_flat))
         psnr = self.psnr_head(self.psnr_body(torch.cat([context, t_feat], dim=-1)))
         clip = self.clip_head(self.clip_body(context, t_feat))
-        out = torch.cat([psnr, clip], dim=-1) + self._anchor_for(t_flat)
-        return out.reshape(g, c, -1)
+        return torch.cat([psnr, clip], dim=-1).reshape(g, c, -1)
 
 
 class SurrogateModel(nn.Module):

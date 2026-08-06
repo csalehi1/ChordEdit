@@ -9,7 +9,7 @@ held-out samples with full grids, and reports selection metrics
 Run after train_m.py:
 
     python train_t.py
-    python train_t.py --run-dir outputs/sdturbo_random10/20260101_120000
+    python train_t.py --run-dir runs/UltraEdit_Region_10000/20260101_120000
 """
 
 from __future__ import annotations
@@ -47,10 +47,11 @@ def parse_args() -> argparse.Namespace:
 # Resolve the run's settings snapshot before importing modules that bind
 # settings at import time (load_run_settings raises otherwise; see _helpers).
 _ARGS = parse_args()
+
 # The live settings are only needed to find the newest run; an explicit
 # --run-dir is self-contained (its snapshot pins the config), so skip loading
 # them and the prompts they carry.
-RUN_DIR = resolve_run_dir(load_live_settings().OUTPUTS_DIR if _ARGS.run_dir is None else None, _ARGS.run_dir)
+RUN_DIR = resolve_run_dir(load_live_settings().RUNS_DIR if _ARGS.run_dir is None else None, _ARGS.run_dir)
 load_run_settings(RUN_DIR)
 
 from _data import ID_TO_SPLIT_NAME, df_to_metric_grids, load_split_df
@@ -84,10 +85,7 @@ def evaluate(
     for sid, group in test_df.groupby("sample_id"):
         pairs = set(zip(group["t_start"].astype(float), group["t_end"].astype(float)))
         if pairs != expected_pairs:
-            raise ValueError(
-                f"sample {sid} has {len(pairs)} labeled (t_start, t_end) pairs, "
-                f"expected the shared set of {len(expected_pairs)}"
-            )
+            raise ValueError(f"Unexpected shape mismatch: {len(pairs)} != {len(expected_pairs)}")
 
     # Load the model and timestep predictor.
     device = resolve_device(gpu)
@@ -98,13 +96,30 @@ def evaluate(
     model.regressor.set_target_stats(ckpt["target_mean"], ckpt["target_std"])
     model.regressor.to(device).eval()
 
-    # Load the timestep selector.
-    t_selector = TimestepSelector(model, t_start_values=t_start_values, t_end_values=t_end_values)
+    # Load the timestep selector. T requires the run's mean_surface sidecar;
+    # train_m.py writes it for new runs, calibrate_t.py retrofits older ones.
+    # In the "residual" target space the surface is added back to predicted
+    # residuals before phi; in "delta" space no offset is applied.
+    from _helpers import MEAN_SURFACE_NAME, load_mean_surface
+    from model_t import mean_surface_from_sidecar
+
+    surface = load_mean_surface(run_dir)
+    if surface is None:
+        raise FileNotFoundError(f"Missing T mean surface: {run_dir / MEAN_SURFACE_NAME}")
+    mean_surface = (
+        mean_surface_from_sidecar(surface, np.asarray(t_start_values), np.asarray(t_end_values))
+        if M_TARGET_SPACE == "residual" else None
+    )
+    print(
+        f"Loaded mean_surface ({surface['split']} split, {surface['n_samples']} samples): "
+        f"T selects {'residual + mean surface' if mean_surface is not None else 'predicted deltas'}."
+    )
+    t_selector = TimestepSelector(model, t_start_values=t_start_values, t_end_values=t_end_values, mean_surface=mean_surface)
     default_i = t_selector._default_i
     default_j = t_selector._default_j
     nf = NOISE_FLOOR_PHI if noise_floor is None else noise_floor
 
-    emb = get_embeddings_by_sample(test_df.drop_duplicates("sample_id"), model, device)
+    emb = get_embeddings_by_sample(test_df.drop_duplicates("sample_id"), device)
     model.release_encoders()
     true_psnr, _ = df_to_metric_grids(test_df, sample_ids, t_start_values, t_end_values, PSNR_COL)
     true_clip, _ = df_to_metric_grids(test_df, sample_ids, t_start_values, t_end_values, CLIP_COL)

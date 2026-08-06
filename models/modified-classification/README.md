@@ -92,7 +92,7 @@ Pack scattered per-sample embedding `.pt` files into a packed table at `.cache/p
 python train_m.py --skip-model  # CPU-only; builds the caches, then exits.
 ```
 
-Encoder behavior always matches the ChordEdit model type: for `sd` models the stored text sequences are collapsed with the same mask-weighted mean pooling as encoding (tokenizer-only, no weights); `sdxl` scattered files must already store `text_encoder_2` pooled embeds; `flux` raises `NotImplementedError`. Each packed cache carries a `meta` dict (model, pipeline type, pooling, dims, provenance).
+Scattered files live under `EMBEDDINGS_DIR/annotation_embeddings/<sample_id>/` as packing-ready flat float32 vectors (`image.pt`, `mask.pt`, `source.pt`, `target.pt`), so packing is a pure stack. `mask.pt` may not exist yet for every sample while the annotation pipeline backfills it; those samples pack as zero mask rows, and the cache repacks itself once the files appear. Each packed cache carries a `meta` dict (model, pipeline type, layout, dims, provenance).
 
 Later `train_m` and eval reuse the packed cache. Encoders are inherited from the ChordEdit pipeline and are never trainable. If no packed or scattered cache can cover the request, `embeddings.get_embeddings` raises.
 
@@ -102,7 +102,9 @@ Later `train_m` and eval reuse the packed cache. Encoders are inherited from the
 python train_m.py
 ```
 
-Writes a run to `outputs/<dataset>/` (named by `RUN_NAME`, else a timestamp) with `regressor_weights.pt`, the `settings.json` it used, and train/val/test splits.
+Writes a run to `runs/<dataset>/` (named by `RUN_NAME`, else a timestamp) with `regressor_weights.pt`, the `settings.json` it used, train/val/test splits, and `mean_surface.pt` (the train split's mean true delta surface, computed from the labels alone).
+
+Targets are per-sample normalized deltas Delta. With `M_TARGET_SPACE="residual"` (recommended) the towers regress each image's deviation from the train mean surface and T adds the surface back at selection time, so an uninformative prediction falls back to the population-best cell instead of never deviating. `"delta"` regresses the full deltas with no offset (the uncentered comparison arm). Runs from before this patch can be retrofitted with `python calibrate_t.py --run-dir <run_dir>`.
 
 ### 2. Evaluate
 
@@ -116,7 +118,7 @@ Run after M^ training completes.
 
 ```bash
 python train_t.py
-# optional: python train_t.py --run-dir outputs/UltraEdit_Region_100/<timestamp> --gpu 1
+# optional: python train_t.py --run-dir runs/UltraEdit_Region_100/<timestamp> --gpu 1
 ```
 
 Reports regret, Spearman correlation, and deviate-gate precision/recall on the test split. Saves `t_train_metrics.json`, `t_test_selections.json`, and `id_to_predictions_<commit>.csv` (`sample_id`, `pred_t_start`, `pred_t_end`) tagged with the commit that produced it.

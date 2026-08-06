@@ -36,15 +36,20 @@ from _data import (
     save_split_df,
     split_df,
 )
-from _helpers import save_run_settings, t_target_phi_values
-from model_m import SurrogateModel, format_results, pairwise_ranking_loss
+from _helpers import (
+    calc_mean_surface,
+    gather_at_pairs,
+    calc_phi,
+    save_mean_surface,
+    save_run_settings,
+)
+from model_m import SurrogateModel, format_metric_table, pairwise_ranking_loss
 from settings import *
 
 
 def parse_args() -> argparse.Namespace:
     # Argument parser for the command line.
     parser = argparse.ArgumentParser(description="Train metric surrogate M")
-    parser.add_argument("--skip-model", action="store_true")
     # Read off argv by settings.py at import time, before this parser runs;
     # declared here so it shows up in --help and is not rejected as unknown.
     parser.add_argument("--settings-path", default=None, help="config file to use instead of ./settings.json")
@@ -60,7 +65,11 @@ def evaluate(
     cells: CellTensors,
     device: torch.device | None = None,
 ) -> dict[str, float]:
-    """Per-target MAE/RMSE/R^2 in raw metric units, plus z-scored MSE loss."""
+    """Per-target MAE/RMSE/R^2 in target units, plus z-scored MSE loss.
+
+    Target units are normalized deltas, minus the train mean surface when
+    M_TARGET_SPACE is "residual" - not raw PSNR/CLIP.
+    """
 
     # Set the model to evaluation mode.
     model.regressor.eval()
@@ -98,6 +107,7 @@ def evaluate(
 def evaluate_selection(
     model: SurrogateModel,
     cells: CellTensors,
+    offset: torch.Tensor,
     chunk_grids: int = 256,
 ) -> dict[str, float]:
     """Selection-side metrics on a split's grids: phi rank agreement and regret.
@@ -105,6 +115,11 @@ def evaluate_selection(
     These are what T actually consumes, so they are the checkpoint signal:
     the summed z-scored MSE is dominated by PSNR and can pick an epoch whose
     CLIP head has collapsed.
+
+    offset: the train split's mean true delta surface at the split's sorted
+    per-grid cell order, flat (n_cells, C) - zeros in the "delta" target
+    space. Added to both the (residual) targets and predictions so phi
+    consumes full deltas, exactly as T does at selection time.
     """
 
     def _row_ranks(x: torch.Tensor) -> torch.Tensor:
@@ -131,27 +146,35 @@ def evaluate_selection(
         return num / den.clamp_min(1e-12)
 
     model.regressor.eval()
-    true_parts, pred_parts = [], []
+    offset = offset.double().to(cells.t.device)
+    true_delta_parts, pred_delta_parts, base_parts = [], [], []
     for k in range(0, cells.n_grids, chunk_grids):
         sel = torch.arange(k, min(k + chunk_grids, cells.n_grids), device=cells.t.device)
         img, mask, src, tar, t, y = cells.gather_grids(sel)
-        out = model.regressor.denormalize(model.regressor.forward_grid(img, mask, src, tar, t))
-        base = cells.grid_baseline[sel]
-        true_parts.append(t_target_phi_values(y.double(), base))
-        pred_parts.append(t_target_phi_values(out.double(), base))
+        out = model.regressor.denormalize(model.regressor.forward_grid(img, mask, src, tar, t)).double()
+        pred_delta_parts.append(out + offset)
+        true_delta_parts.append(y.double() + offset)
+        base_parts.append(cells.grid_baseline[sel])
 
-    true_phi = torch.cat(true_parts)
-    pred_phi = torch.cat(pred_parts)
+    true_deltas = torch.cat(true_delta_parts)
+    pred_deltas = torch.cat(pred_delta_parts)
+    baseline = torch.cat(base_parts)
+    true_phi = calc_phi(true_deltas)
+    pred_phi = calc_phi(pred_deltas)
+
     rho = _row_spearman(true_phi, pred_phi)
     rho = rho[~rho.isnan()]
     chosen = pred_phi.argmax(dim=-1, keepdim=True)
-    reg = true_phi.max(dim=-1).values - true_phi.gather(-1, chosen).squeeze(-1)
+    gain = true_phi.gather(-1, chosen).squeeze(-1)  # phi(default) == 0, so this is gain over the default
+    reg = true_phi.max(dim=-1).values - gain
     # Use quantile(0.5) and not median() because torch's median takes the
     # lower of the two middle values, while numpy (and so train_t.py) averages them.
     return {
         "phi_spearman": float(rho.quantile(0.5).item()) if rho.numel() else float("nan"),
         "regret_median": float(reg.quantile(0.5).item()),
         "regret_p90": float(reg.quantile(0.9).item()),
+        "gain_mean": float(gain.mean().item()),
+        "deviate_rate": float((chosen.squeeze(-1) != baseline).double().mean().item()),
     }
 
 
@@ -163,58 +186,58 @@ def train(
     val_y: pd.DataFrame,
     test_X: pd.DataFrame,
     test_y: pd.DataFrame,
-    skip_model: bool = False,
 ) -> Path:
     """Train the metric surrogate model and save run artifacts."""
 
     # Create run directory to save information to.
     run_name = RUN_NAME or datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = OUTPUTS_DIR / run_name
+    run_dir = RUNS_DIR / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     save_run_settings(run_dir)
+    print(f"Saved settings")
 
     # Build device-resident cell tensors for the train, val, and test sets.
     device = next(model.regressor.parameters()).device
     splits_df = {"train": (train_X, train_y), "val": (val_X, val_y), "test": (test_X, test_y)}
-    splits_cells = create_cell_tensors(model, splits_df, device)
+    splits_cells = create_cell_tensors(splits_df, device)
     train_cells, val_cells, test_cells = splits_cells["train"], splits_cells["val"], splits_cells["test"]
-    if skip_model:
-        return run_dir
 
-    # Whole-grid batches only: ranking / selection / cell-anchor all need them.
-    use_ranking = RANKING_LOSS_WEIGHT > 0
+    # Calculate and save the train split's true mean delta surface. 
+    # "residual" space predicts deviations from the this surface.
+    surface = calc_mean_surface(train_cells)
+    surface_path = save_mean_surface(run_dir, surface)
+    print(f"Saved {surface_path.stem}")
 
-    # Record encoder dimensions, then free the (always frozen) VAE/text pipeline.
+    # Per-split grid-ordered offsets for phi (0s in "delta" space).
+    offsets: dict[str, torch.Tensor] = {}
+    for name, cells in splits_cells.items():
+        if M_TARGET_SPACE == "residual":
+            # Anchor each cell on the train split's mean value, so the towers
+            # only have to predict how an image deviates from the mean surface. 
+            offsets[name] = gather_at_pairs(surface, cells.t[cells.grid_rows[0]])
+            cells.y.sub_(gather_at_pairs(surface, cells.t).to(cells.y))
+        elif M_TARGET_SPACE == "delta":
+            offsets[name] = torch.zeros(cells.n_cells, cells.y.shape[1], dtype=torch.float64)
+        else:
+            raise ValueError(f"Unknown {M_TARGET_SPACE=}")
+
     img_dim, text_dim = model.encoder_img_dim, model.encoder_text_dim
     model.release_encoders()
+    y_train = train_cells.y.detach().float().cpu()
 
-    target_cols = list(M_TARGET_COLS)
-    y_train = torch.tensor(train_y[target_cols].values, dtype=torch.float)
-
-    # Normalize the targets if specified.
     if NORMALIZE_TARGETS:
         # Store train mean/std so MSE is computed in z-scored space.
         model.regressor.set_target_stats(y_train.mean(0), y_train.std(0))
     print(
         "Target columns (train):\n"
-        f"  {'Target':<20} {'Mean':>8} {'Std':>8}\n"
+        f"  {'Target':<38} {'Mean':>8} {'Std':>8}\n"
         + "\n".join(
-            f"  {c:<20} "
+            f"  {c:<38} "
             f"{model.regressor.target_mean[i]:8.3f} "
             f"{model.regressor.target_std[i]:8.3f}"
             for i, c in enumerate(M_TARGET_COLS)
         )
     )
-
-    # Anchor each cell on the train split's mean standardized value, so the
-    # towers only have to predict how an image deviates from the shared
-    # surface. Computed after the target stats, in the same z-scored space.
-    if USE_CELL_ANCHOR:
-        anchor_t = train_cells.t[train_cells.grid_rows[0]]
-        y_grids = train_cells.y[train_cells.grid_rows]
-        anchor_values = ((y_grids - model.regressor.target_mean) / model.regressor.target_std).mean(dim=0)
-        model.regressor.set_cell_anchor(anchor_t, anchor_values)
-        print(f"Cell anchor set on {anchor_t.shape[0]} grid cells.")
 
     # Initialize the optimizer and (optional) cosine LR schedule.
     optimizer = torch.optim.AdamW(model.regressor.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
@@ -223,6 +246,7 @@ def train(
     y_mean, y_std = model.regressor.target_mean, model.regressor.target_std
     loss_weights = torch.tensor([PSNR_LOSS_WEIGHT, CLIP_LOSS_WEIGHT], dtype=torch.float, device=device)
     loss_weights = loss_weights / loss_weights.mean()
+    train_offset = offsets["train"].to(device=device, dtype=torch.float)
 
     # Train the model.
     weights_out = run_dir / "regressor_weights.pt"
@@ -238,24 +262,26 @@ def train(
     for epoch in range(1, EPOCHS + 1):
 
         epoch_start = time.perf_counter()
-        # Set the model to training mode.
         model.regressor.train()
 
-        for (img, mask, src, tar, t, y), baseline_idx in train_cells.iter_grids(grids_per_batch, shuffle=True):
+        for (img, mask, src, tar, t, y), _ in train_cells.iter_grids(grids_per_batch, shuffle=True):
 
             # Predict the metric values for the timestep grid.
             out = model.regressor.forward_grid(img, mask, src, tar, t)
 
-            # Standardize targets in z-scored space for MSE loss, weighting
-            # the per-target terms so one head cannot dominate the gradient.
+            # Weighted MSE loss on normalized targets.
+            # TODO: Do we need different behavior if NORMALIZE_TARGETS=True?
             se = (out - (y - y_mean) / y_std) ** 2
             loss = (se * loss_weights).mean()
 
             # If specified, use per-sample ranking loss.
-            if use_ranking:
+            if RANKING_LOSS_WEIGHT > 0:
                 y_hat = model.regressor.denormalize(out)
-                true_phi = t_target_phi_values(y, baseline_idx)
-                pred_phi = t_target_phi_values(y_hat, baseline_idx)
+                # Adding the train offset (zeros in the "delta" target space)
+                # turns (residual) targets and predictions into the full
+                # deltas phi consumes; the predicted grid is never normalized.
+                true_phi = calc_phi(y + train_offset)
+                pred_phi = calc_phi(y_hat + train_offset)
                 loss = loss + RANKING_LOSS_WEIGHT * pairwise_ranking_loss(pred_phi, true_phi, top_k=RANKING_TOP_K)
 
             # Backpropagate the training loss.
@@ -275,28 +301,30 @@ def train(
         if scheduler is not None:
             scheduler.step()
 
-        # Evaluate (and checkpoint) the averaged weights when EMA is on.
+        # Evaluate the averaged weights when EMA is on.
         live_state = None
         if ema_state is not None:
             live_state = {k: v.detach().clone() for k, v in model.regressor.state_dict().items()}
             model.regressor.load_state_dict(ema_state)
 
-        # Find val metrics every epoch and save best weights.
         val_results = evaluate(model, val_cells, device)
-        val_sel = evaluate_selection(model, val_cells)
+        val_sel = evaluate_selection(model, val_cells, offsets["val"])
 
         if CKPT_METRIC == "val_phi_spearman":
             score = val_sel.get("phi_spearman", float("nan"))
         elif CKPT_METRIC == "val_regret":
             score = -val_sel.get("regret_median", float("nan"))
+        elif CKPT_METRIC == "val_gain_mean":
+            score = val_sel.get("gain_mean", float("nan"))
         else:
             score = -val_results["loss"]
 
+        # Save the best weights if the checkpoint metric is improved.
         improved = score > best_score
         if improved:
             best_score, best_epoch, since_improved = score, epoch, 0
             best_val_loss = val_results["loss"]
-            torch.save( {
+            torch.save({
                 "regressor_state_dict": model.regressor.state_dict(),
                 "target_mean": model.regressor.target_mean.cpu(),
                 "target_std": model.regressor.target_std.cpu(),
@@ -307,22 +335,25 @@ def train(
         else:
             since_improved += 1
 
-
         # Evaluate the model on the train and val sets.
         train_results = evaluate(model, train_cells, device)
         if live_state is not None:
             model.regressor.load_state_dict(live_state)
-        history.append({"epoch": epoch, "train": train_results, "val": val_results, "val_selection": val_sel})
-        sel_str = (
-            f"  |  phi rho={val_sel['phi_spearman']:.3f} regret={val_sel['regret_median']:.4f}"
-            if val_sel else ""
-        )
+        history.append({
+            "epoch": epoch, 
+            "train": train_results, 
+            "val": val_results, 
+            "val_selection": val_sel
+        })
         elapsed = time.perf_counter() - epoch_start
         print(
-            f"Epoch [{epoch:03d}/{EPOCHS:03d}] | {n_cells} cells ({n_samples} samples) in {elapsed:.2f}s"
-            f"\n    {'Train:':<6} {format_results(train_results)}"
-            f"\n    {'Val:':<6} {format_results(val_results)}{sel_str}"
+            f"Epoch [{epoch:03d}/{EPOCHS:03d}]: {n_cells} cells ({n_samples} samples) in {elapsed:.2f}s"
             + ("  *" if improved else "")
+            + "\n"
+            + format_metric_table([
+                ("train", train_results, None),
+                ("val", val_results, val_sel),
+            ])
         )
 
         # Early stop if the checkpoint metric has stalled.
@@ -333,14 +364,10 @@ def train(
     # Load the best weights and evaluate the model on the test set.
     checkpoint = torch.load(weights_out, map_location=device, weights_only=False)
     model.regressor.load_state_dict(checkpoint["regressor_state_dict"])
+
     results = evaluate(model, test_cells, device)
-    test_sel = evaluate_selection(model, test_cells)
-    print(f"\n    {'Test:':<6} {format_results(results)}")
-    if test_sel:
-        print(
-            f"    {'':<6} phi rho={test_sel['phi_spearman']:.3f} "
-            f"regret median={test_sel['regret_median']:.4f} p90={test_sel['regret_p90']:.4f}"
-        )
+    test_sel = evaluate_selection(model, test_cells, offsets["test"])
+    print("\n" + format_metric_table([("test", results, test_sel)]))
 
     # Save the splits and metrics.
     save_split_df(train_X, val_X, test_X, run_dir)
@@ -390,8 +417,7 @@ def main() -> None:
         val_X,
         val_y,
         test_X,
-        test_y,
-        skip_model=args.skip_model,
+        test_y
     )
     print(f"\nSaved to {run_dir.resolve()}")
 
