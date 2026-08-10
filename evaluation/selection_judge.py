@@ -1,4 +1,3 @@
-import json
 import re
 from pathlib import Path
 
@@ -41,6 +40,7 @@ class QwenSelectionJudge(torch.nn.Module):
     def __init__(
         self, model_id="Qwen/Qwen3-VL-8B-Instruct",
         max_new_tokens=700, repetition_penalty=1.0, enable_thinking=False,
+        device_map={"": 0},
     ):
         super().__init__()
 
@@ -52,7 +52,8 @@ class QwenSelectionJudge(torch.nn.Module):
         self.model = AutoModelForImageTextToText.from_pretrained(
             model_id,
             dtype="auto",
-            device_map="auto",
+            device_map=device_map,
+            attn_implementation="eager",
         )
 
         self.processor = AutoProcessor.from_pretrained(model_id)
@@ -101,38 +102,6 @@ class QwenSelectionJudge(torch.nn.Module):
         return output_texts
 
     @staticmethod
-    def _extract_json_block(text):
-        """Same fallback strategies as the other judges in this package
-        (json fence, bare fence, brace span, raw text), each retried with
-        newlines stripped in case a value has an unescaped line break."""
-        candidates = []
-
-        for pattern in (r"```json\s*(\{.*?\})\s*```", r"```\s*(\{.*?\})\s*```"):
-            match = re.search(pattern, text, re.DOTALL)
-            if match:
-                candidates.append(match.group(1))
-
-        start_idx = text.find("{")
-        end_idx = text.rfind("}") + 1
-        if start_idx != -1 and end_idx != 0:
-            candidates.append(text[start_idx:end_idx])
-
-        candidates.append(text)
-
-        for candidate in candidates:
-            try:
-                return json.loads(candidate)
-            except (json.JSONDecodeError, ValueError):
-                pass
-            cleaned = candidate.replace("\n", " ").replace("\r", " ")
-            try:
-                return json.loads(cleaned)
-            except (json.JSONDecodeError, ValueError):
-                continue
-
-        return None
-
-    @staticmethod
     def _nan_result():
         return {"best_index": "nan", "reasoning": ""}
 
@@ -173,25 +142,23 @@ class QwenSelectionJudge(torch.nn.Module):
             answers = self._run_batch(items)
         except Exception as e:
             print(f"An error occurred during batched generation: {e}")
+            torch.cuda.empty_cache()
             return [self._nan_result() for _ in items]
 
         results = []
         for answer, (_, _, candidates) in zip(answers, items):
-            parsed = self._extract_json_block(answer)
-            if not parsed:
-                print(f"Could not parse selection JSON out of: {answer!r}")
+            match = re.search(r"(?<!\d)\d{1,2}(?!\d)", answer)
+            if not match:
+                print(f"Could not parse a bare index out of: {answer!r}")
                 results.append(self._nan_result())
                 continue
 
-            try:
-                best_index = int(parsed.get("best_index"))
-            except (TypeError, ValueError):
-                best_index = "nan"
-            if best_index != "nan" and not (1 <= best_index <= len(candidates)):
+            best_index = int(match.group())
+            if not (1 <= best_index <= len(candidates)):
                 print(f"best_index {best_index} out of range for {len(candidates)} candidates: {answer!r}")
                 best_index = "nan"
 
-            results.append({"best_index": best_index, "reasoning": parsed.get("reasoning", "")})
+            results.append({"best_index": best_index, "reasoning": ""})
         return results
 
     @staticmethod

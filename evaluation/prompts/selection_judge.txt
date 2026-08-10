@@ -9,7 +9,5 @@ Select the single best candidate by balancing three considerations together -- n
 2. Edit quality: how realistic, natural, and well-executed the edit itself looks (no artifacts, distortions, or blending errors).
 3. Instruction alignment: how well the edit matches what was requested.
 
-Respond with a JSON object in exactly this format:
-{"best_index": <integer from 1 to [n_candidates]>, "reasoning": "<justification, no more than 20 words>"}
-
-Output only the JSON object, nothing else.
+Respond with only the integer index (from 1 to [n_candidates]) of the best
+candidate. Output nothing else -- no words, no punctuation, just the number.

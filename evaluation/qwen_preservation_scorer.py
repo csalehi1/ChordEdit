@@ -1,7 +1,7 @@
 import re
 
 import torch
-from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+from transformers import AutoModelForImageTextToText, AutoProcessor
 
 
 class QwenPreservationScorer(torch.nn.Module):
@@ -17,13 +17,21 @@ class QwenPreservationScorer(torch.nn.Module):
         "mostly changed, and 10 means everything except the requested edit is almost perfectly preserved."
     )
 
-    def __init__(self, model_id="Qwen/Qwen3-VL-8B-Instruct"):
+    def __init__(
+        self, model_id="Qwen/Qwen3-VL-8B-Instruct",
+        max_new_tokens=128, repetition_penalty=1.0, enable_thinking=False,
+    ):
         super().__init__()
 
-        self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+        self.max_new_tokens = max_new_tokens
+        self.repetition_penalty = repetition_penalty
+        self.enable_thinking = enable_thinking
+
+        self.model = AutoModelForImageTextToText.from_pretrained(
             model_id,
             dtype="auto",
-            device_map="auto",
+            device_map={"": 0},
+            attn_implementation="eager",
         )
 
         self.processor = AutoProcessor.from_pretrained(model_id)
@@ -57,11 +65,14 @@ class QwenPreservationScorer(torch.nn.Module):
             return_dict=True,
             return_tensors="pt",
             padding=True,
+            enable_thinking=self.enable_thinking,
         )
         inputs = inputs.to(self.model.device)
 
         # Inference: Generation of the output
-        generated_ids = self.model.generate(**inputs, max_new_tokens=128, do_sample=False)
+        generated_ids = self.model.generate(
+            **inputs, max_new_tokens=self.max_new_tokens, repetition_penalty=self.repetition_penalty, do_sample=False,
+        )
         generated_ids_trimmed = [
             out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
@@ -101,6 +112,7 @@ class QwenPreservationScorer(torch.nn.Module):
             answers = self._run_batch(items)
         except Exception as e:
             print(f"An error occurred during batched generation: {e}")
+            torch.cuda.empty_cache()
             return ["nan"] * len(items)
 
         scores = []

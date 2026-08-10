@@ -20,8 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 from evaluation.selection_judge import QwenSelectionJudge
 
-DATA_ROOT = Path("/shared/ssd_30T/zarageddes/ultraedit_100_v2_dataroot")
-MAPPING_PATH = DATA_ROOT / "mapping_file.json"
+DEFAULT_DATA_ROOT = Path("/shared/ssd_30T/zarageddes/ultraedit_100_v2_dataroot")
 
 T_VALUES = [round(0.1 * i, 1) for i in range(11)]
 BATCH_SIZE = 4  # smaller than the 8B-model's 8 -- 27B sharded across 2 GPUs has less headroom per call
@@ -48,15 +47,20 @@ def load_cell(sample_id, ts, te):
 
 
 def main():
+    global DATA_ROOT
     ap = argparse.ArgumentParser()
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--nshards", type=int, default=1)
     ap.add_argument("--out", required=True)
     ap.add_argument("--model-id", default="Qwen/Qwen-Image-Bench")
     ap.add_argument("--max-samples", type=int, default=None)
+    ap.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
+    ap.add_argument("--mapping-path", type=Path, default=None)
     args = ap.parse_args()
 
-    mapping = json.loads(MAPPING_PATH.read_text())
+    DATA_ROOT = args.data_root
+    mapping_path = args.mapping_path or (DATA_ROOT / "mapping_file.json")
+    mapping = json.loads(mapping_path.read_text())
     all_ids = sorted(mapping.keys())
     if args.max_samples is not None:
         all_ids = all_ids[:args.max_samples]
@@ -71,7 +75,11 @@ def main():
                 done.add(row["sample_id"])
         print(f"resuming: {len(done)} samples already done", flush=True)
 
-    write_header = not out_path.exists()
+    # A crashed prior attempt may have created an empty placeholder file
+    # via open(path, "a") before ever writing a row (e.g. crashing during
+    # model load) -- exists() alone would then permanently skip the header
+    # on every retry, even though real rows get appended afterward.
+    write_header = not out_path.exists() or out_path.stat().st_size == 0
     fout = open(out_path, "a", newline="")
     writer = csv.writer(fout)
     if write_header:
@@ -106,9 +114,9 @@ def main():
 
     judge = QwenSelectionJudge(
         model_id=args.model_id,
-        max_new_tokens=4096, repetition_penalty=1.05, enable_thinking=True,
+        max_new_tokens=4096, repetition_penalty=1.05, enable_thinking=False,
     )
-    print(f"Model device map: {judge.model.hf_device_map}", flush=True)
+    print(f"Model device map: {getattr(judge.model, 'hf_device_map', judge.model.device)}", flush=True)
     results = judge.judge_tournament_batch(samples, batch_size=BATCH_SIZE, on_progress=on_progress)
 
     for sid, sample, result in zip(sids, samples, results):
