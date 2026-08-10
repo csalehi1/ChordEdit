@@ -73,9 +73,14 @@ def _u_estimate_delta0(x_anchor, src_embed, edit_embed, noise, t_s: float):
 
 
 def _u_estimate(x_anchor, src_embed, edit_embed, noise, t_s: float, delta: float):
-    """Interrupt paper's pipeline_chord.py:_u_estimate with a delta==0 fast path."""
+    """Interrupt paper's pipeline_chord.py:_u_estimate with a delta==0 fast path.
+
+    The fast path assumes a DDPM alpha/sigma schedule (via _get_alpha_sigma), which
+    doesn't hold for FLUX's flow-matching scheduler. Flux always defers to the
+    pipeline's own (flux-aware) _u_estimate.
+    """
     pipeline = _get_pipeline()
-    if delta == 0.0:
+    if delta == 0.0 and pipeline._model_family != "flux":
         return _u_estimate_delta0(x_anchor, src_embed, edit_embed, noise, t_s)
     return pipeline._u_estimate(x_anchor, src_embed, edit_embed, noise, t_s, delta)
 

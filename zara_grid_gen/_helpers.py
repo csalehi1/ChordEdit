@@ -155,24 +155,32 @@ def load_pipeline(
     device: str,
     base_config: Dict[str, Any],
     component_subdirs: Dict[str, str],
+    model_type: str = "sd",
 ) -> Any:
-    """Load fp32 SD ChordEditPipeline for grid generation (default edit mode)."""
+    """Load ChordEditPipeline for grid generation (default edit mode). fp32 for SD, bf16 for FLUX."""
     import torch
     from pipeline_chord import ChordEditPipeline
 
     model_path = Path(model_root).expanduser().resolve()
-    component_paths = {
-        key: str((model_path / sub).resolve()) for key, sub in component_subdirs.items()
-    }
+    if model_type == "flux":
+        component_paths = {"model_root": str(model_path)}
+        torch_dtype = torch.bfloat16
+    else:
+        component_paths = {
+            key: str((model_path / sub).resolve()) for key, sub in component_subdirs.items()
+        }
+        torch_dtype = torch.float32
+    # SDXL is native at 1024; cells are downsized to settings.IMAGE_SIZE on save (run_shard).
+    generation_image_size = 1024 if model_type == "sdxl" else settings.IMAGE_SIZE
     return ChordEditPipeline.from_local_weights(
         component_paths=component_paths,
-        model_type="sd",
+        model_type=model_type,
         default_edit_config=base_config,
         device=device,
-        torch_dtype=torch.float32,
-        image_size=settings.IMAGE_SIZE,
+        torch_dtype=torch_dtype,
+        image_size=generation_image_size,
         use_center_crop=True,
-        compute_dtype=torch.float32,
+        compute_dtype=torch_dtype,
         use_attention_mask=False,
         use_safety_checker=False,
         chord_edit_mode="default",

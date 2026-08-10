@@ -49,6 +49,11 @@ SD_COMPONENT_SUBDIRS = {
     "tokenizer_path": "tokenizer",
     "vae_path": "vae",
 }
+# SDXL adds a second text encoder/tokenizer on top of the SD subdirs.
+SDXL_EXTRA_COMPONENT_SUBDIRS = {
+    "text_encoder_2_path": "text_encoder_2",
+    "tokenizer_2_path": "tokenizer_2",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--model-root", required=True)
+    parser.add_argument("--model-type", choices=["sd", "sdxl", "flux"], default="sd")
     parser.add_argument("--gpus", nargs="+", type=int, default=[0])
     parser.add_argument("--max-samples", type=int, default=None)
     # Optional arguments: also write grid_clean.png overviews and only generate cells where t_start > t_end.
@@ -69,6 +75,7 @@ def run_shard(
     data_root: Path,
     output_root: Path,
     model_root: str,
+    model_type: str,
     max_samples: int | None,
     write_grids: bool,
     diagonal_optimization: bool,
@@ -115,7 +122,10 @@ def run_shard(
     )
 
     # After CUDA_VISIBLE_DEVICES pinning, the only visible device is cuda:0.
-    bind_pipeline(load_pipeline(model_root, "cuda:0", base_config, SD_COMPONENT_SUBDIRS))
+    component_subdirs = (
+        {**SD_COMPONENT_SUBDIRS, **SDXL_EXTRA_COMPONENT_SUBDIRS} if model_type == "sdxl" else SD_COMPONENT_SUBDIRS
+    )
+    bind_pipeline(load_pipeline(model_root, "cuda:0", base_config, component_subdirs, model_type=model_type))
 
     # Generate cells for each sample into {output_root}/{sample_id}/cells/.
     for index, (sample_id, meta) in enumerate(samples, start=1):
@@ -216,6 +226,7 @@ def main() -> None:
         data_root=data_root,
         output_root=output_root,
         model_root=args.model_root,
+        model_type=args.model_type,
         max_samples=args.max_samples,
         write_grids=args.add_grids,
         diagonal_optimization=args.diagonal_optimization,

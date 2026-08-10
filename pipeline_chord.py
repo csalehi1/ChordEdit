@@ -6,8 +6,9 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
+import os
 from PIL import Image, ImageOps
-from diffusers import DDPMScheduler, AutoencoderKL, UNet2DConditionModel
+from diffusers import DDPMScheduler, AutoencoderKL, UNet2DConditionModel, FluxPipeline
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from diffusers.utils import BaseOutput
@@ -38,6 +39,7 @@ class _PromptCondition:
     hidden_states: torch.Tensor
     pooled_embeds: Optional[torch.Tensor] = None
     time_ids: Optional[torch.Tensor] = None
+    txt_ids: Optional[torch.Tensor] = None
 
 
 class _CenterSquareCropTransform:
@@ -73,13 +75,15 @@ class ChordEditPipeline(DiffusionPipeline):
 
     def __init__(
         self,
-        unet: UNet2DConditionModel,
-        scheduler: DDPMScheduler,
+        unet: Optional[UNet2DConditionModel],
+        scheduler,
         vae: AutoencoderKL,
         tokenizer,
-        text_encoder: CLIPTextModel,
+        text_encoder,
         tokenizer_2=None,
         text_encoder_2: Optional[CLIPTextModelWithProjection] = None,
+        transformer=None,
+        flux_pipe: Optional[FluxPipeline] = None,
         default_edit_config: Optional[Dict[str, Any]] = None,
         image_size: int = 512,
         device: Optional[str | torch.device] = None,
@@ -99,13 +103,17 @@ class ChordEditPipeline(DiffusionPipeline):
             text_encoder=text_encoder,
             tokenizer_2=tokenizer_2,
             text_encoder_2=text_encoder_2,
+            transformer=transformer,
         )
         self._device = torch.device(
             device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
         )
         self._compute_dtype = compute_dtype
         self._use_attention_mask = bool(use_attention_mask)
-        self._is_sdxl = tokenizer_2 is not None and text_encoder_2 is not None
+        self._is_flux = flux_pipe is not None or transformer is not None
+        self._is_sdxl = (not self._is_flux) and tokenizer_2 is not None and text_encoder_2 is not None
+        self._model_family = "flux" if self._is_flux else ("sdxl" if self._is_sdxl else "sd")
+        self._flux_pipe = flux_pipe
         self.to(self._device)
         self._set_compute_precision()
 
@@ -113,12 +121,19 @@ class ChordEditPipeline(DiffusionPipeline):
         self.image_size = int(image_size)
         self._use_center_crop = bool(use_center_crop)
         self._vae_transform = self._build_vae_transform()
-        self.unet.eval()
+        if self.unet is not None:
+            self.unet.eval()
         self.vae.eval()
-        self.text_encoder.eval()
+        if self.text_encoder is not None:
+            self.text_encoder.eval()
         if self.text_encoder_2 is not None:
             self.text_encoder_2.eval()
-        self._max_unet_timestep = self.scheduler.config.num_train_timesteps - 1
+        if getattr(self, "transformer", None) is not None:
+            self.transformer.eval()
+        if self._model_family == "flux":
+            self._max_unet_timestep = 1000
+        else:
+            self._max_unet_timestep = self.scheduler.config.num_train_timesteps - 1
         self._use_safety_checker = bool(use_safety_checker)
         self._safety_checker_id = safety_checker_id
         self._safety_checker: Optional[StableDiffusionSafetyChecker] = None
@@ -128,7 +143,7 @@ class ChordEditPipeline(DiffusionPipeline):
         self._chord_edit_mode = chord_edit_mode
 
     def _set_compute_precision(self) -> None:
-        modules = (self.unet, self.vae, self.text_encoder, self.text_encoder_2)
+        modules = (self.unet, self.vae, self.text_encoder, self.text_encoder_2, getattr(self, "transformer", None))
         for module in modules:
             if module is not None:
                 module.to(device=self._device, dtype=self._compute_dtype)
@@ -188,6 +203,12 @@ class ChordEditPipeline(DiffusionPipeline):
             "safety_checker_id": safety_checker_id,
             "chord_edit_mode": chord_edit_mode,
         }
+        if resolved_model_type == "flux":
+            return cls.from_local_flux_weights(
+                component_paths=component_paths,
+                image_size=512 if image_size is None else image_size,
+                **common_kwargs,
+            )
         if resolved_model_type == "sdxl":
             return cls.from_local_sdxl_weights(
                 component_paths=component_paths,
@@ -214,7 +235,9 @@ class ChordEditPipeline(DiffusionPipeline):
             return "sd"
         if normalized in {"sdxl", "sdxl-turbo", "stable-diffusion-xl", "stable-diffusion-xl-turbo"}:
             return "sdxl"
-        raise ValueError("model_type must be one of: sd, sd-turbo, sdxl, sdxl-turbo.")
+        if normalized in {"flux", "flux-schnell", "flux.1-schnell"}:
+            return "flux"
+        raise ValueError("model_type must be one of: sd, sd-turbo, sdxl, sdxl-turbo, flux.")
 
     @classmethod
     def from_local_sd_weights(
@@ -334,6 +357,53 @@ class ChordEditPipeline(DiffusionPipeline):
         )
 
     @classmethod
+    def from_local_flux_weights(
+        cls,
+        component_paths: Dict[str, str],
+        *,
+        default_edit_config: Optional[Dict[str, Any]] = None,
+        device: Optional[str | torch.device] = None,
+        torch_dtype: torch.dtype = torch.float32,
+        image_size: int = 512,
+        use_center_crop: bool = True,
+        compute_dtype: torch.dtype = DEFAULT_COMPUTE_DTYPE,
+        use_attention_mask: bool = False,
+        use_safety_checker: bool = False,
+        safety_checker_id: Optional[str] = DEFAULT_SAFETY_CHECKER_ID,
+        chord_edit_mode: str = "default",
+    ) -> "ChordEditPipeline":
+        """Instantiate the pipeline from a local FLUX.1/Schnell checkpoint."""
+
+        model_root = component_paths.get("model_root")
+        if model_root is None:
+            raise ValueError("FLUX loading requires component_paths['model_root'].")
+
+        pipe = FluxPipeline.from_pretrained(
+            model_root,
+            torch_dtype=torch_dtype,
+        )
+        return cls(
+            unet=None,
+            scheduler=pipe.scheduler,
+            vae=pipe.vae,
+            tokenizer=pipe.tokenizer,
+            text_encoder=pipe.text_encoder,
+            tokenizer_2=pipe.tokenizer_2,
+            text_encoder_2=pipe.text_encoder_2,
+            transformer=pipe.transformer,
+            flux_pipe=pipe,
+            default_edit_config=default_edit_config,
+            image_size=image_size,
+            device=device,
+            compute_dtype=compute_dtype,
+            use_attention_mask=use_attention_mask,
+            use_center_crop=use_center_crop,
+            use_safety_checker=use_safety_checker,
+            safety_checker_id=safety_checker_id,
+            chord_edit_mode=chord_edit_mode,
+        )
+
+    @classmethod
     def from_local_sdxl_turbo_weights(
         cls,
         component_paths: Dict[str, str],
@@ -408,6 +478,8 @@ class ChordEditPipeline(DiffusionPipeline):
 
     def encode_prompt(self, prompts: Sequence[str]) -> torch.Tensor | _PromptCondition:
         """Public helper mirroring diffusers pipelines for text encoding."""
+        if self._model_family == "flux":
+            return self._encode_flux_text(prompts)
         if self._is_sdxl:
             return self._encode_sdxl_text(prompts)
         return self._encode_text(prompts)
@@ -442,17 +514,39 @@ class ChordEditPipeline(DiffusionPipeline):
 
     def _encode_image_to_latent(self, pixel_values: torch.Tensor) -> torch.Tensor:
         scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
+        shift_factor = getattr(self.vae.config, "shift_factor", 0.0)
+
         pixel_values = pixel_values.to(device=self._device, dtype=self._compute_dtype)
         latents = self.vae.encode(pixel_values).latent_dist.mode()
-        latents = latents * scaling_factor
+
+        if self._model_family == "flux":
+            # FLUX VAE latents use both scaling and shift.
+            latents = (latents - shift_factor) * scaling_factor
+        else:
+            # SD/SDXL VAE latents use scaling only.
+            latents = latents * scaling_factor
+
         return latents.to(device=self._device, dtype=self._compute_dtype)
 
     def _decode_latent_to_image(self, latents: torch.Tensor) -> torch.Tensor:
         scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
+        shift_factor = getattr(self.vae.config, "shift_factor", 0.0)
+
         latents = latents.to(device=self._device, dtype=self._compute_dtype)
-        decoded = self.vae.decode(latents / scaling_factor).sample
+
+        if self._model_family == "flux":
+            # Invert FLUX VAE latent normalization.
+            vae_latents = (latents / scaling_factor) + shift_factor
+        else:
+            # Invert SD/SDXL VAE latent normalization.
+            vae_latents = latents / scaling_factor
+
+        decoded = self.vae.decode(vae_latents).sample
         decoded = (decoded.clamp(-1.0, 1.0) + 1.0) / 2.0
-        return decoded.to(dtype=self._compute_dtype)
+        # Keep model computations in the requested dtype, but return float32 for
+        # downstream PIL/torchvision/export code. torchvision image conversion
+        # does not reliably support bfloat16 tensors.
+        return decoded.to(dtype=torch.float32)
 
     def _apply_safety_checker(self, images: torch.Tensor) -> tuple[torch.Tensor, List[bool]]:
         batch = images.shape[0]
@@ -548,6 +642,22 @@ class ChordEditPipeline(DiffusionPipeline):
             time_ids=time_ids,
         )
 
+    def _encode_flux_text(self, prompts: Sequence[str]) -> _PromptCondition:
+        if self._flux_pipe is None:
+            raise ValueError("FLUX prompt encoding requires a FluxPipeline instance.")
+        prompt_embeds, pooled_prompt_embeds, txt_ids = self._flux_pipe.encode_prompt(
+            prompt=list(prompts),
+            prompt_2=list(prompts),
+            device=self._device,
+            num_images_per_prompt=1,
+            max_sequence_length=512,
+        )
+        return _PromptCondition(
+            hidden_states=prompt_embeds.to(device=self._device, dtype=self._compute_dtype),
+            pooled_embeds=pooled_prompt_embeds.to(device=self._device, dtype=self._compute_dtype),
+            txt_ids=txt_ids.to(device=self._device, dtype=self._compute_dtype),
+        )
+
     def _get_sdxl_time_ids(self, batch_size: int) -> torch.Tensor:
         size = (self.image_size, self.image_size)
         crop = (0, 0)
@@ -576,10 +686,19 @@ class ChordEditPipeline(DiffusionPipeline):
         time_ids = None
         if all(cond.time_ids is not None for cond in prompt_conditions):
             time_ids = torch.cat([cond.time_ids for cond in prompt_conditions if cond.time_ids is not None], dim=0)
+        txt_ids = None
+        if all(cond.txt_ids is not None for cond in prompt_conditions):
+            # FLUX txt_ids are shared across batch; repeat only if they already have a batch dimension.
+            first_txt = prompt_conditions[0].txt_ids
+            if first_txt is not None and first_txt.dim() == 3:
+                txt_ids = torch.cat([cond.txt_ids for cond in prompt_conditions if cond.txt_ids is not None], dim=0)
+            else:
+                txt_ids = first_txt
         return _PromptCondition(
             hidden_states=torch.cat([cond.hidden_states for cond in prompt_conditions], dim=0),
             pooled_embeds=pooled,
             time_ids=time_ids,
+            txt_ids=txt_ids,
         )
 
     def _repeat_condition(self, cond: torch.Tensor | _PromptCondition, repeats: int) -> torch.Tensor | _PromptCondition:
@@ -596,10 +715,15 @@ class ChordEditPipeline(DiffusionPipeline):
         if cond.time_ids is not None:
             time_repeat_dims = [repeats] + [1] * (cond.time_ids.dim() - 1)
             time_ids = cond.time_ids.repeat(*time_repeat_dims)
+        txt_ids = cond.txt_ids
+        if txt_ids is not None and txt_ids.dim() == 3:
+            txt_repeat_dims = [repeats] + [1] * (txt_ids.dim() - 1)
+            txt_ids = txt_ids.repeat(*txt_repeat_dims)
         return _PromptCondition(
             hidden_states=cond.hidden_states.repeat(*hidden_repeat_dims),
             pooled_embeds=pooled,
             time_ids=time_ids,
+            txt_ids=txt_ids,
         )
 
     def _predict_noise(
@@ -704,6 +828,12 @@ class ChordEditPipeline(DiffusionPipeline):
         return alpha_t, sigma_t
 
     def _pred_x0(self, x_anchor, timesteps, cond, noise):
+        if self._model_family == "flux":
+            return self._pred_x0_flux(x_anchor, timesteps, cond, noise)
+        return self._pred_x0_ddpm(x_anchor, timesteps, cond, noise)
+
+    def _pred_x0_ddpm(self, x_anchor, timesteps, cond, noise):
+        """DDPM/DDIM x0 prediction used by SD and SDXL backends."""
         alpha_t, sigma_t = self._get_alpha_sigma(x_anchor, timesteps)
         z_t = alpha_t * x_anchor + sigma_t * noise
         noise_pred = self._predict_noise(
@@ -713,11 +843,234 @@ class ChordEditPipeline(DiffusionPipeline):
         )
         x0_pred = (z_t - sigma_t * noise_pred) / alpha_t
         return x0_pred
+
+    def _flux_timestep_to_sigma(self, timesteps: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
+        # ChordEdit's scalar t maps to integer 0..1000. FLUX uses a flow sigma in [0,1].
+        sigma = timesteps.to(device=tensor.device, dtype=tensor.dtype) / 1000.0
+        return sigma.clamp(0.0, 1.0).view(-1, 1, 1, 1)
+
+    def _pack_flux_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        if self._flux_pipe is None:
+            raise ValueError("FLUX latent packing requires FluxPipeline helpers.")
+        b, c, h, w = latents.shape
+        return self._flux_pipe._pack_latents(latents, b, c, h, w)
+
+    def _unpack_flux_latents(self, latents: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        if self._flux_pipe is None:
+            raise ValueError("FLUX latent unpacking requires FluxPipeline helpers.")
+        return self._flux_pipe._unpack_latents(latents, height, width, self._flux_pipe.vae_scale_factor)
+
+    def _predict_flux_velocity(
+        self,
+        sample: torch.Tensor,
+        timesteps: torch.Tensor,
+        cond: _PromptCondition,
+    ) -> torch.Tensor:
+        if self._flux_pipe is None:
+            raise ValueError("FLUX prediction requires FluxPipeline helpers.")
+        if not isinstance(cond, _PromptCondition):
+            raise TypeError("FLUX condition must be a _PromptCondition.")
+
+        b, c, h, w = sample.shape
+        packed = self._pack_flux_latents(sample)
+        img_ids = self._flux_pipe._prepare_latent_image_ids(
+            b,
+            h // 2,
+            w // 2,
+            self._device,
+            self._compute_dtype,
+        )
+
+        # Diffusers FLUX transformer expects normalized timesteps in [0, 1],
+        # while ChordEdit's generic timestep index uses [0, 1000].
+        timestep = timesteps.to(device=self._device, dtype=self._compute_dtype) / 1000.0
+        guidance = None
+        
+        if getattr(self.transformer.config, "guidance_embeds", False):
+            guidance_scale = float(os.environ.get("FLUX_CHORDEDIT_GUIDANCE", "3.5"))
+            guidance = torch.full(
+                (packed.shape[0],),
+                guidance_scale,
+                device=self._device,
+                dtype=torch.float32,
+            )
+
+        pred = self.transformer(
+            hidden_states=packed,
+            timestep=timestep,
+            guidance=guidance,
+            pooled_projections=cond.pooled_embeds,
+            encoder_hidden_states=cond.hidden_states,
+            txt_ids=cond.txt_ids,
+            img_ids=img_ids,
+            return_dict=False,
+        )[0]
+        return self._unpack_flux_latents(pred, self.image_size, self.image_size)
+
+    def _pred_x0_flux(self, x_anchor, timesteps, cond, noise):
+        sigma = self._flux_timestep_to_sigma(timesteps, x_anchor)
+        z_t = (1.0 - sigma) * x_anchor + sigma * noise
+        velocity_pred = self._predict_flux_velocity(
+            sample=z_t,
+            timesteps=timesteps,
+            cond=cond,
+        )
+        return z_t - sigma * velocity_pred
+
+    def _predict_x0_from_noised_samples(
+        self,
+        samples: torch.Tensor,
+        timesteps: torch.Tensor,
+        cond: torch.Tensor | _PromptCondition,
+        *,
+        alpha: Optional[torch.Tensor] = None,
+        sigma: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Convert backend model predictions at noised/interpolated samples into x0 estimates."""
+        if self._model_family == "flux":
+            return self._predict_x0_flux_from_noised_samples(
+                samples=samples,
+                timesteps=timesteps,
+                cond=cond,
+                sigma=sigma,
+            )
+
+        if alpha is None or sigma is None:
+            raise ValueError("DDPM x0 prediction requires alpha and sigma.")
+        noise_pred = self._predict_noise(
+            sample=samples,
+            timesteps=timesteps,
+            cond=cond,
+        )
+        return (samples - sigma * noise_pred) / alpha
+
+    def _predict_x0_flux_from_noised_samples(
+        self,
+        samples: torch.Tensor,
+        timesteps: torch.Tensor,
+        cond: torch.Tensor | _PromptCondition,
+        *,
+        sigma: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if sigma is None:
+            sigma = self._flux_timestep_to_sigma(timesteps, samples)
+        velocity_pred = self._predict_flux_velocity(
+            sample=samples,
+            timesteps=timesteps,
+            cond=cond,
+        )
+        return samples - sigma * velocity_pred
     
+    def _u_estimate_flux(self, x_anchor, src_embed, edit_embed, noise, t_s: float, delta: float):
+        """FLUX ChordEdit residual.
+
+        FLUX_CHORDEDIT_RESIDUAL=velocity:
+        R = v_tgt - v_src.
+        This is the paper-literal flow-model residual with B_t = I.
+
+        FLUX_CHORDEDIT_RESIDUAL=clean_disp:
+        R = x0_tgt - x0_src = -sigma * (v_tgt - v_src).
+        This maps the FLUX velocity difference into clean-latent displacement
+        space, matching the residual domain used by the SD/SDXL implementation.
+        This is the main FLUX variant used for diagnostics.
+
+        FLUX_CHORDEDIT_RESIDUAL=neg_velocity:
+        R = -(v_tgt - v_src).
+        This is only a sign-convention sanity check.
+        """
+        batch, device = x_anchor.shape[0], x_anchor.device
+        batch_size = batch
+        noises = noise if isinstance(noise, (list, tuple)) else [noise]
+        mode = os.environ.get("FLUX_CHORDEDIT_RESIDUAL", "velocity").lower()
+
+        def query_residual(t_query: float, eps: torch.Tensor):
+            t_query = float(max(0.0, min(1.0, t_query)))
+            t_idx = self._time_to_index(batch_size, t_query, device=device)
+
+            sigma = self._flux_timestep_to_sigma(t_idx, x_anchor)
+            sigma = sigma.to(device=x_anchor.device, dtype=x_anchor.dtype)
+            alpha = 1.0 - sigma
+
+            z_t = alpha * x_anchor + sigma * eps
+
+            v_src = self._predict_flux_velocity(
+                z_t,
+                t_idx,
+                src_embed,
+            )
+            v_tgt = self._predict_flux_velocity(
+                z_t,
+                t_idx,
+                edit_embed,
+            )
+
+            dv = v_tgt - v_src
+
+            if mode in {"velocity", "paper", "paper_velocity"}:
+                residual = dv
+            elif mode in {"neg_velocity", "minus_velocity"}:
+                # Sign sanity check: test whether the FLUX/Diffusers velocity convention
+                # is opposite of the assumed paper direction.
+                residual = -dv
+            else:
+                # Diffusers FLUX clean extrapolation:
+                # x0 = z_t - sigma * v.
+                # Therefore x0_tgt - x0_src = -sigma * (v_tgt - v_src).
+                residual = -sigma * dv
+
+            if os.environ.get("FLUX_CHORDEDIT_DEBUG", "0") == "1" and not getattr(self, "_flux_chord_debug_printed", False):
+                self._flux_chord_debug_printed = True
+                print("FLUX_CHORDEDIT_RESIDUAL", mode)
+                print("t_query", t_query)
+                print("sigma mean", float(sigma.float().mean()))
+                print("z_t absmean", float(z_t.float().abs().mean()))
+                print("v_src absmean", float(v_src.float().abs().mean()))
+                print("v_tgt absmean", float(v_tgt.float().abs().mean()))
+                print("dv absmean", float(dv.float().abs().mean()))
+                print("residual absmean", float(residual.float().abs().mean()))
+
+            return residual
+
+        residual_t_all = []
+        residual_prev_all = []
+        t_prev = max(0.0, float(t_s) - float(delta))
+
+        for eps in noises:
+            residual_t_all.append(query_residual(float(t_s), eps))
+            if delta > 1e-8:
+                residual_prev_all.append(query_residual(t_prev, eps))
+
+        residual_t = torch.stack(residual_t_all, dim=0).mean(dim=0)
+
+        if delta <= 1e-8:
+            return residual_t
+
+        residual_prev = torch.stack(residual_prev_all, dim=0).mean(dim=0)
+
+        denom = float(t_s) + float(delta)
+        if denom <= 1e-8:
+            return residual_t
+
+        return (float(t_s) * residual_prev + float(delta) * residual_t) / denom
+
     def _u_estimate(self, x_anchor, src_embed, edit_embed, noise, t_s: float, delta: float):
+        # ChordEdit dispatch:
+        #   SD/SDXL: convert noise/x0 outputs into the comparison domain.
+        #   FLUX: velocity model, so B_t = I and the residual is v_tgt - v_src.
+        if self._model_family == "flux":
+            return self._u_estimate_flux(
+                x_anchor,
+                src_embed,
+                edit_embed,
+                noise,
+                t_s,
+                delta,
+            )
+
         if self._chord_edit_mode == "sym":
             print("Using symmetric edit mode ...")
             return self._u_estimate_sym(x_anchor, src_embed, edit_embed, noise, t_s, delta)
+
         return self._u_estimate_default(x_anchor, src_embed, edit_embed, noise, t_s, delta)
 
     def _u_estimate_default(self, x_anchor, src_embed, edit_embed, noise, t_s: float, delta: float):
@@ -727,8 +1080,14 @@ class ChordEditPipeline(DiffusionPipeline):
 
         noises = noise if isinstance(noise, (list, tuple)) else [noise]
 
-        alpha_s, sigma_s = self._get_alpha_sigma(x_anchor, t_idx_s)
-        alpha_prev, sigma_prev = self._get_alpha_sigma(x_anchor, t_idx_s0)
+        if self._model_family == "flux":
+            sigma_s = self._flux_timestep_to_sigma(t_idx_s, x_anchor)
+            sigma_prev = self._flux_timestep_to_sigma(t_idx_s0, x_anchor)
+            alpha_s = 1.0 - sigma_s
+            alpha_prev = 1.0 - sigma_prev
+        else:
+            alpha_s, sigma_s = self._get_alpha_sigma(x_anchor, t_idx_s)
+            alpha_prev, sigma_prev = self._get_alpha_sigma(x_anchor, t_idx_s0)
 
         num_noises = len(noises)
         noise_stack = torch.stack(noises, dim=0)
@@ -760,13 +1119,13 @@ class ChordEditPipeline(DiffusionPipeline):
             dim=1,
         ).reshape(num_noises * 4 * batch, 1, 1, 1)
 
-        noise_pred = self._predict_noise(
-            sample=samples,
+        x0_all = self._predict_x0_from_noised_samples(
+            samples=samples,
             timesteps=timesteps,
             cond=conds,
+            alpha=alpha_cat,
+            sigma=sigma_cat,
         )
-
-        x0_all = (samples - sigma_cat * noise_pred) / alpha_cat
         x0_all = x0_all.reshape(num_noises, 4, batch, *x_anchor.shape[1:])
         x_src_p_s, x_tar_p_s, x_src_p_s0, x_tar_p_s0 = x0_all.unbind(dim=1)
 
@@ -785,8 +1144,14 @@ class ChordEditPipeline(DiffusionPipeline):
 
         noises = noise if isinstance(noise, (list, tuple)) else [noise]
 
-        alpha_s, sigma_s = self._get_alpha_sigma(x_anchor, t_idx_s)
-        alpha_prev, sigma_prev = self._get_alpha_sigma(x_anchor, t_idx_s0)
+        if self._model_family == "flux":
+            sigma_s = self._flux_timestep_to_sigma(t_idx_s, x_anchor)
+            sigma_prev = self._flux_timestep_to_sigma(t_idx_s0, x_anchor)
+            alpha_s = 1.0 - sigma_s
+            alpha_prev = 1.0 - sigma_prev
+        else:
+            alpha_s, sigma_s = self._get_alpha_sigma(x_anchor, t_idx_s)
+            alpha_prev, sigma_prev = self._get_alpha_sigma(x_anchor, t_idx_s0)
 
         num_noises = len(noises)
         noise_stack = torch.stack(noises, dim=0)
@@ -818,13 +1183,13 @@ class ChordEditPipeline(DiffusionPipeline):
             dim=1,
         ).reshape(num_noises * 4 * batch, 1, 1, 1)
 
-        noise_pred = self._predict_noise(
-            sample=samples,
+        x0_all = self._predict_x0_from_noised_samples(
+            samples=samples,
             timesteps=timesteps,
             cond=conds,
+            alpha=alpha_cat,
+            sigma=sigma_cat,
         )
-
-        x0_all = (samples - sigma_cat * noise_pred) / alpha_cat
         x0_all = x0_all.reshape(num_noises, 4, batch, *x_anchor.shape[1:])
         x_src_p_s, x_tar_p_s, x_src_p_s0, x_tar_p_s0 = x0_all.unbind(dim=1)
 
@@ -874,6 +1239,9 @@ class ChordEditPipeline(DiffusionPipeline):
 
         if params["cleanup"]:
             t_end_idx = self._time_to_index(x_src.shape[0], params["t_end"], device=device)
-            x_curr = self._pred_x0(x_curr, t_end_idx, edit_embed, noise[0])
+            if self._model_family == "flux":
+                x_curr = self._pred_x0_flux(x_curr, t_end_idx, edit_embed, noise[0])
+            else:
+                x_curr = self._pred_x0(x_curr, t_end_idx, edit_embed, noise[0])
 
         return x_curr
