@@ -8,6 +8,7 @@ from models.classification.utils import (
     compute_agreement_score,
     compute_naive_pareto_score,
     compute_softplus_score,
+    compute_linex_score,
 )
 
 """
@@ -20,8 +21,8 @@ _PARENT_DIR = Path(__file__).resolve().parent
 DATA_DIR = _PARENT_DIR / "data"
 
 # NOTE: Adjust METRICS_CSV dependent on the data
-METRICS_CSV = DATA_DIR / "id_to_metrics_sdturbo-tstart.csv"
-STRINGS_CSV = DATA_DIR / "id_to_string_pair.csv"
+METRICS_CSV = DATA_DIR / "id_to_metrics_sdxlturbo_tournament12k.csv"
+STRINGS_CSV = DATA_DIR / "id_to_string_pair_sdxlturbo_tournament12k.csv"
 
 # Files for image data should be named `id_to_metrics_*`
 _OUTPUTS_SUBDIR = METRICS_CSV.stem.removeprefix("id_to_metrics_")
@@ -38,12 +39,12 @@ within each sample group.
 """
 
 # NOTE: May be "weighted_combined_score", "agreement_score",
-# "naive_pareto_score", or "softplus_score". Choose one.
-TARGET_METRIC = "softplus_score"
+# "naive_pareto_score", "softplus_score", or "linex_score". Choose one.
+TARGET_METRIC = "linex_score"
 
 # NOTE: Must match number of distinct `t_start`, `t_end` values in METRICS_CSV
 N_BUCKETS_START = 11
-N_BUCKETS_END = 1
+N_BUCKETS_END = 11
 
 # Value in `t_delta` column to select data from 
 TARGET_T_DELTA = 0.0
@@ -75,6 +76,7 @@ class MetricOption:
 _LAMBDA_PSNR, _LAMBDA_CLIP = 0.5, 0.5
 _PARETO_BIAS_ALPHA = 2.0
 _SOFTPLUS_ALPHA, _SOFTPLUS_BETA = 1.0, 2.0
+_LINEX_ALPHA = 5.0
 _NORMALIZE = True
 _METRIC_REGISTRY: dict[str, MetricOption] = {
     "weighted_combined_score": MetricOption(
@@ -96,6 +98,11 @@ _METRIC_REGISTRY: dict[str, MetricOption] = {
         fn=partial(compute_softplus_score, alpha=_SOFTPLUS_ALPHA, beta=_SOFTPLUS_BETA, normalize=_NORMALIZE),
         col=f"softplus_score_a{_SOFTPLUS_ALPHA:g}-b{_SOFTPLUS_BETA:g}-n{_NORMALIZE:d}",
         label=f"Softplus Score ($\\alpha={_SOFTPLUS_ALPHA}$, $\\beta={_SOFTPLUS_BETA}$, n={_NORMALIZE:d})",
+    ),
+    "linex_score": MetricOption(
+        fn=partial(compute_linex_score, alpha=_LINEX_ALPHA, normalize=_NORMALIZE),
+        col=f"linex_score_a{_LINEX_ALPHA:g}-n{_NORMALIZE:d}",
+        label=f"LINEX Score ($\\alpha={_LINEX_ALPHA}$, n={_NORMALIZE:d})",
     ),
 }
 
@@ -143,7 +150,7 @@ counteract label imbalance in the training split.
 """
 
 # Name of HuggingFace checkpoint for text-encoder
-ENCODER_MODEL = "sentence-transformers/Qwen3-VL-Embedding-2B"
+ENCODER_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 # Prevent encoder weights from updating during training
 FREEZE_ENCODER = True
 # NOTE: Select head type to use for last step of model, 

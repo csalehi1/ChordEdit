@@ -134,6 +134,51 @@ def compute_naive_pareto_score(
     return scores
 
 
+def compute_linex_score(
+    df: pd.DataFrame,
+    psnr_col: str = "psnr",
+    clip_col: str = "clip_edited",
+    sample_id_col: str = "sample_id",
+    base_t_start: float | None = None,
+    base_t_end: float | None = None,
+    alpha: float = 1.0,
+    normalize: bool = True,
+) -> pd.Series:
+    """
+    Return the LINEX (linear-exponential) score for each row relative to
+    the baseline row in its sample_id group. When normalized is True, PSNR
+    and CLIP are min-max scaled within each sample_id group before deltas
+    are taken.
+
+    The average of the Naive and CARA scores, using the LINEX utility
+    u(x) = (1/2)[x + (1/alpha)(1 - e^{-alpha*x})], applied to each of the
+    two (possibly normalized) metric deltas and summed:
+
+        linex(delta) = u(delta_psnr) + u(delta_clip)
+
+    Regressions (delta < 0) are penalized superlinearly (u' -> infinity as
+    x -> -infinity); improvements (delta > 0) accrue at an asymptotic rate
+    of 1/2 per unit rather than saturating, unlike the CARA score. As
+    alpha -> 0+, this recovers the Naive Score.
+    """
+    from models.classification.settings import DEFAULT_T_START, DEFAULT_T_END
+
+    base_t_start = DEFAULT_T_START if base_t_start is None else base_t_start
+    base_t_end = DEFAULT_T_END if base_t_end is None else base_t_end
+
+    def _u(x: np.ndarray, alpha: float) -> np.ndarray:
+        return 0.5 * (x + (1 - np.exp(-alpha * x)) / alpha)
+
+    scores = pd.Series(0.0, index=df.index, name="linex_score")
+    for sample_id, group in df.groupby(sample_id_col):
+        base_idx = _find_baseline_idx(group, base_t_start, base_t_end, sample_id)
+        delta_psnr, delta_clip = _group_deltas(group, psnr_col, clip_col, base_idx, normalize)
+        row_scores = _u(delta_psnr, alpha) + _u(delta_clip, alpha)
+        scores.loc[group.index] = row_scores
+
+    return scores
+
+
 def compute_softplus_score(
     df: pd.DataFrame,
     psnr_col: str = "psnr",

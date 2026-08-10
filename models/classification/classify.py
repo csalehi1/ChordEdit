@@ -98,6 +98,17 @@ def load_data() -> pd.DataFrame:
     filtered = metrics[metrics["t_delta"] == TARGET_T_DELTA]
     if TARGET_METRIC_COL not in filtered.columns:
         filtered[TARGET_METRIC_COL] = TARGET_METRIC_COL_FN(filtered)
+
+    # A sample_id group can be all-NaN on the target metric (e.g. no mask
+    # available to compute PSNR-unedited for that sample), leaving no valid
+    # cell to select -- idxmax has nothing to return for such a group, so
+    # drop them before taking the per-sample argmax.
+    all_nan = filtered.groupby("sample_id")[TARGET_METRIC_COL].apply(lambda s: s.isna().all())
+    n_dropped = int(all_nan.sum())
+    if n_dropped:
+        print(f"Dropping {n_dropped} sample_id(s) with all-NaN {TARGET_METRIC_COL} (no valid pick)")
+        filtered = filtered[filtered["sample_id"].isin(all_nan[~all_nan].index)]
+
     # Rows with default t-values will score 1 on Pareto Score so that
     # a maximum value will always exist.
     best_idx = filtered.groupby("sample_id")[TARGET_METRIC_COL].idxmax()
