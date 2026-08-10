@@ -7,3 +7,4 @@ __pycache__/
 datasets/
 checkpoints/
 ablation_outputs/
+zara_grid_gen/generated/
