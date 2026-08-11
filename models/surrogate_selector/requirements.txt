@@ -1,0 +1,9 @@
+# Runtime deps for train_m / train_t (precomputed embeddings; no ChordEdit pipeline).
+# Aligns with the repo-root CUDA torch index when installing GPU builds.
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+torch==2.5.0+cu124
+numpy
+pandas
+scipy
+tqdm
