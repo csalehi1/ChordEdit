@@ -16,27 +16,22 @@ from __future__ import annotations
 
 import argparse
 import json
-import numpy as np
 import os
-import pandas as pd
 import sys
-import torch
-from pathlib import Path
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_DIR, "..", ".."))
 sys.path.insert(0, _ROOT)
 sys.path.insert(0, _DIR)
 
-from _helpers import (
-    current_commit_id,
-    load_live_settings,
-    load_run_settings,
-    resolve_device,
-    resolve_run_dir,
-    score_metric_grids,
-    timestep_pairs_from_df,
-)
+from inspect import signature
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+
+from _helpers import *
 
 
 # Parse command line arguments.
@@ -60,7 +55,7 @@ from model_t import TimestepSelector, gate_metrics, per_image_spearman, regret
 from settings import *
 
 
-def evaluate(run_dir: Path) -> dict:
+def eval(run_dir: Path) -> dict:
     print(f"Using settings from {run_dir / 'settings.json'}")
 
     # Confirm that the run artifacts exist.
@@ -74,59 +69,67 @@ def evaluate(run_dir: Path) -> dict:
     if not weights_path.exists():
         raise FileNotFoundError(f"Missing {weights_path=}.")
 
-    # Load the test split.
-    test_df = load_split_df(run_dir)["test"]
-    sample_ids = sorted(test_df["sample_id"].unique())
-    t_start_values = sorted(test_df["t_start"].unique())
-    t_end_values = sorted(test_df["t_end"].unique())
-    t_pairs = timestep_pairs_from_df(test_df)
+    # Load all splits but metrics stay on test, the selections CSV covers every sample.
+    splits = load_split_df(run_dir)
+    all_df = pd.concat([splits["train"], splits["val"], splits["test"]], ignore_index=True)
+    test_df = splits["test"]
+    all_sample_ids = sorted(all_df["sample_id"].unique())
+    test_sample_ids = sorted(test_df["sample_id"].unique())
+    test_pos = {sid: k for k, sid in enumerate(test_sample_ids)}
+    t_start_values = sorted(all_df["t_start"].unique())
+    t_end_values = sorted(all_df["t_end"].unique())
 
     # Load the model and timestep predictor.
     device = resolve_device()
     print(f"Device: {device}.")
     ckpt = torch.load(weights_path, map_location=device, weights_only=False)
-    model = SurrogateModel(int(ckpt["img_dim"]), int(ckpt["text_dim"]), device=device)
+    cell_t_pairs = ckpt["cell_t_pairs"].cpu().numpy()
+    model = SurrogateModel(int(ckpt["img_dim"]), int(ckpt["text_dim"]), int(cell_t_pairs.shape[0]), device=device)
     model.regressor.load_state_dict(ckpt["regressor_state_dict"])
-    model.regressor.set_target_stats(ckpt["target_mean"], ckpt["target_std"])
+    model.regressor.set_target_standardization(ckpt["target_mean"], ckpt["target_std"])
     model.regressor.to(device).eval()
 
     # Initialize the timestep selector.
     surface = torch.load(surface_path, map_location="cpu", weights_only=True)
     mean_surface = np.asarray(surface["mean_true_delta"], dtype=np.float64) if M_TARGET_SPACE == "residual" else None
-    t_selector = TimestepSelector(model, t_start_values=t_start_values, t_end_values=t_end_values, mean_surface=mean_surface)
+    t_selector = TimestepSelector(model, cell_t_pairs, t_start_values=t_start_values, t_end_values=t_end_values, mean_surface=mean_surface)
     default_i, default_j = t_selector._default_i, t_selector._default_j
 
-    # Load the embeddings and find the true metrics.
-    emb = get_embeddings_by_sample(test_df.drop_duplicates("sample_id"), device)
-    true_psnr, _ = df_to_metric_grids(test_df, sample_ids, t_start_values, t_end_values, PSNR_COL)
-    true_clip, _ = df_to_metric_grids(test_df, sample_ids, t_start_values, t_end_values, CLIP_COL)
+    # Load embeddings for every sample and true test metrics for evaluation.
+    emb = get_embeddings_by_sample(all_df.drop_duplicates("sample_id"), device)
+    true_psnr, _ = df_to_metric_grids(test_df, test_sample_ids, t_start_values, t_end_values, PSNR_COL)
+    true_clip, _ = df_to_metric_grids(test_df, test_sample_ids, t_start_values, t_end_values, CLIP_COL)
     true_phi = score_metric_grids(true_psnr, true_clip, default_i * len(t_end_values) + default_j)
 
-    # Predict the timestep pairs and select the best one per sample.
+    # Select (t_start, t_end) for every sample; fill pred grids only for test metrics.
     pred_psnr, pred_clip, pred_phi = np.zeros_like(true_psnr), np.zeros_like(true_clip), np.zeros_like(true_phi)
-    selections: list[dict[str, float | str]] = []
-    for k, sid in enumerate(sample_ids):
+    all_selections: list[dict[str, float | str | bool]] = []
+    for sid in all_sample_ids:
         e = emb[sid]
-        grid = t_selector.pred_grid(e["img"], e["mask"], e["src"], e["tar"], t_pairs=t_pairs)
-        pred_psnr[k], pred_clip[k], pred_phi[k] = grid.psnr_grid, grid.clip_grid, grid.phi_grid
+        grid = t_selector.pred_grid(e["img"], e["src"], e["tar"])
         sel = t_selector.select_grid(grid, noise_floor=NOISE_FLOOR_PHI)
-        selections.append({
+        all_selections.append({
             "sample_id": sid,
             "t_start": sel.t_start,
             "t_end": sel.t_end,
             "deviate": sel.deviate,
             "pred_gain": sel.pred_gain,
         })
+        if sid in test_pos:
+            k = test_pos[sid]
+            pred_psnr[k], pred_clip[k], pred_phi[k] = grid.psnr_grid, grid.clip_grid, grid.phi_grid
 
-    # Compute metrics on the selected timestep pairs.
+    test_selections = [s for s in all_selections if s["sample_id"] in test_pos]
+
+    # Compute metrics on the test selections only.
     reg = regret(true_phi, pred_phi)
     rho_phi = per_image_spearman(true_phi, pred_phi)
     gate = gate_metrics(true_phi, pred_phi, default_i, default_j, NOISE_FLOOR_PHI)
     metrics = {
         "run_dir": str(run_dir),
-        "n_test_images": len(sample_ids),
+        "n_test_images": len(test_sample_ids),
         "grid": f"{len(t_start_values)}x{len(t_end_values)}",
-        "n_labeled_pairs": len(t_pairs),
+        "n_labeled_pairs": int(cell_t_pairs.shape[0]),
         "regret_median": float(np.median(reg)),
         "regret_p90": float(np.percentile(reg, 90)),
         "spearman_m_median": float(np.nanmedian(rho_phi)),  # JSON key kept for saved-run schema
@@ -136,17 +139,21 @@ def evaluate(run_dir: Path) -> dict:
         "default_t_end": DEFAULT_T_END,
     }
 
-    # Save the metrics and selections.
-    out_metrics = run_dir / "t_train_metrics.json"
-    out_selections = run_dir / "t_test_selections.json"
-    out_predictions = run_dir / f"id_to_predictions_{current_commit_id()}.csv"
+    # Save test metrics / selections; CSV covers every sample_id in the run.
+    out_metrics = run_dir / "selection_metrics.json"
+    out_selections = run_dir / "selections.json"
+    scorer = T_TARGET_FN if "alpha" not in signature(T_TARGET_FNS[T_TARGET_FN][0]).parameters else f"{T_TARGET_FN}_a{int(PHI_ALPHA)}"
+    start_col, end_col = f"{scorer}_t_start", f"{scorer}_t_end"
+    out_predictions = run_dir / f"id_to_selections_{DIR_NAME.replace('_', '').lower()}.csv"
     with open(out_metrics, "w") as f:
         json.dump(metrics, f, indent=2)
     with open(out_selections, "w") as f:
-        json.dump(selections, f, indent=2)
-    pd.DataFrame(selections, columns=["sample_id", "t_start", "t_end"]).to_csv(out_predictions, index=False)
+        json.dump(test_selections, f, indent=2)
+    pd.DataFrame(
+        [{"sample_id": s["sample_id"], start_col: s["t_start"], end_col: s["t_end"]} for s in all_selections]
+    ).to_csv(out_predictions, index=False)
 
-    print(f"T eval on {len(sample_ids)} test images  run={run_dir.name}")
+    print(f"T eval on {len(test_sample_ids)} test images ({len(all_sample_ids)} selections)  run={run_dir.name}")
     print(f"  regret median={metrics['regret_median']:.4f}  p90={metrics['regret_p90']:.4f}")
     print(f"  spearman phi median={metrics['spearman_m_median']:.3f}")
     print(
@@ -169,7 +176,7 @@ def main() -> None:
     np.random.seed(SEED)
 
     # Evaluate the timestep selector.
-    evaluate(RUN_DIR)
+    eval(RUN_DIR)
 
 
 if __name__ == "__main__":

@@ -154,8 +154,6 @@ MLP_HIDDEN = int(_cfg("MLP_HIDDEN"))
 MLP_INNER = int(_cfg("MLP_INNER"))
 MLP_PSNR_DROPOUT = float(_cfg("MLP_PSNR_DROPOUT"))
 MLP_CLIP_DROPOUT = float(_cfg("MLP_CLIP_DROPOUT"))
-T_FOURIER_FREQS = int(_cfg("T_FOURIER_FREQS"))
-T_PROJ_DIM = int(_cfg("T_PROJ_DIM"))
 
 EPOCHS = int(_cfg("EPOCHS"))
 BATCH_SIZE = int(_cfg("BATCH_SIZE"))

@@ -19,7 +19,7 @@ from settings import *
 
 _PACKED_EMBEDDINGS_DIR = Path(__file__).resolve().parent / ".cache" / "packed_embeddings"
 _SCATTERED_EMBEDDINGS_DIR = SCATTERED_DIR / "annotation_embeddings"
-_EMB_FILES = {"img": "image.pt", "mask": "mask.pt", "src": "source.pt", "tar": "target.pt"}
+_EMB_FILES = {"img": "image.pt", "src": "source.pt", "tar": "target.pt"}
 
 
 def _scattered_path(sample_id: str, kind: str) -> Path:
@@ -49,7 +49,7 @@ def _expected_packed_meta() -> dict:
     return {
         "model": CHORD_EDIT_MODEL,
         "pipeline_type": CHORD_EDIT_PIPELINE_TYPE,
-        "layout": "img_mask_src_tar_v1",
+        "layout": "img_src_tar_v1",
         "image_size": int(CHORD_EDIT_IMAGE_SIZE),
         "dir_name": DIR_NAME,
         "target_t_delta": TARGET_T_DELTA,
@@ -67,9 +67,9 @@ def _load_pt(path: str | Path) -> torch.Tensor:
 def _load_packed_cache(
     packed_path: Path,
     sample_ids: list[str],
-) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor] | None:
     """Packed tables sliced to sample_ids, or None (missing / bad meta / coverage)."""
-    
+
     # Check if the packed cache exists.
     if not packed_path.exists():
         return None
@@ -78,42 +78,33 @@ def _load_packed_cache(
     except Exception as e:
         print(f"Failed to load {packed_path} ({e}). Repacking...")
         return None
-    
+
     # Get the meta data from the packed cache.
     meta = data.get("meta")
-    
+
     # Verify that the meta data is consistent with the expected meta data.
     if not isinstance(meta, dict):
         print(f"{packed_path} has no meta. Repacking...")
         return None
     for key, expected in _expected_packed_meta().items():
         if meta.get(key) != expected:
-            print(f"{packed_path} meta mismatch: {key}={meta.get(key)!r} expected {expected!r}; repacking")
+            print(f"{packed_path} meta mismatch: {key}={meta.get(key)!r} expected {expected!r}. Repacking...")
             return None
     if data["img"].shape[1] != meta.get("img_dim") or data["src"].shape[1] != meta.get("text_dim"):
-        print(f"{packed_path} table dims do not match meta; repacking")
+        print(f"{packed_path} table dims do not match meta. Repacking...")
         return None
     id_to_i = {sid: i for i, sid in enumerate(data["sids"])}
     n_missing = sum(sid not in id_to_i for sid in sample_ids)
     if n_missing:
-        print(f"{packed_path} missing {n_missing} of {len(sample_ids)} requested samples; repacking")
-        return None
-
-    # Samples cached with a zero mask repack once their mask.pt is backfilled.
-    mask_missing = set(meta.get("mask_missing_sids", ()))
-    backfilled = sum(1 for sid in sample_ids if sid in mask_missing and _scattered_path(sid, "mask").exists())
-    if backfilled:
-        print(f"{packed_path}: {backfilled} cached zero-mask sample(s) now have mask.pt; repacking")
+        print(f"{packed_path} missing {n_missing} of {len(sample_ids)} requested samples. Repacking...")
         return None
 
     # Get the indices of the samples in the packed cache.
     idxs = [id_to_i[sid] for sid in sample_ids]
-    
-    # Return the samples, images, masks, sources, and targets.
+
     return (
         sample_ids,
         data["img"][idxs].contiguous(),
-        data["mask"][idxs].contiguous(),
         data["src"][idxs].contiguous(),
         data["tar"][idxs].contiguous(),
     )
@@ -123,14 +114,12 @@ def _save_packed_cache(
     packed_path: Path,
     sample_ids: list[str],
     tables: dict[str, torch.Tensor],
-    mask_missing_sids: list[str],
 ) -> None:
     """Atomically write the packed table dict with meta from scattered files."""
     meta = _expected_packed_meta() | {
         "source": "scattered",
         "img_dim": int(tables["img"].shape[1]),
         "text_dim": int(tables["src"].shape[1]),
-        "mask_missing_sids": sorted(mask_missing_sids),
     }
     packed_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = Path(str(packed_path) + ".tmp")
@@ -142,14 +131,8 @@ def _save_packed_cache(
 def _pack_scattered_cache(
     samples_df: pd.DataFrame,
     packed_path: Path,
-) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
-    """Pack scattered per-sample .pt files into packed tables.
-
-    Scattered embeddings stay per-sample on disk to best support symlinks between
-    dataset sizes, but loading them is slow, so the packed table is cached. The
-    scattered files are packing-ready (one flat float32 vector per file), so
-    packing is a pure stack. Samples without a mask.pt yet get a zero mask row.
-    """
+) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Pack scattered per-sample .pt files into packed tables."""
     sample_ids = samples_df[SAMPLE_ID_COL].tolist()
     if not sample_ids:
         raise ValueError("No samples to pack")
@@ -161,13 +144,6 @@ def _pack_scattered_cache(
         print(f"Scattered embeddings missing {len(missing)} sample_id(s): {preview}{more}")
         return None
 
-    mask_missing = [sid for sid in sample_ids if not _scattered_path(sid, "mask").exists()]
-    if mask_missing:
-        print(
-            f"{len(mask_missing)} of {len(sample_ids)} sample(s) have no mask.pt yet: "
-            f"packing zero mask rows for them."
-        )
-
     # Probe dims from the first sample, then preallocate the packed tables so
     # that peak memory stays ~1x table size (no row lists + torch.stack copy).
     n = len(sample_ids)
@@ -175,18 +151,14 @@ def _pack_scattered_cache(
     src_probe_path = _scattered_path(sample_ids[0], "src")
     text_dim = _text_dim(_load_pt(src_probe_path), src_probe_path)
     img_emb = torch.empty((n, img_dim), dtype=torch.float32)
-    mask_emb = torch.zeros((n, img_dim), dtype=torch.float32)
     src_emb = torch.empty((n, text_dim), dtype=torch.float32)
     tar_emb = torch.empty((n, text_dim), dtype=torch.float32)
-
-    mask_missing_set = set(mask_missing)
 
     def _load_row(i: int):
         sid = sample_ids[i]
         return (
             i,
             _load_pt(_scattered_path(sid, "img")),
-            None if sid in mask_missing_set else _load_pt(_scattered_path(sid, "mask")),
             _load_pt(_scattered_path(sid, "src")),
             _load_pt(_scattered_path(sid, "tar")),
         )
@@ -198,25 +170,20 @@ def _pack_scattered_cache(
 
     with ThreadPoolExecutor(max_workers=32) as pool:
         # Load the embeddings in parallel using a thread pool.
-        for i, img_t, mask_t, src_t, tar_t in tqdm(pool.map(_load_row, range(n)), total=n, desc="Packing embeddings", unit="sample"):
+        for i, img_t, src_t, tar_t in tqdm(pool.map(_load_row, range(n)), total=n, desc="Packing embeddings", unit="sample"):
             img_emb[i] = _check(img_t, i, "image", img_dim)
-            if mask_t is not None:
-                mask_emb[i] = _check(mask_t, i, "mask", img_dim)
             src_emb[i] = _check(src_t, i, "source", text_dim)
             tar_emb[i] = _check(tar_t, i, "target", text_dim)
 
-    tables = {"img": img_emb, "mask": mask_emb, "src": src_emb, "tar": tar_emb}
-    _save_packed_cache(packed_path, sample_ids, tables, mask_missing)
-    return sample_ids, img_emb, mask_emb, src_emb, tar_emb
+    tables = {"img": img_emb, "src": src_emb, "tar": tar_emb}
+    _save_packed_cache(packed_path, sample_ids, tables)
+    return sample_ids, img_emb, src_emb, tar_emb
 
 
 def get_embeddings(
     samples: pd.DataFrame,
-) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return CPU embedding tables (img, mask, src, tar), packed for training.
-
-    Tries the packed cache, then packs scattered files.
-    """
+) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return CPU embedding tables (img, src, tar), packed for training."""
     packed_path = _get_packed_path()
     sample_ids = samples[SAMPLE_ID_COL].tolist()
 
@@ -239,12 +206,11 @@ def get_embeddings_by_sample(
 ) -> dict[str, dict[str, torch.Tensor]]:
     """Embeddings keyed by sample_id, on device."""
     samples = df.drop_duplicates(subset=SAMPLE_ID_COL).sort_values(SAMPLE_ID_COL)
-    sample_ids, img_emb, mask_emb, src_emb, tar_emb = get_embeddings(samples)
-    img_emb, mask_emb, src_emb, tar_emb = img_emb.to(device), mask_emb.to(device), src_emb.to(device), tar_emb.to(device)
+    sample_ids, img_emb, src_emb, tar_emb = get_embeddings(samples)
+    img_emb, src_emb, tar_emb = img_emb.to(device), src_emb.to(device), tar_emb.to(device)
 
     return {sid: {
         "img": img_emb[i],
-        "mask": mask_emb[i],
         "src": src_emb[i],
         "tar": tar_emb[i],
     } for i, sid in enumerate(sample_ids)}

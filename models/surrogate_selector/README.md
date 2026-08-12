@@ -39,7 +39,7 @@ python train_t.py
 # optional: python train_t.py --run-dir runs/<dataset>/<run>
 ```
 
-Reports regret, Spearman correlation, and deviate-gate precision/recall on the test split. Saves `t_train_metrics.json`, `t_test_selections.json`, and `id_to_predictions_<commit>.csv` (`sample_id`, `pred_t_start`, `pred_t_end`) tagged with the commit that produced it.
+Reports regret, Spearman correlation, and deviate-gate precision/recall on the test split. Saves `selection_metrics.json` and `selections.json` for the test split, and `id_to_selections_<slug>.csv` with selected timesteps for every sample_id in the run (`sample_id`, `<scorer>_t_start`, `<scorer>_t_end`, e.g. `linex_a2_t_start`).
 
 ## Configuration
 

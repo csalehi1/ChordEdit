@@ -24,7 +24,6 @@ class EmbeddingTable:
     """One embedding row per unique sample_id."""
 
     img: torch.Tensor   # (n_samples, img_dim)
-    mask: torch.Tensor  # (n_samples, img_dim)
     src: torch.Tensor   # (n_samples, text_dim)
     tar: torch.Tensor   # (n_samples, text_dim)
 
@@ -51,41 +50,14 @@ class CellTensors:
     def n_cells(self) -> int:
         return int(self.grid_rows.shape[1])
 
-    def gather(self, rows: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """(img, mask, src, tar, t, y) for the given cell rows."""
-        sid = self.sample_idx[rows]
-        return (
-            self.emb_table.img[sid],
-            self.emb_table.mask[sid],
-            self.emb_table.src[sid],
-            self.emb_table.tar[sid],
-            self.t[rows],
-            self.y[rows],
-        )
-
-    def iter_flat(self, batch_size: int, shuffle: bool = False):
-        """Yield plain cell batches (used for evaluation)."""
-        n = len(self)
-        order = torch.randperm(n, device=self.t.device) if shuffle else torch.arange(n, device=self.t.device)
-        for k in range(0, n, batch_size):
-            yield self.gather(order[k : k + batch_size])
-
     def gather_grids(self, sel: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """(img, mask, src, tar, t, y) for whole grids.
-
-        Embeddings come back one row per grid, shaped (G, D), while t and y
-        keep their grid axis at (G, n_cells, .). SurrogateRegressor.forward_grid
-        consumes this directly, so a sample's embeddings are projected once
-        rather than once per cell.
-        """
+        """(img, src, tar, y) for whole grids: embeddings (G, D), y (G, n_cells, .)."""
         rows = self.grid_rows[sel]
         sid = self.sample_idx[rows[:, 0]]
         return (
             self.emb_table.img[sid],
-            self.emb_table.mask[sid],
             self.emb_table.src[sid],
             self.emb_table.tar[sid],
-            self.t[rows],
             self.y[rows],
         )
 
@@ -135,10 +107,7 @@ def _build_grid_index(
         rows.append(idx)
         baselines.append(int(hits[0]))
     if not rows:
-        raise ValueError(
-            f"no complete {n_cells}-cell grids with default cell "
-            f"{default_t} (dropped {dropped} sample(s))"
-        )
+        raise ValueError(f"No complete {n_cells}")
     if dropped:
         print(f"Dropped {dropped} sample(s) without a complete {n_cells}-cell grid and default cell.")
     return (
@@ -154,12 +123,11 @@ def create_cell_tensors(
     """Build device-resident CellTensors for each split, sharing one embedding table."""
     frames = [X for X, _ in splits_df.values()]
     samples = pd.concat(frames, ignore_index=True).drop_duplicates(SAMPLE_ID_COL).sort_values(SAMPLE_ID_COL)
-    sample_ids, img_emb, mask_emb, src_emb, tar_emb = get_embeddings(samples)
+    sample_ids, img_emb, src_emb, tar_emb = get_embeddings(samples)
 
     # Build the shared embedding table.
     emb_table = EmbeddingTable(
         img=img_emb.to(device),
-        mask=mask_emb.to(device),
         src=src_emb.to(device),
         tar=tar_emb.to(device),
     )
@@ -305,7 +273,7 @@ def split_df(
     )
 
 
-def save_split_df(
+def save_splits_df(
     train_X: pd.DataFrame,
     val_X: pd.DataFrame,
     test_X: pd.DataFrame,

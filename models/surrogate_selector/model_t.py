@@ -132,6 +132,7 @@ class TimestepSelector:
     def __init__(
         self,
         surrogate_model: SurrogateModel,
+        cell_t_pairs: np.ndarray,
         t_start_values: tuple[float, ...] | list[float] | np.ndarray,
         t_end_values: tuple[float, ...] | list[float] | np.ndarray,
         default_t_start: float = DEFAULT_T_START,
@@ -146,6 +147,10 @@ class TimestepSelector:
         self.mean_surface = None if mean_surface is None else np.asarray(mean_surface, dtype=np.float64)
         self._default_i = _nearest_index(self.t_start_values, default_t_start)
         self._default_j = _nearest_index(self.t_end_values, default_t_end)
+        # Grid positions of the model's output cells, in the training cell order.
+        cell_t_pairs = np.asarray(cell_t_pairs, dtype=np.float64)
+        self._cell_i = nearest_indices(self.t_start_values, cell_t_pairs[:, 0])
+        self._cell_j = nearest_indices(self.t_end_values, cell_t_pairs[:, 1])
 
     @property
     def n_start(self) -> int:
@@ -159,29 +164,21 @@ class TimestepSelector:
     def pred_grid(
         self,
         img_emb: torch.Tensor,
-        mask_emb: torch.Tensor,
         src_emb: torch.Tensor,
         tar_emb: torch.Tensor,
-        t_pairs: np.ndarray,
     ) -> TimestepGridResult:
-        """Batched M^ forward over labeled (t_start, t_end) pairs."""
-        
+        """Single M^ forward predicting every labeled (t_start, t_end) cell."""
+
         device = self.surrogate.regressor.target_mean.device
-        t_pairs = np.asarray(t_pairs, dtype=np.float64)
+        img, src, tar = (
+            (e.unsqueeze(0) if e.dim() == 1 else e).to(device)
+            for e in (img_emb, src_emb, tar_emb)
+        )
+        pred = self.surrogate.pred_emb(img, src, tar)[0].cpu().numpy()
 
-        # Prepare the embeddings and timestep pairs.
-        embs = [e.unsqueeze(0) if e.dim() == 1 else e for e in (img_emb, mask_emb, src_emb, tar_emb)]
-        img, mask, src, tar = (e.to(device).expand(len(t_pairs), -1) for e in embs)
-        t = torch.as_tensor(t_pairs, dtype=torch.float, device=device)
-        
-        # Predict for each timestep pair.
-        pred = self.surrogate.pred_emb(img, mask, src, tar, t).cpu().numpy()
-
-        # Scatter labeled preds into the grid.
-        i = nearest_indices(self.t_start_values, t_pairs[:, 0])
-        j = nearest_indices(self.t_end_values, t_pairs[:, 1])
+        # Scatter the per-cell preds into the grid.
         deltas = np.full((self.n_start, self.n_end, 2), np.nan)
-        deltas[i, j] = pred
+        deltas[self._cell_i, self._cell_j] = pred
         if self.mean_surface is not None:
             # For residual space, add the train mean surface back.
             deltas = deltas + self.mean_surface
@@ -243,18 +240,6 @@ class TimestepSelector:
             clip_grid=grid.clip_grid,
         )
 
-    # @torch.no_grad()
-    # def predict(
-    #     self,
-    #     image,
-    #     mask,
-    #     src_prompt: str,
-    #     tar_prompt: str,
-    #     noise_floor: float = NOISE_FLOOR_PHI,
-    # ) -> TimestepSelection:
-    #     grid = self.predict_grid(image, mask, src_prompt, tar_prompt)
-    #     return self.select_from_grid(grid, noise_floor=noise_floor)
-
 
 def load_timestep_selector(
     weights_path: Path | str,
@@ -268,10 +253,12 @@ def load_timestep_selector(
         device = resolve_device(gpu)
     ckpt = torch.load(weights_path, map_location=device, weights_only=False)
 
-    # Load the surrogate model.
-    model = SurrogateModel(int(ckpt["img_dim"]), int(ckpt["text_dim"]), device=device)
+    # Load the surrogate model. The checkpoint's cell_t_pairs give the output
+    # cell count and each cell's (t_start, t_end) grid position.
+    cell_t_pairs = ckpt["cell_t_pairs"].cpu().numpy()
+    model = SurrogateModel(int(ckpt["img_dim"]), int(ckpt["text_dim"]), int(cell_t_pairs.shape[0]), device=device)
     model.regressor.load_state_dict(ckpt["regressor_state_dict"])
-    model.regressor.set_target_stats(ckpt["target_mean"], ckpt["target_std"])
+    model.regressor.set_target_standardization(ckpt["target_mean"], ckpt["target_std"])
     model.regressor.to(device).eval()
 
     # Load the mean surface.
@@ -289,4 +276,4 @@ def load_timestep_selector(
         if M_TARGET_SPACE == "residual" else None
     )
     print(f"Loaded mean_surface ({surface['split']} split, {surface['n_samples']} samples): T selects {'residual + mean surface' if mean_surface is not None else 'predicted deltas'}.")
-    return TimestepSelector(model, t_start_values=t_start_values, t_end_values=t_end_values, mean_surface=mean_surface)
+    return TimestepSelector(model, cell_t_pairs, t_start_values=t_start_values, t_end_values=t_end_values, mean_surface=mean_surface)

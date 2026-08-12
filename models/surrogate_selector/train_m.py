@@ -1,9 +1,9 @@
 # train_m.py
 
 """
-Train the surrogate model M^ (paper: M^(x_src, c_src, c_tar, t*, t**) -> s):
+Train the surrogate model M^ (paper: M^(x_src, c_src, c_tar) -> s):
 
-    M(img_emb, mask_emb, src_emb, tar_emb, t_start, t_end) -> (psnr, clip)
+    M(img_emb, src_emb, tar_emb) -> (n_cells, 2) grid of (psnr, clip)
 
 Run from this directory:
 
@@ -30,22 +30,8 @@ import numpy as np
 import pandas as pd
 import torch
 
-from _data import (
-    CellTensors,
-    create_cell_tensors,
-    load_df,
-    prepare_df,
-    save_split_df,
-    split_df,
-)
-from _helpers import (
-    calc_mean_surface,
-    calc_phi,
-    format_metric_table,
-    gather_at_pairs,
-    save_mean_surface,
-    save_run_settings,
-)
+from _data import *
+from _helpers import *
 from model_m import SurrogateModel, pairwise_ranking_loss
 from settings import *
 
@@ -53,9 +39,8 @@ from settings import *
 def parse_args() -> argparse.Namespace:
     # Argument parser for the command line.
     parser = argparse.ArgumentParser(description="Train metric surrogate M")
-    # Read off argv by settings.py at import time, before this parser runs;
-    # declared here so it shows up in --help and is not rejected as unknown.
-    parser.add_argument("--settings-path", default=None, help="config file to use instead of ./settings.json")
+    # Read off argv by settings.py at import time, before this parser runs.
+    parser.add_argument("--settings-path", default=None)
     return parser.parse_args()
 
 
@@ -66,9 +51,9 @@ def eval_regression(
     device: torch.device | None = None,
 ) -> dict[str, float]:
     """Per-target MAE/RMSE/R^2 in target units, plus z-scored MSE loss."""
-    
-    # Evaluate in chunks of 16384 cells.
-    EVAL_CHUNK = 16384
+
+    # Evaluate in chunks of 256 grids.
+    EVAL_CHUNK = 256
 
     # Set the model to evaluation mode.
     model.regressor.eval()
@@ -76,14 +61,14 @@ def eval_regression(
     loss_sum, n = 0.0, 0
     mean, std = model.regressor.target_mean, model.regressor.target_std
 
-    # Evaluate the model over the split's cells.
-    for img, mask, src, tar, t, y in cells.iter_flat(EVAL_CHUNK):
-        out = model.regressor(img, mask, src, tar, t)
+    # Evaluate the model over the split's grids.
+    for (img, src, tar, y), _ in cells.iter_grids(EVAL_CHUNK, shuffle=False):
+        out = model.regressor(img, src, tar)
         y_std = (y - mean) / std
         loss_sum += torch.nn.functional.mse_loss(out, y_std, reduction="sum").item()
         n += y.numel()
-        preds.append(model.regressor.denormalize(out))
-        trues.append(y)
+        preds.append(model.regressor.destandardize(out).reshape(-1, y.shape[-1]))
+        trues.append(y.reshape(-1, y.shape[-1]))
     pred = torch.cat(preds)
     true = torch.cat(trues)
     err = pred - true
@@ -134,8 +119,8 @@ def eval_selection(
     true_delta_parts, pred_delta_parts, base_parts = [], [], []
     for k in range(0, cells.n_grids, chunk_grids):
         sel = torch.arange(k, min(k + chunk_grids, cells.n_grids), device=cells.t.device)
-        img, mask, src, tar, t, _ = cells.gather_grids(sel)
-        out = model.regressor.denormalize(model.regressor.forward_grid(img, mask, src, tar, t)).double()
+        img, src, tar, _ = cells.gather_grids(sel)
+        out = model.regressor.destandardize(model.regressor(img, src, tar)).double()
         pred_delta_parts.append(out + offset)
         true_delta_parts.append(cells.y[cells.grid_rows[sel]].double() + offset)
         base_parts.append(cells.grid_baseline[sel])
@@ -149,7 +134,7 @@ def eval_selection(
     rho = _row_spearman(true_phi, pred_phi)
     rho = rho[~rho.isnan()]
     chosen = pred_phi.argmax(dim=-1, keepdim=True)
-    gain = true_phi.gather(-1, chosen).squeeze(-1)  # phi(default) == 0, so this is gain over the default
+    gain = true_phi.gather(-1, chosen).squeeze(-1)  # phi(default) == 0
     reg = true_phi.max(dim=-1).values - gain
 
     # Per-metric rank agreement, and the true delta the picks land on: a selector
@@ -193,10 +178,12 @@ def train(
     splits_cells = create_cell_tensors(splits_df, device)
     train_cells, val_cells, test_cells = splits_cells["train"], splits_cells["val"], splits_cells["test"]
 
-    # Size the regressor from precomputed embedding dims (no ChordEdit encoders).
+    # Size the regressor from precomputed embedding dims and the data's grid.
+    # cell_t_pairs maps output cell k to its canonical sorted (t_start, t_end).
     img_dim = int(train_cells.emb_table.img.shape[1])
     text_dim = int(train_cells.emb_table.src.shape[1])
-    model = SurrogateModel(img_dim, text_dim, device=device)
+    cell_t_pairs = train_cells.t[train_cells.grid_rows[0]].detach().cpu()
+    model = SurrogateModel(img_dim, text_dim, train_cells.n_cells, device=device)
 
     # Calculate and save the train split's true mean delta surface. 
     # "residual" space predicts deviations from the this surface.
@@ -221,7 +208,7 @@ def train(
 
     if NORMALIZE_TARGETS:
         # Store train mean/std so MSE is computed in z-scored space.
-        model.regressor.set_target_stats(y_train.mean(0), y_train.std(0))
+        model.regressor.set_target_standardization(y_train.mean(0), y_train.std(0))
     print(
         "Target columns (train):\n"
         f"  {'Target':<38} {'Mean':>8} {'Std':>8}\n"
@@ -254,31 +241,26 @@ def train(
 
     # Iterate over the epochs.
     for epoch in range(1, EPOCHS + 1):
-
         epoch_start = time.perf_counter()
         model.regressor.train()
 
-        for (img, mask, src, tar, t, y), _ in train_cells.iter_grids(grids_per_batch, shuffle=True):
+        # Iterate over the batches.
+        for (img, src, tar, y), _ in train_cells.iter_grids(grids_per_batch, shuffle=True):
 
-            # Predict the metric values for the timestep grid.
-            out = model.regressor.forward_grid(img, mask, src, tar, t)
+            # Forward pass.
+            out = model.regressor(img, src, tar)
 
-            # Weighted MSE loss on normalized targets.
-            # TODO: Do we need different behavior if NORMALIZE_TARGETS=True?
+            # Compute the loss.
             se = (out - (y - y_mean) / y_std) ** 2
             loss = (se * loss_weights).mean()
-
-            # If specified, use per-sample ranking loss.
             if RANKING_LOSS_WEIGHT > 0:
-                y_hat = model.regressor.denormalize(out)
-                # Adding the train offset (zeros in the "delta" target space)
-                # turns (residual) targets and predictions into the full
-                # deltas phi consumes; the predicted grid is never normalized.
+                y_hat = model.regressor.destandardize(out)
+                # Add the train offset to convert to delta target space.
                 true_delta, pred_delta = y + train_offset, y_hat + train_offset
                 true_phi, pred_phi = calc_phi(true_delta), calc_phi(pred_delta)
                 loss = loss + RANKING_LOSS_WEIGHT * pairwise_ranking_loss(pred_phi, true_phi, top_k=RANKING_TOP_K)
 
-            # Backpropagate the training loss.
+            # Backpropagate the loss.
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -301,24 +283,28 @@ def train(
             live_state = {k: v.detach().clone() for k, v in model.regressor.state_dict().items()}
             model.regressor.load_state_dict(ema_state)
 
-        regression_res = eval_regression(model, val_cells, device)
-        selection_res = eval_selection(model, val_cells, offsets["val"])
+        # Evaluate regression and selection on train and val.
+        train_regression = eval_regression(model, train_cells, device)
+        train_selection = eval_selection(model, train_cells, offsets["train"])
+        val_regression = eval_regression(model, val_cells, device)
+        val_selection = eval_selection(model, val_cells, offsets["val"])
 
+        # Choose a checkpoint metric to gauge improvement.
         if CKPT_METRIC == "val_phi_spearman":
-            score = selection_res.get("phi_spearman", float("nan"))
+            score = val_selection.get("phi_spearman", float("nan"))
         elif CKPT_METRIC == "val_regret":
-            score = -selection_res.get("regret_median", float("nan"))
+            score = -val_selection.get("regret_median", float("nan"))
         elif CKPT_METRIC == "val_gain_mean":
-            score = selection_res.get("gain_mean", float("nan"))
+            score = val_selection.get("gain_mean", float("nan"))
         else:
             # Fallback to a regression-based metric.
-            score = -regression_res["loss"]
+            score = -val_regression["loss"]
 
         # Save the best weights if the checkpoint metric is improved.
         improved = score > best_score
         if improved:
             best_score, best_epoch, since_improved = score, epoch, 0
-            best_val_loss = regression_res["loss"]
+            best_val_loss = val_regression["loss"]
             torch.save({
                 "regressor_state_dict": model.regressor.state_dict(),
                 "target_mean": model.regressor.target_mean.cpu(),
@@ -326,19 +312,19 @@ def train(
                 "target_cols": list(M_TARGET_COLS),
                 "img_dim": img_dim,
                 "text_dim": text_dim,
+                "cell_t_pairs": cell_t_pairs,
             }, weights_out)
         else:
             since_improved += 1
 
-        # Evaluate the model on the train and val sets.
-        train_results = eval_regression(model, train_cells, device)
         if live_state is not None:
             model.regressor.load_state_dict(live_state)
         history.append({
-            "epoch": epoch, 
-            "train": train_results, 
-            "val": regression_res, 
-            "val_selection": selection_res
+            "epoch": epoch,
+            "train": train_regression,
+            "train_selection": train_selection,
+            "val": val_regression,
+            "val_selection": val_selection,
         })
         elapsed = time.perf_counter() - epoch_start
         print(
@@ -346,17 +332,17 @@ def train(
             + ("  *" if improved else "")
             + "\n"
             + format_metric_table([
-                ("train", train_results, None),
-                ("val", regression_res, selection_res),
+                ("train", train_regression, train_selection),
+                ("val", val_regression, val_selection),
             ])
         )
 
         # Early stop if the checkpoint metric has stalled.
         if EARLY_STOP_PATIENCE > 0 and epoch >= 5 and since_improved >= EARLY_STOP_PATIENCE:
-            print(f"Early stop at epoch {epoch}: no improvement in {since_improved} epochs.")
+            print(f"No improvement in {since_improved} epochs. Early stopping at epoch {epoch}.")
             break
 
-    # Load the best weights and evaluate the model on the test set.
+    # Load the best weights and evaluate on the test set.
     checkpoint = torch.load(weights_out, map_location=device, weights_only=False)
     model.regressor.load_state_dict(checkpoint["regressor_state_dict"])
 
@@ -365,8 +351,8 @@ def train(
     print("\n" + format_metric_table([("test", results, test_sel)]))
 
     # Save the splits and metrics.
-    save_split_df(train_X, splits_df["val"][0], splits_df["test"][0], run_dir)
-    metrics_out = run_dir / "m_train_metrics.json"
+    save_splits_df(train_X, splits_df["val"][0], splits_df["test"][0], run_dir)
+    metrics_out = run_dir / "regression_metrics.json"
     with open(metrics_out, "w") as f:
         json.dump({
             "best_epoch": best_epoch,
