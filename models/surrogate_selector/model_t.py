@@ -156,76 +156,40 @@ class TimestepSelector:
         return len(self.t_end_values)
 
     @torch.no_grad()
-    def predict_grid_from_emb(
+    def pred_grid(
         self,
         img_emb: torch.Tensor,
         mask_emb: torch.Tensor,
         src_emb: torch.Tensor,
         tar_emb: torch.Tensor,
-        t_pairs: np.ndarray | None = None,
+        t_pairs: np.ndarray,
     ) -> TimestepGridResult:
-        """Batched M^ forward over the grid."""
+        """Batched M^ forward over labeled (t_start, t_end) pairs."""
+        
         device = self.surrogate.regressor.target_mean.device
-        if img_emb.dim() == 1:
-            img_emb = img_emb.unsqueeze(0)
-        if mask_emb.dim() == 1:
-            mask_emb = mask_emb.unsqueeze(0)
-        if src_emb.dim() == 1:
-            src_emb = src_emb.unsqueeze(0)
-        if tar_emb.dim() == 1:
-            tar_emb = tar_emb.unsqueeze(0)
+        t_pairs = np.asarray(t_pairs, dtype=np.float64)
 
-        n1, n2 = self.n_start, self.n_end
-        if t_pairs is None:
-            tt1, tt2 = np.meshgrid(self.t_start_values, self.t_end_values, indexing="ij")
-            t1, t2 = tt1.reshape(-1), tt2.reshape(-1)
-            scatter = False
-        else:
-            t_pairs = np.asarray(t_pairs, dtype=np.float64)
-            if t_pairs.ndim != 2 or t_pairs.shape[1] != 2:
-                raise ValueError(f"t_pairs must have shape (N, 2), got {t_pairs.shape}")
-            t1, t2 = t_pairs[:, 0], t_pairs[:, 1]
-            scatter = True
+        # Prepare the embeddings and timestep pairs.
+        embs = [e.unsqueeze(0) if e.dim() == 1 else e for e in (img_emb, mask_emb, src_emb, tar_emb)]
+        img, mask, src, tar = (e.to(device).expand(len(t_pairs), -1) for e in embs)
+        t = torch.as_tensor(t_pairs, dtype=torch.float, device=device)
+        
+        # Predict for each timestep pair.
+        pred = self.surrogate.pred_emb(img, mask, src, tar, t).cpu().numpy()
 
-        # Expand the embeddings to the number of cells.
-        n_cells = len(t1)
-        img = img_emb.to(device).expand(n_cells, -1)
-        mask = mask_emb.to(device).expand(n_cells, -1)
-        src = src_emb.to(device).expand(n_cells, -1)
-        tar = tar_emb.to(device).expand(n_cells, -1)
-        t = torch.tensor(np.stack([t1, t2], axis=1), dtype=torch.float, device=device)
-        pred = self.surrogate.predict_emb(img, mask, src, tar, t).cpu().numpy()
-
-        # Reshape the predictions into a grid.
-        if not scatter:
-            psnr = pred[:, 0].reshape(n1, n2)
-            clip = pred[:, 1].reshape(n1, n2)
-        else:
-            i = nearest_indices(self.t_start_values, t1)
-            j = nearest_indices(self.t_end_values, t2)
-            psnr = np.full((n1, n2), np.nan)
-            clip = np.full((n1, n2), np.nan)
-            psnr[i, j] = pred[:, 0]
-            clip[i, j] = pred[:, 1]
-
-        # The towers predict per-sample normalized deltas (minus the mean
-        # surface in the "residual" target space); adding the surface back
-        # gives the full deltas phi consumes, so the predicted grid is never
-        # renormalized. Axis cells the surface leaves NaN (unlabeled during
-        # training) stay NaN, so selection never picks a cell it cannot pin.
+        # Scatter labeled preds into the grid.
+        i = nearest_indices(self.t_start_values, t_pairs[:, 0])
+        j = nearest_indices(self.t_end_values, t_pairs[:, 1])
+        deltas = np.full((self.n_start, self.n_end, 2), np.nan)
+        deltas[i, j] = pred
         if self.mean_surface is not None:
-            psnr = psnr + self.mean_surface[..., 0]
-            clip = clip + self.mean_surface[..., 1]
-        deltas = np.stack([psnr, clip], axis=-1)[None]
-        phi = phi_from_delta_grids(deltas)[0]
+            # For residual space, add the train mean surface back.
+            deltas = deltas + self.mean_surface
+        psnr, clip = deltas[..., 0], deltas[..., 1]
+        phi = phi_from_delta_grids(deltas[None])[0]
         return TimestepGridResult(psnr, clip, phi, self.t_start_values, self.t_end_values)
 
-    # @torch.no_grad()
-    # def predict_grid(self, image, mask, src_prompt: str, tar_prompt: str) -> TimestepGridResult:
-    #     img_emb, mask_emb, src_emb, tar_emb = self.surrogate.encode([image], [mask], [src_prompt], [tar_prompt])
-    #     return self.predict_grid_from_emb(img_emb, mask_emb, src_emb, tar_emb)
-
-    def select_from_grid(
+    def select_grid(
         self,
         grid: TimestepGridResult,
         noise_floor: float = NOISE_FLOOR_PHI,

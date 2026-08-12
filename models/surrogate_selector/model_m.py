@@ -500,7 +500,7 @@ class SurrogateModel(nn.Module):
     #         self.text_encoder(tar_prompts).to(device),
     #     )
 
-    def predict_emb(
+    def pred_emb(
         self,
         img_emb: torch.Tensor,  # (N, D_img)
         mask_emb: torch.Tensor, # (N, D_img)
