@@ -1,6 +1,6 @@
 {
   "CHORD_EDIT_MODEL": "sd_turbo",
-  "DIR_NAME": "UltraEdit_Region_10",
+  "DIR_NAME": "UltraEdit_Region_10000",
   "TARGET_T_DELTA": 0.0,
   "TRAIN_FRAC": 0.8,
   "VAL_FRAC": 0.1,
@@ -8,6 +8,8 @@
   "SPLIT_SEED": 42,
   "USE_CENTER_CROP": true,
   "IMG_ENCODER": "linear",
+  "IMG_EMB_SOURCE": "vae",
+  "TEXT_EMB_SOURCE": "sd",
   "IMG_PROJ_DIM": 512,
   "TEXT_PROJ_DIM": 256,
   "MLP_WIDE": 256,

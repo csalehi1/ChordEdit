@@ -39,11 +39,21 @@ if not SETTINGS_JSON.exists():
 CONFIG: dict = {k: v for k, v in _json.loads(SETTINGS_JSON.read_text()).items() if not k.startswith("_")}
 
 
+# Sentinel so that None stays a usable default.
+_REQUIRED = object()
+
+
 # Function to get a value from the settings json.
-def _cfg(name):
-    """One value from settings.json, with a readable error when it is absent."""
+def _cfg(name, default=_REQUIRED):
+    """One value from settings.json, with a readable error when it is absent.
+
+    Keys added after a run was trained pass a default so that the run's
+    settings snapshot still loads when train_t.py replays it.
+    """
     if name not in CONFIG:
-        raise KeyError(f"{name!r} is missing from {SETTINGS_JSON}")
+        if default is _REQUIRED:
+            raise KeyError(f"{name!r} is missing from {SETTINGS_JSON}")
+        return default
     return CONFIG[name]
 
 
@@ -145,6 +155,23 @@ USE_CENTER_CROP = bool(_cfg("USE_CENTER_CROP"))
 # latents with a single Linear layer. "conv" projects with a
 # convolutional layer.
 IMG_ENCODER = str(_cfg("IMG_ENCODER"))
+
+# Which image representation the regressor sees. "vae" is the flattened SD VAE
+# latent the model has always used. "clip" replaces it with a mean-pooled
+# CLIP-L/14 embedding, the encoder CLIP-Edited is scored with, pooled the way
+# the cached text embeddings were. "vae+clip" keeps the latent and projects the
+# CLIP embedding as a second image arm.
+IMG_EMB_SOURCE = str(_cfg("IMG_EMB_SOURCE", "vae"))
+if IMG_EMB_SOURCE not in ("vae", "clip", "vae+clip"):
+    raise ValueError(f"Unknown {IMG_EMB_SOURCE=}; expected 'vae', 'clip' or 'vae+clip'")
+
+# Which prompt representation the regressor sees. "sd" is the sd_turbo text
+# encoder's mean-pooled hidden states, the cached source.pt / target.pt. "clip"
+# replaces them with CLIP-L/14 text embeddings, so that image and text share one
+# space and the CLIP-Edited cosine becomes expressible from the inputs.
+TEXT_EMB_SOURCE = str(_cfg("TEXT_EMB_SOURCE", "sd"))
+if TEXT_EMB_SOURCE not in ("sd", "clip"):
+    raise ValueError(f"Unknown {TEXT_EMB_SOURCE=}; expected 'sd' or 'clip'")
 
 # Regressor MLP architecture.
 IMG_PROJ_DIM = int(_cfg("IMG_PROJ_DIM"))

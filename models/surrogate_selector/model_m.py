@@ -156,19 +156,36 @@ class SurrogateRegressor(nn.Module):
         if n_targets != 2:
             raise ValueError("SurrogateRegressor expects exactly two targets (PSNR, CLIP)")
 
-        def image_projector() -> nn.Module:
+        def image_projector(n_in: int, allow_conv: bool = True) -> nn.Module:
             if str(IMG_ENCODER) == "conv":
-                return ConvImageProjector(img_dim, img_proj_dim)
+                if not allow_conv:
+                    raise ValueError(f"{IMG_ENCODER=} applies to VAE latents only, not CLIP embeddings")
+                return ConvImageProjector(n_in, img_proj_dim)
             if str(IMG_ENCODER) == "linear":
-                return LinearImageProjector(img_dim, img_proj_dim)
+                return LinearImageProjector(n_in, img_proj_dim)
             raise ValueError(f"Unknown {IMG_ENCODER=}")
 
-        # Project the embeddings to the MLP input dimension.
-        self.img_proj = image_projector()
+        # Project the embeddings to the MLP input dimension. Under "vae+clip"
+        # the image input arrives as one concatenated tensor (embeddings.py) and
+        # each half gets its own projector.
+        self.img_emb_source = str(IMG_EMB_SOURCE)
+        if self.img_emb_source == "vae+clip":
+            from clip_image import CLIP_IMG_DIM
+
+            self.vae_dim = img_dim - CLIP_IMG_DIM
+            if self.vae_dim <= 0:
+                raise ValueError(f"{img_dim=} is too small to hold a {CLIP_IMG_DIM}-d CLIP embedding")
+            self.img_proj = image_projector(self.vae_dim)
+            self.clip_img_proj = image_projector(CLIP_IMG_DIM, allow_conv=False)
+        else:
+            self.vae_dim = img_dim
+            self.img_proj = image_projector(img_dim, allow_conv=self.img_emb_source == "vae")
+
         self.text_proj = LinearTextProjector(text_dim * 4, text_proj_dim)
 
         # Build the PSNR and CLIP towers.
-        n_features = img_proj_dim + text_proj_dim
+        n_img_arms = 2 if self.img_emb_source == "vae+clip" else 1
+        n_features = n_img_arms * img_proj_dim + text_proj_dim
         self.psnr_body = MLPBody(n_features, n_wide, n_hidden, n_inner, psnr_dropout_rate)
         self.psnr_head = nn.Linear(n_inner, n_cells)
         self.clip_body = MLPBody(n_features, n_wide, n_hidden, n_inner, clip_dropout_rate)
@@ -193,7 +210,14 @@ class SurrogateRegressor(nn.Module):
     ) -> torch.Tensor:          # (N, n_cells, 2)
         """Return standardized per-cell metric predictions."""
         text_emb = combine_text_embs(src_emb, tar_emb)
-        x = torch.cat([self.img_proj(img_emb), self.text_proj(text_emb)], dim=-1)
+        if self.img_emb_source == "vae+clip":
+            img_parts = [
+                self.img_proj(img_emb[..., : self.vae_dim]),
+                self.clip_img_proj(img_emb[..., self.vae_dim :]),
+            ]
+        else:
+            img_parts = [self.img_proj(img_emb)]
+        x = torch.cat([*img_parts, self.text_proj(text_emb)], dim=-1)
         psnr = self.psnr_head(self.psnr_body(x))
         clip = self.clip_head(self.clip_body(x))
         return torch.stack([psnr, clip], dim=-1)

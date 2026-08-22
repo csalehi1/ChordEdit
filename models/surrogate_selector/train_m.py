@@ -155,6 +155,7 @@ def eval_selection(
         "regret_median": float(reg.quantile(0.5).item()),
         "regret_p90": float(reg.quantile(0.9).item()),
         "gain_mean": float(gain.mean().item()),
+        "win_rate": float((gain > 0).double().mean().item()),
         "deviate_rate": float((chosen.squeeze(-1) != baseline).double().mean().item()),
         **per_metric,
     }

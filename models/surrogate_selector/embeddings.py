@@ -180,6 +180,43 @@ def _pack_scattered_cache(
     return sample_ids, img_emb, src_emb, tar_emb
 
 
+def _apply_img_emb_source(samples: pd.DataFrame, img_emb: torch.Tensor) -> torch.Tensor:
+    """The image table the regressor sees, per IMG_EMB_SOURCE.
+
+    "vae+clip" concatenates the two so that the image input stays a single
+    tensor; the regressor splits it back apart on the known CLIP width, which
+    keeps every caller (CellTensors, the checkpoint's img_dim, train_t) unchanged.
+    """
+    if IMG_EMB_SOURCE == "vae":
+        return img_emb
+
+    from clip_image import CLIP_IMG_DIM, get_clip_image_embeddings
+
+    clip_emb = get_clip_image_embeddings(samples)
+    if clip_emb.shape[0] != img_emb.shape[0] or clip_emb.shape[1] != CLIP_IMG_DIM:
+        raise ValueError(f"CLIP image table {tuple(clip_emb.shape)} does not match {tuple(img_emb.shape)}")
+    if IMG_EMB_SOURCE == "clip":
+        return clip_emb
+    return torch.cat([img_emb, clip_emb], dim=1)
+
+
+def _apply_text_emb_source(
+    samples: pd.DataFrame,
+    src_emb: torch.Tensor,
+    tar_emb: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The (source, target) prompt tables the regressor sees, per TEXT_EMB_SOURCE."""
+    if TEXT_EMB_SOURCE == "sd":
+        return src_emb, tar_emb
+
+    from clip_image import CLIP_TXT_DIM, get_clip_text_embeddings
+
+    both = get_clip_text_embeddings(samples)
+    if both.shape[0] != src_emb.shape[0] or both.shape[1] != 2 * CLIP_TXT_DIM:
+        raise ValueError(f"CLIP text table {tuple(both.shape)} does not match {tuple(src_emb.shape)}")
+    return both[:, :CLIP_TXT_DIM].contiguous(), both[:, CLIP_TXT_DIM:].contiguous()
+
+
 def get_embeddings(
     samples: pd.DataFrame,
 ) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -188,16 +225,17 @@ def get_embeddings(
     sample_ids = samples[SAMPLE_ID_COL].tolist()
 
     cached = _load_packed_cache(packed_path, sample_ids)
-    if cached is not None:
-        print("Loaded packed embeddings from cache.")
-        return cached
-
-    packed = _pack_scattered_cache(samples, packed_path)
-    if packed is not None:
+    if cached is None:
+        cached = _pack_scattered_cache(samples, packed_path)
+        if cached is None:
+            raise RuntimeError(f"Embeddings unavailable: {packed_path} cannot cover {len(sample_ids)} requested.")
         print("Loaded scattered embeddings from cache.")
-        return packed
+    else:
+        print("Loaded packed embeddings from cache.")
 
-    raise RuntimeError(f"Embeddings unavailable: {packed_path} cannot cover {len(sample_ids)} requested.")
+    sids, img_emb, src_emb, tar_emb = cached
+    src_emb, tar_emb = _apply_text_emb_source(samples, src_emb, tar_emb)
+    return sids, _apply_img_emb_source(samples, img_emb), src_emb, tar_emb
 
 
 def get_embeddings_by_sample(
