@@ -51,20 +51,55 @@ SD_COMPONENT_SUBDIRS = {
     "vae_path": "vae",
 }
 
+# SDXL adds a second tokenizer/text-encoder pair.
+SDXL_COMPONENT_SUBDIRS = {
+    **SD_COMPONENT_SUBDIRS,
+    "tokenizer_2_path": "tokenizer_2",
+    "text_encoder_2_path": "text_encoder_2",
+}
+
+# Per --model-type loading config. FLUX has no component_subdirs: the
+# encoder-only stand-in loads straight from the diffusers model root, and
+# supports --skip-generated embedding caching only (no grid generation).
+_CHORD_EDIT_MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
+    "sd": {
+        "component_subdirs": SD_COMPONENT_SUBDIRS,
+        "default_model_root": DEFAULT_MODEL_ROOT,
+        "encode_only": False,
+    },
+    "sdxl": {
+        "component_subdirs": SDXL_COMPONENT_SUBDIRS,
+        "default_model_root": "/shared/ssd_30T/mirick/models/sdxl-turbo",
+        "encode_only": False,
+    },
+    "flux": {
+        "component_subdirs": None,
+        "default_model_root": "/shared/ssd_30T/salehi/models/FLUX.1-schnell",
+        "encode_only": True,
+    },
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", required=True)
-    parser.add_argument("--model-root", required=True)
+    parser.add_argument("--model-root", default=None, help="Defaults per --model-type (see _CHORD_EDIT_MODEL_CONFIGS).")
+    parser.add_argument("--model-type", choices=sorted(_CHORD_EDIT_MODEL_CONFIGS), default="sd")
     parser.add_argument("--embeddings-root", default=None)
     parser.add_argument("--generated-root", default=None)
     parser.add_argument("--gpus", nargs="+", type=int, default=[0])
     parser.add_argument("--max-samples", type=int, default=None)
-    # Optional flags: --add-plots, --cache-masks, --skip-embeddings, --skip-generated, --diagonal-optimization.
+    # Optional flags: --add-plots, --cache-masks, --skip-embeddings, --skip-generated,
+    # --minimal-embeddings, --diagonal-optimization.
     parser.add_argument("--add-plots", action="store_true")
     parser.add_argument("--cache-masks", action="store_true")
     parser.add_argument("--skip-embeddings", action="store_true")
     parser.add_argument("--skip-generated", action="store_true")
+    parser.add_argument(
+        "--minimal-embeddings",
+        action="store_true",
+        help="Save only source.pt, target.pt, and image_tokens.pt per sample (no flat/token extras, no CSV).",
+    )
     parser.add_argument("--diagonal-optimization", action="store_true")
     return parser.parse_args()
 
@@ -75,12 +110,14 @@ def run_shard(
     embeddings_root: Path,
     generated_root: Path,
     model_root: str,
+    model_type: str,
     max_samples: int | None,
     write_plots: bool,
     diagonal_optimization: bool,
     cache_masks: bool,
     skip_embeddings: bool,
     skip_generated: bool,
+    minimal_embeddings: bool,
     num_shards: int,
     shard: int,
     gpu: int,
@@ -107,7 +144,9 @@ def run_shard(
 
     # Only shard 0 writes the full-dataset embeddings/inputs CSVs (avoids races).
     if shard == 0:
-        if not skip_embeddings:
+        if not skip_embeddings and not minimal_embeddings:
+            # Minimal mode skips the CSV: its image_embedding column points at
+            # image.pt, which minimal mode does not write.
             emb_dest = write_id_to_embeddings(embeddings_root, mapping_path, cache_masks=cache_masks)
             LOGGER.info("Wrote %s", emb_dest)
         if not skip_generated:
@@ -128,7 +167,10 @@ def run_shard(
     )
 
     # After CUDA_VISIBLE_DEVICES pinning, the only visible device is cuda:0.
-    bind_pipeline(load_pipeline(model_root, "cuda:0", base_config, SD_COMPONENT_SUBDIRS))
+    model_config = _CHORD_EDIT_MODEL_CONFIGS[model_type]
+    bind_pipeline(
+        load_pipeline(model_root, "cuda:0", base_config, model_config["component_subdirs"], model_type)
+    )
 
     # Select (t_start, t_end) pairs, including filters for diagonal optimization
     # and t_start - t_delta >= 0 (invalid when the delta window would go negative).
@@ -146,7 +188,10 @@ def run_shard(
         # Determine if sample embeddings are already complete (i.e., partially generated).
         need_embeddings = False
         if not skip_embeddings:
-            all_embedding_names = (*settings.EMBEDDING_FILENAMES, *settings.TOKEN_EMBEDDING_FILENAMES)
+            if minimal_embeddings:
+                all_embedding_names = settings.MINIMAL_EMBEDDING_FILENAMES
+            else:
+                all_embedding_names = (*settings.EMBEDDING_FILENAMES, *settings.TOKEN_EMBEDDING_FILENAMES)
             emb_paths = [emb_dir / name for name in all_embedding_names]
             # Masks are optional per sample; when caching them, an existing trio without mask.pt is incomplete.
             if mask_rel:
@@ -203,6 +248,7 @@ def run_shard(
             embeddings_dir=emb_dir if need_embeddings else None,
             mask_image=mask_image,
             skip_generated=encode_only,
+            minimal_embeddings=minimal_embeddings,
         )
 
         if encode_only:
@@ -248,6 +294,15 @@ def main() -> None:
         raise SystemExit("--skip-embeddings cannot be combined with --skip-generated")
     if args.cache_masks and args.skip_embeddings:
         raise SystemExit("--cache-masks cannot be combined with --skip-embeddings")
+    if args.cache_masks and args.minimal_embeddings:
+        raise SystemExit("--cache-masks cannot be combined with --minimal-embeddings")
+    if args.minimal_embeddings and args.skip_embeddings:
+        raise SystemExit("--minimal-embeddings cannot be combined with --skip-embeddings")
+    model_config = _CHORD_EDIT_MODEL_CONFIGS[args.model_type]
+    if model_config["encode_only"] and not args.skip_generated:
+        raise SystemExit(f"--model-type {args.model_type} supports embedding caching only; pass --skip-generated")
+    if args.model_root is None:
+        args.model_root = model_config["default_model_root"]
     data_root = Path(args.data_root).expanduser().resolve()
     validate_dataset_root(data_root)
     gpus = args.gpus
@@ -282,12 +337,14 @@ def main() -> None:
         embeddings_root=embeddings_root,
         generated_root=generated_root,
         model_root=args.model_root,
+        model_type=args.model_type,
         max_samples=args.max_samples,
         write_plots=args.add_plots,
         diagonal_optimization=args.diagonal_optimization,
         cache_masks=args.cache_masks,
         skip_embeddings=args.skip_embeddings,
         skip_generated=args.skip_generated,
+        minimal_embeddings=args.minimal_embeddings,
         num_shards=len(gpus),
     )
 

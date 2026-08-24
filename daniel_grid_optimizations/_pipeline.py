@@ -135,22 +135,32 @@ def _token_cpu(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().float().cpu().clone()
 
 
-def _(hidden: Any, prompts: List[str]) -> torch.Tensor:
-    """Masked-mean pool CLIP hidden states to one vector per prompt, (N, dim).
+def _pool_text_embeds(hidden: Any, prompts: List[str]) -> torch.Tensor:
+    """Masked-mean pool text-encoder hidden states to one vector per prompt, (N, dim).
 
     Matches the classification repo's mean_pool / encode_text_pooled exactly:
     attention masks come from re-tokenizing the prompts (the pipeline is built
     with use_attention_mask=False, so encode_prompt retains no mask), then a
     mask-weighted mean over the token dimension.
+
+    SD hidden states arrive as a raw tensor; SDXL and FLUX arrive as a
+    _PromptCondition whose hidden_states carry the sequence axis. The mask must
+    come from the tokenizer that produced that axis: pipeline.tokenizer for SD
+    and SDXL (both SDXL tokenizers emit identical masks for the same prompt),
+    or pipeline.mask_tokenizer when set (FLUX: the T5 tokenizer). max_length is
+    taken from the hidden states themselves — identical to
+    tokenizer.model_max_length for CLIP (77), and the pipeline's
+    max_sequence_length for T5.
     """
     if not torch.is_tensor(hidden):
-        raise NotImplementedError("Pooled text saving is implemented for SD hidden states only")
+        hidden = hidden.hidden_states
     pipeline = _get_pipeline()
-    inputs = pipeline.tokenizer(
+    tokenizer = getattr(pipeline, "mask_tokenizer", None) or pipeline.tokenizer
+    inputs = tokenizer(
         list(prompts),
         padding="max_length",
         truncation=True,
-        max_length=pipeline.tokenizer.model_max_length,
+        max_length=hidden.shape[1],
         return_tensors="pt",
     )
     mask = inputs.attention_mask.to(hidden.device).unsqueeze(-1).expand_as(hidden).float()
@@ -175,10 +185,10 @@ def _save_sample_embeddings(
     *,
     src_cpu: torch.Tensor,
     tgt_cpu: torch.Tensor,
-    image_cpu: torch.Tensor,
-    src_tokens_cpu: torch.Tensor,
-    tgt_tokens_cpu: torch.Tensor,
     image_tokens_cpu: torch.Tensor,
+    image_cpu: torch.Tensor | None = None,
+    src_tokens_cpu: torch.Tensor | None = None,
+    tgt_tokens_cpu: torch.Tensor | None = None,
     mask_cpu: torch.Tensor | None = None,
 ) -> None:
     """Write per-sample .pt files (safe to call from a background thread).
@@ -186,24 +196,33 @@ def _save_sample_embeddings(
     Flat/pooled set for the MLP/classification models: image.pt (and mask.pt,
     when --cache-masks provides one) is the flattened VAE latent (C*H*W, e.g.
     16384 for sd-turbo at 512px); source.pt / target.pt are masked-mean-pooled
-    CLIP vectors (hidden_dim, e.g. 1024).
+    text vectors (hidden_dim: 1024 sd-turbo, 2048 sdxl-turbo, 4096 flux).
 
     Token set for the attention_predictor model: image_tokens.pt is the
-    unflattened VAE latent (C, S, S), e.g. (4, 64, 64); source_tokens.pt /
-    target_tokens.pt are raw CLIP last_hidden_state rows (L, D), e.g.
-    (77, 1024), unpooled and with no attention mask applied.
+    unflattened VAE latent (C, S, S) — (4, 64, 64) for sd/sdxl-turbo,
+    (16, 64, 64) for flux at 512px; source_tokens.pt / target_tokens.pt are
+    raw last_hidden_state rows (L, D), e.g. (77, 1024), unpooled and with no
+    attention mask applied.
+
+    With --minimal-embeddings only source.pt, target.pt, and image_tokens.pt
+    are written; the optional tensors arrive as None and are skipped.
     """
-    assert src_cpu.ndim == 1 and tgt_cpu.ndim == 1 and image_cpu.ndim == 1
+    assert src_cpu.ndim == 1 and tgt_cpu.ndim == 1
+    assert image_cpu is None or image_cpu.ndim == 1
     assert mask_cpu is None or mask_cpu.ndim == 1
-    assert src_tokens_cpu.ndim == 2 and tgt_tokens_cpu.ndim == 2
+    assert src_tokens_cpu is None or src_tokens_cpu.ndim == 2
+    assert tgt_tokens_cpu is None or tgt_tokens_cpu.ndim == 2
     assert image_tokens_cpu.ndim == 3 and image_tokens_cpu.shape[-1] == image_tokens_cpu.shape[-2]
     embeddings_dir.mkdir(parents=True, exist_ok=True)
     torch.save(src_cpu, embeddings_dir / "source.pt")
     torch.save(tgt_cpu, embeddings_dir / "target.pt")
-    torch.save(image_cpu, embeddings_dir / "image.pt")
-    torch.save(src_tokens_cpu, embeddings_dir / "source_tokens.pt")
-    torch.save(tgt_tokens_cpu, embeddings_dir / "target_tokens.pt")
     torch.save(image_tokens_cpu, embeddings_dir / "image_tokens.pt")
+    if image_cpu is not None:
+        torch.save(image_cpu, embeddings_dir / "image.pt")
+    if src_tokens_cpu is not None:
+        torch.save(src_tokens_cpu, embeddings_dir / "source_tokens.pt")
+    if tgt_tokens_cpu is not None:
+        torch.save(tgt_tokens_cpu, embeddings_dir / "target_tokens.pt")
     if mask_cpu is not None:
         torch.save(mask_cpu, embeddings_dir / "mask.pt")
 
@@ -219,6 +238,7 @@ def run_factorized_grid(
     embeddings_dir: Path | None = None,
     mask_image: Image.Image | None = None,
     skip_generated: bool = False,
+    minimal_embeddings: bool = False,
 ) -> Dict[Tuple[float, float], Image.Image]:
     """Generate the given (t_start, t_end) cells for one source image."""
     pipeline = _get_pipeline()
@@ -264,12 +284,15 @@ def run_factorized_grid(
                     embeddings_dir=embeddings_dir,
                     src_cpu=_flat_cpu(pooled[0]),
                     tgt_cpu=_flat_cpu(pooled[1]),
-                    image_cpu=_flat_cpu(latents),
-                    src_tokens_cpu=_token_cpu(hidden[0]),
-                    tgt_tokens_cpu=_token_cpu(hidden[1]),
                     image_tokens_cpu=_token_cpu(latents[0]),
-                    mask_cpu=_flat_cpu(mask_latents) if mask_latents is not None else None,
                 )
+                if not minimal_embeddings:
+                    save_kwargs.update(
+                        image_cpu=_flat_cpu(latents),
+                        src_tokens_cpu=_token_cpu(hidden[0]),
+                        tgt_tokens_cpu=_token_cpu(hidden[1]),
+                        mask_cpu=_flat_cpu(mask_latents) if mask_latents is not None else None,
+                    )
                 if skip_generated:
                     # Encode-only (--skip-generated): nothing to overlap with, write synchronously.
                     _save_sample_embeddings(**save_kwargs)

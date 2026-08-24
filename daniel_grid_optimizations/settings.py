@@ -74,6 +74,12 @@ TOKEN_EMBEDDING_FILENAMES: Tuple[str, ...] = (
 )
 # Written per sample only with --cache-masks (and only when the sample has a mask).
 MASK_FILENAME = "mask.pt"
+# The only files written (and required for resume) with --minimal-embeddings.
+MINIMAL_EMBEDDING_FILENAMES: Tuple[str, ...] = (
+    "source.pt",
+    "target.pt",
+    "image_tokens.pt",
+)
 
 # CSV schemas.
 SAMPLE_ID_WIDTH = 8

@@ -196,19 +196,37 @@ def load_pipeline(
     model_root: str,
     device: str,
     base_config: Dict[str, Any],
-    component_subdirs: Dict[str, str],
+    component_subdirs: Dict[str, str] | None,
+    model_type: str = "sd",
 ) -> Any:
-    """Load fp32 SD ChordEditPipeline for grid generation (default edit mode)."""
+    """Load an fp32 ChordEditPipeline for grid generation (default edit mode).
+
+    model_type "sd" or "sdxl" loads the full pipeline from per-component
+    subdirs; "flux" loads the encoder-only stand-in (VAE + text encoders,
+    no transformer) straight from the diffusers model root — valid only for
+    --skip-generated embedding caching.
+    """
     import torch
+
+    if model_type == "flux":
+        from _flux import FluxEncoderPipeline
+
+        return FluxEncoderPipeline(
+            model_root,
+            device=device,
+            image_size=settings.IMAGE_SIZE,
+            torch_dtype=torch.float32,
+        )
+
     from pipeline_chord import ChordEditPipeline
 
     model_path = Path(model_root).expanduser().resolve()
     component_paths = {
-        key: str((model_path / sub).resolve()) for key, sub in component_subdirs.items()
+        key: str((model_path / sub).resolve()) for key, sub in (component_subdirs or {}).items()
     }
     return ChordEditPipeline.from_local_weights(
         component_paths=component_paths,
-        model_type="sd",
+        model_type=model_type,
         default_edit_config=base_config,
         device=device,
         torch_dtype=torch.float32,
