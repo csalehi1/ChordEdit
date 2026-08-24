@@ -19,7 +19,7 @@ from settings import *
 
 _PACKED_EMBEDDINGS_DIR = Path(__file__).resolve().parent / ".cache" / "packed_embeddings"
 _SCATTERED_EMBEDDINGS_DIR = SCATTERED_DIR / "annotation_embeddings"
-_EMB_FILES = {"img": "image_tokens.pt", "src": "source_tokens.pt", "tar": "target_tokens.pt"}
+_EMB_FILES = {"img": "image_tokens.pt", "src": "source.pt", "tar": "target.pt"}
 
 
 def _scattered_path(sample_id: str, kind: str) -> Path:
@@ -33,11 +33,11 @@ def _img_token_shape(probe: torch.Tensor, path) -> tuple[int, ...]:
     return tuple(probe.shape)
 
 
-def _text_token_shape(probe: torch.Tensor, path) -> tuple[int, ...]:
-    """Validate a stored prompt token tensor (L, D) and return its shape."""
-    if probe.ndim != 2:
-        raise ValueError(f"Expected {tuple(probe.shape)} == (L, D) in {path}")
-    return tuple(probe.shape)
+def _text_shape(probe: torch.Tensor, path) -> tuple[int, ...]:
+    """Validate a stored pooled text vector (D,) or (1, D) and return (D,)."""
+    if probe.numel() != probe.shape[-1]:
+        raise ValueError(f"Expected a pooled text vector (D,) or (1, D), got {tuple(probe.shape)} in {path}.")
+    return (int(probe.shape[-1]),)
 
 
 """
@@ -56,7 +56,7 @@ def _expected_packed_meta() -> dict:
     return {
         "model": CHORD_EDIT_MODEL,
         "pipeline_type": CHORD_EDIT_PIPELINE_TYPE,
-        "layout": "img_src_tar_tokens_v1",
+        "layout": "img_tokens_src_tar_pooled_v1",
         "image_size": int(CHORD_EDIT_IMAGE_SIZE),
         "dir_name": DIR_NAME,
         "target_t_delta": TARGET_T_DELTA,
@@ -155,12 +155,12 @@ def _pack_scattered_cache(
 
     # Probe shapes from the first sample, then preallocate the packed tables so
     # that peak memory stays ~1x table size (no row lists + torch.stack copy).
-    # Token shapes are kept as saved: no flattening.
+    # Image token shapes are kept as saved; text vectors are already pooled.
     n = len(sample_ids)
     img_probe_path = _scattered_path(sample_ids[0], "img")
     img_shape = _img_token_shape(_load_pt(img_probe_path), img_probe_path)
     src_probe_path = _scattered_path(sample_ids[0], "src")
-    text_shape = _text_token_shape(_load_pt(src_probe_path), src_probe_path)
+    text_shape = _text_shape(_load_pt(src_probe_path), src_probe_path)
     img_emb = torch.empty((n, *img_shape), dtype=torch.float32)
     src_emb = torch.empty((n, *text_shape), dtype=torch.float32)
     tar_emb = torch.empty((n, *text_shape), dtype=torch.float32)
@@ -183,8 +183,9 @@ def _pack_scattered_cache(
         # Load the embeddings in parallel using a thread pool.
         for i, img_t, src_t, tar_t in tqdm(pool.map(_load_row, range(n)), total=n, desc="Packing embeddings", unit="sample"):
             img_emb[i] = _check(img_t, i, "image", img_shape)
-            src_emb[i] = _check(src_t, i, "source", text_shape)
-            tar_emb[i] = _check(tar_t, i, "target", text_shape)
+            # Text rows may be saved as (D,) or (1, D); flatten before checking.
+            src_emb[i] = _check(src_t.reshape(-1), i, "source", text_shape)
+            tar_emb[i] = _check(tar_t.reshape(-1), i, "target", text_shape)
 
     tables = {"img": img_emb, "src": src_emb, "tar": tar_emb}
     _save_packed_cache(packed_path, sample_ids, tables)
@@ -194,11 +195,12 @@ def _pack_scattered_cache(
 def get_embeddings(
     samples: pd.DataFrame,
 ) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return CPU token tables (img, src, tar), packed for training.
+    """Return CPU tables (img, src, tar), packed for training.
 
-    Tables keep the saved token shapes: img (n, C, S, S) VAE latents and
-    src/tar (n, L, D) prompt token sequences. The cross-attention regressor
-    consumes the token structure directly; nothing is flattened or pooled here.
+    img keeps the saved token shape (n, C, S, S) VAE latents; the
+    cross-attention regressor consumes the token structure directly. src/tar
+    are (n, D) masked-mean-pooled prompt vectors, the pipeline's own
+    source.pt / target.pt, so no pooling happens in the model.
     """
     packed_path = _get_packed_path()
     sample_ids = samples[SAMPLE_ID_COL].tolist()

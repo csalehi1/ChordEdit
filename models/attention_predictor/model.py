@@ -130,17 +130,17 @@ class TextProjector(nn.Module):
 
     def forward(
         self,
-        src_emb: torch.Tensor,  # (N, L, D_txt)
-        tar_emb: torch.Tensor,  # (N, L, D_txt)
+        src_emb: torch.Tensor,  # (N, D_txt)
+        tar_emb: torch.Tensor,  # (N, D_txt)
     ) -> torch.Tensor:          # (N, 2, d)
         """Return the prompt queries F_t, source first then target."""
-        
+
         if src_emb.shape != tar_emb.shape:
             raise ValueError(f"Expected {src_emb.shape} == {tar_emb.shape}")
 
-        # Because the text encoder emits a token sequence, first mean-pool 
-        # to (N, 1, D_txt), E_text(c), then concatenate and project.
-        pair = torch.cat([src_emb.mean(dim=1), tar_emb.mean(dim=1)], dim=-1)
+        # The prompts arrive pooled to one vector each, E_text(c) -- the
+        # pipeline's masked mean over token positions -- so concatenate and project.
+        pair = torch.cat([src_emb, tar_emb], dim=-1)
         return self.proj(pair).reshape(src_emb.shape[0], 2, self.attn_dim)
 
 
@@ -254,8 +254,8 @@ class AttentionRegressor(nn.Module):
     def forward(
         self,
         img_emb: torch.Tensor,  # (N, C, S, S)
-        src_emb: torch.Tensor,  # (N, L, D_txt)
-        tar_emb: torch.Tensor,  # (N, L, D_txt)
+        src_emb: torch.Tensor,  # (N, D_txt)
+        tar_emb: torch.Tensor,  # (N, D_txt)
     ) -> torch.Tensor:          # (N, n_cells, 2)
         """Return per-cell (psnr, clip) predictions, standardized where active."""
         # Ground both prompts in the source image with one cross-attention pass.
@@ -290,8 +290,8 @@ class AttentionModel(nn.Module):
     def pred_cells(
         self,
         img_emb: torch.Tensor,  # (N, C, S, S)
-        src_emb: torch.Tensor,  # (N, L, D_txt)
-        tar_emb: torch.Tensor,  # (N, L, D_txt)
+        src_emb: torch.Tensor,  # (N, D_txt)
+        tar_emb: torch.Tensor,  # (N, D_txt)
     ) -> torch.Tensor:          # (N, n_cells, 2)
         """Predict per-cell (psnr, clip) in PREDICTION_SPACE units."""
         return self.regressor.destandardize(self.regressor(img_emb, src_emb, tar_emb))
@@ -441,10 +441,10 @@ class TimestepSelector:
         needs no retraining.
         """
         device = self.model.regressor.target_mean.device
-        # Accept one unbatched sample: (C, S, S) latents and (L, D) prompts.
+        # Accept one unbatched sample: (C, S, S) latents and (D,) prompts.
         img = (img_emb.unsqueeze(0) if img_emb.dim() == 3 else img_emb).to(device)
-        src = (src_emb.unsqueeze(0) if src_emb.dim() == 2 else src_emb).to(device)
-        tar = (tar_emb.unsqueeze(0) if tar_emb.dim() == 2 else tar_emb).to(device)
+        src = (src_emb.unsqueeze(0) if src_emb.dim() == 1 else src_emb).to(device)
+        tar = (tar_emb.unsqueeze(0) if tar_emb.dim() == 1 else tar_emb).to(device)
         preds = self.model.pred_cells(img, src, tar)
 
         # Map out of PREDICTION_SPACE before anything is scored.

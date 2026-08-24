@@ -21,11 +21,11 @@ ID_TO_SPLIT_NAME = "id_to_split.csv"
 
 @dataclass(frozen=True)
 class EmbeddingTable:
-    """One token-table row per unique sample_id."""
+    """One embedding-table row per unique sample_id."""
 
     img: torch.Tensor   # (n_samples, C, S, S)
-    src: torch.Tensor   # (n_samples, L, D_txt)
-    tar: torch.Tensor   # (n_samples, L, D_txt)
+    src: torch.Tensor   # (n_samples, D_txt)
+    tar: torch.Tensor   # (n_samples, D_txt)
 
 
 @dataclass(frozen=True)

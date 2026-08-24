@@ -116,28 +116,22 @@ def eval_selection(
     chunk_grids: int = 256,
     mean_surface: torch.Tensor | None = None,  # (n_cells, 2)
 ) -> dict[str, float]:
-    """How well the predicted surfaces serve selection, not regression.
+    """
+    How well the predicted surfaces serve selection, not regression.
 
-        phi_spearman         median per-grid rank correlation of predicted vs
-                             true phi; how well the whole surface is ordered
-        regret_median/_p90   true phi lost by picking argmax(predicted phi)
-                             instead of the true best cell; lower is better
-        gain_mean            mean true phi at the picked cell. True phi at the
-                             default cell is 0, so this is gain over the default
-        improvement_rate     fraction of grids whose pick beats the default
-        deviate_rate         fraction of grids that pick a non-default cell
+    phi_spearman         median per-grid rank correlation of predicted vs
+                            true phi; how well the whole surface is ordered
+    regret_median/_p90   true phi lost by picking argmax(predicted phi)
+                            instead of the true best cell; lower is better
+    gain_mean            mean true phi at the picked cell. True phi at the
+                            default cell is 0, so this is gain over the default
+    improvement_rate     fraction of grids whose pick beats the default
+    deviate_rate         fraction of grids that pick a non-default cell
 
-    Plus, per metric (psnr, clip), how the pick treats that metric alone, so a
-    predictor that trades CLIP away for PSNR shows up here and not in phi:
-
-        rho_<col>            median rank correlation of that metric's surface
-        rho_<col>_image      the same after removing the per-cell population
-                             mean, i.e. only the image-specific variation
-        delta_at_pick_<col>  mean true delta of that metric at the picked cell
-
-    mean_surface is required under PREDICTION_SPACE "residuals": the targets in
-    cells were residualized in-place by train(), so mapping both sides back to
-    deltas (deltas_from_preds) needs the surface passed in.
+    rho_<col>            median rank correlation of that metric's surface
+    rho_<col>_image      the same after removing the per-cell population
+                            mean, i.e. only the image-specific variation
+    delta_at_pick_<col>  mean true delta of that metric at the picked cell
     """
 
     def _row_ranks(x: torch.Tensor) -> torch.Tensor:
@@ -218,13 +212,9 @@ def train(
     Train the grid surface predictor and save run artifacts.
 
     Saves regressor_weights.pt {regressor_state_dict, target_mean, target_std,
-    target_cols, prediction_space, img_shape (C, S, S), text_shape (L, D),
+    target_cols, prediction_space, img_shape (C, S, S), text_shape (D,),
     cell_t_pairs, t_start_values, t_end_values}, mean_surface.pt,
     id_to_split.csv, and regression_metrics.json.
-
-    The mean surface is computed on the train split and always saved; under
-    PREDICTION_SPACE "residuals" it is also subtracted from every split's
-    targets here, so the heads regress deviations from it.
     """
 
     # Create run directory to save information to.
