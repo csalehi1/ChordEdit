@@ -126,7 +126,16 @@ def _flat_cpu(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().reshape(-1).float().cpu().clone()
 
 
-def _pool_text_embeds(hidden: Any, prompts: List[str]) -> torch.Tensor:
+def _token_cpu(tensor: torch.Tensor) -> torch.Tensor:
+    """Like _flat_cpu but keeps the token shape (no reshape(-1)).
+
+    The clone is still mandatory: batch slices are views over the whole
+    batch storage, and torch.save would serialize all of it.
+    """
+    return tensor.detach().float().cpu().clone()
+
+
+def _(hidden: Any, prompts: List[str]) -> torch.Tensor:
     """Masked-mean pool CLIP hidden states to one vector per prompt, (N, dim).
 
     Matches the classification repo's mean_pool / encode_text_pooled exactly:
@@ -167,21 +176,34 @@ def _save_sample_embeddings(
     src_cpu: torch.Tensor,
     tgt_cpu: torch.Tensor,
     image_cpu: torch.Tensor,
+    src_tokens_cpu: torch.Tensor,
+    tgt_tokens_cpu: torch.Tensor,
+    image_tokens_cpu: torch.Tensor,
     mask_cpu: torch.Tensor | None = None,
 ) -> None:
-    """Write packing-ready per-sample .pt files (safe to call from a background thread).
+    """Write per-sample .pt files (safe to call from a background thread).
 
-    Format: one flat float32 vector per file. image.pt (and mask.pt, when
-    --cache-masks provides one) is the flattened VAE latent (C*H*W, e.g. 16384
-    for sd-turbo at 512px); source.pt / target.pt are masked-mean-pooled CLIP
-    vectors (hidden_dim, e.g. 1024).
+    Flat/pooled set for the MLP/classification models: image.pt (and mask.pt,
+    when --cache-masks provides one) is the flattened VAE latent (C*H*W, e.g.
+    16384 for sd-turbo at 512px); source.pt / target.pt are masked-mean-pooled
+    CLIP vectors (hidden_dim, e.g. 1024).
+
+    Token set for the attention_predictor model: image_tokens.pt is the
+    unflattened VAE latent (C, S, S), e.g. (4, 64, 64); source_tokens.pt /
+    target_tokens.pt are raw CLIP last_hidden_state rows (L, D), e.g.
+    (77, 1024), unpooled and with no attention mask applied.
     """
     assert src_cpu.ndim == 1 and tgt_cpu.ndim == 1 and image_cpu.ndim == 1
     assert mask_cpu is None or mask_cpu.ndim == 1
+    assert src_tokens_cpu.ndim == 2 and tgt_tokens_cpu.ndim == 2
+    assert image_tokens_cpu.ndim == 3 and image_tokens_cpu.shape[-1] == image_tokens_cpu.shape[-2]
     embeddings_dir.mkdir(parents=True, exist_ok=True)
     torch.save(src_cpu, embeddings_dir / "source.pt")
     torch.save(tgt_cpu, embeddings_dir / "target.pt")
     torch.save(image_cpu, embeddings_dir / "image.pt")
+    torch.save(src_tokens_cpu, embeddings_dir / "source_tokens.pt")
+    torch.save(tgt_tokens_cpu, embeddings_dir / "target_tokens.pt")
+    torch.save(image_tokens_cpu, embeddings_dir / "image_tokens.pt")
     if mask_cpu is not None:
         torch.save(mask_cpu, embeddings_dir / "mask.pt")
 
@@ -232,8 +254,9 @@ def run_factorized_grid(
 
             if embeddings_dir is not None:
                 # Saved embeddings derive from the same tensors that condition
-                # generation: the UNet's full-sequence hidden states pooled to
-                # one vector per prompt, and the flattened VAE latent.
+                # generation: the UNet's full-sequence hidden states (saved raw
+                # as *_tokens.pt and pooled to one vector per prompt), and the
+                # VAE latent (saved unflattened as image_tokens.pt and flat).
                 # Copy to CPU before save so the background writer does not touch GPU tensors.
                 hidden = prompt_batch if torch.is_tensor(prompt_batch) else prompt_batch.hidden_states
                 pooled = _pool_text_embeds(hidden, [record.source_prompt, record.target_prompt])
@@ -242,6 +265,9 @@ def run_factorized_grid(
                     src_cpu=_flat_cpu(pooled[0]),
                     tgt_cpu=_flat_cpu(pooled[1]),
                     image_cpu=_flat_cpu(latents),
+                    src_tokens_cpu=_token_cpu(hidden[0]),
+                    tgt_tokens_cpu=_token_cpu(hidden[1]),
+                    image_tokens_cpu=_token_cpu(latents[0]),
                     mask_cpu=_flat_cpu(mask_latents) if mask_latents is not None else None,
                 )
                 if skip_generated:

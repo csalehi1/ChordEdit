@@ -146,7 +146,8 @@ def run_shard(
         # Determine if sample embeddings are already complete (i.e., partially generated).
         need_embeddings = False
         if not skip_embeddings:
-            emb_paths = [emb_dir / name for name in settings.EMBEDDING_FILENAMES]
+            all_embedding_names = (*settings.EMBEDDING_FILENAMES, *settings.TOKEN_EMBEDDING_FILENAMES)
+            emb_paths = [emb_dir / name for name in all_embedding_names]
             # Masks are optional per sample; when caching them, an existing trio without mask.pt is incomplete.
             if mask_rel:
                 emb_paths.append(emb_dir / settings.MASK_FILENAME)

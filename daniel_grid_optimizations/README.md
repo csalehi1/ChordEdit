@@ -34,8 +34,12 @@ The evaluation metrics come from [PnPInversion](https://github.com/cure-lab/PnPI
 
 ### Embedding format
 
-Saved embeddings are packing-ready: one flat float32 vector per file,
-derived from the same pipeline tensors that condition generation.
+All embeddings derive from the same pipeline tensors that condition
+generation. Two sets are written per sample: a packing-ready flat/pooled
+set (one float32 vector per file) consumed by the MLP/classification
+models, and a per-token set consumed by the attention_predictor model.
+
+Flat/pooled set:
 
 - `image.pt`: flattened VAE latent, `(16384,)` for sd-turbo at 512px.
 - `source.pt` / `target.pt`: masked-mean-pooled CLIP text vectors, `(1024,)`,
@@ -47,6 +51,32 @@ derived from the same pipeline tensors that condition generation.
   same batch=2 VAE forward as the image. Skipped for samples without a
   mask, and the `id_to_embeddings` CSV gains a `mask_embedding` column
   (empty for maskless samples).
+
+Per-token set (for the attention_predictor model; not listed in the
+`id_to_embeddings` CSV, which keeps its existing schema):
+
+- `image_tokens.pt`: unflattened VAE latent, `(4, 64, 64)` for sd-turbo
+  at 512px (same values as `image.pt`, shape preserved).
+- `source_tokens.pt` / `target_tokens.pt`: raw CLIP `last_hidden_state`
+  rows, `(77, 1024)`, unpooled and with no attention mask applied.
+
+### Backfilling token embeddings
+
+Datasets generated before the per-token set existed only have the
+flat/pooled files. The resume check requires both sets, so re-running in
+encode-only mode backfills the missing `*_tokens.pt` files (and rewrites
+the flat/pooled files with identical content):
+
+```bash
+python grid_generate.py \
+    --data-root /shared/ssd_30T/mirick/datasets/ultra_edit/UltraEdit_Region_10000 \
+    --model-root /shared/ssd_30T/mirick/models/sd-turbo \
+    --embeddings-root /shared/ssd_30T/mirick/embeddings/sd_turbo \
+    --skip-generated --gpus 5 6 7
+```
+
+Pass `--cache-masks` when the dataset was originally built with it, so the
+resume check keeps requiring `mask.pt`.
 
 ### Generation Usage
 

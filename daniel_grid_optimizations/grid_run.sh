@@ -33,7 +33,8 @@ CUDA_VISIBLE_DEVICES=0 python grid_generate.py \
     --diagonal-optimization
 
 
-# Regenerate packing-ready scattered embeddings (no grids) on GPUs 5,6,7.
+# Regenerate scattered embeddings (no grids) on GPUs 5,6,7. Also backfills
+# the per-token *_tokens.pt files for datasets generated before they existed.
 # Add --cache-masks to also save per-sample mask.pt VAE latents.
 python grid_generate.py \
     --data-root /shared/ssd_30T/mirick/datasets/ultra_edit/UltraEdit_Region_10000 \

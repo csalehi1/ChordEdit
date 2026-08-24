@@ -13,13 +13,18 @@ Expected dataset layout under --data-root:
 Expected embeddings layout under --embeddings-root/<dataset-name>/:
 
   id_to_embeddings_<suffix>.csv
-  annotation_embeddings/{id}/source.pt   # pooled CLIP vector, (1024,) float32
-  annotation_embeddings/{id}/target.pt   # pooled CLIP vector, (1024,) float32
-  annotation_embeddings/{id}/image.pt    # flat VAE latent, (16384,) float32
-  annotation_embeddings/{id}/mask.pt     # flat VAE latent of the RGB mask, only with --cache-masks
+  annotation_embeddings/{id}/source.pt         # pooled CLIP vector, (1024,) float32
+  annotation_embeddings/{id}/target.pt         # pooled CLIP vector, (1024,) float32
+  annotation_embeddings/{id}/image.pt          # flat VAE latent, (16384,) float32
+  annotation_embeddings/{id}/mask.pt           # flat VAE latent of the RGB mask, only with --cache-masks
+  annotation_embeddings/{id}/source_tokens.pt  # CLIP last_hidden_state, (77, 1024) float32
+  annotation_embeddings/{id}/target_tokens.pt  # CLIP last_hidden_state, (77, 1024) float32
+  annotation_embeddings/{id}/image_tokens.pt   # unflattened VAE latent, (4, 64, 64) float32
 
-All embedding files are packing-ready: one flat float32 vector per file,
-derived from the same pipeline tensors that condition generation.
+All embedding files derive from the same pipeline tensors that condition
+generation. The flat/pooled files are packing-ready one-vector-per-file
+inputs for the MLP/classification models; the *_tokens.pt files keep the
+token structure (unpooled, unflattened) for the attention_predictor model.
 
 Expected generated layout under --generated-root/<dataset-name>/:
 
@@ -59,6 +64,14 @@ CELLS_DIRNAME = "cells"
 # Per-sample embedding layout under --embeddings-root/<dataset-name>/.
 SAMPLES_DIRNAME = "annotation_embeddings"
 EMBEDDING_FILENAMES: Tuple[str, ...] = ("source.pt", "target.pt", "image.pt")
+# Per-token embeddings for the attention_predictor model (unflattened /
+# unpooled). Saved alongside the pooled/flat files above; both sets are
+# required for a sample to count as complete.
+TOKEN_EMBEDDING_FILENAMES: Tuple[str, ...] = (
+    "source_tokens.pt",
+    "target_tokens.pt",
+    "image_tokens.pt",
+)
 # Written per sample only with --cache-masks (and only when the sample has a mask).
 MASK_FILENAME = "mask.pt"
 
