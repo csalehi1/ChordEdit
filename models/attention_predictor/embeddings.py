@@ -18,12 +18,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from settings import *
 
 _PACKED_EMBEDDINGS_DIR = Path(__file__).resolve().parent / ".cache" / "packed_embeddings"
-_SCATTERED_EMBEDDINGS_DIR = SCATTERED_DIR / "annotation_embeddings"
 _EMB_FILES = {"img": "image_tokens.pt", "src": "source.pt", "tar": "target.pt"}
 
 
-def _scattered_path(sample_id: str, kind: str) -> Path:
-    return _SCATTERED_EMBEDDINGS_DIR / sample_id / _EMB_FILES[kind]
+def _scattered_path(
+    sample_id: str,
+    kind: str,
+    *,
+    scattered_dir: Path | None = None,
+) -> Path:
+    root = (scattered_dir if scattered_dir is not None else SCATTERED_DIR) / "annotation_embeddings"
+    return root / sample_id / _EMB_FILES[kind]
 
 
 def _img_token_shape(probe: torch.Tensor, path) -> tuple[int, ...]:
@@ -44,21 +49,21 @@ def _text_shape(probe: torch.Tensor, path) -> tuple[int, ...]:
 Packed/scattered caches.
 """
 
-def _get_packed_path() -> Path:
-    """Packed cache path for the current settings."""
+def _get_packed_path(*, dir_name: str | None = None) -> Path:
+    """Packed cache path for the current settings (or an override dir_name)."""
     t_delta = f"{TARGET_T_DELTA}".replace(".", "p")
-    slug = DIR_NAME.replace("_", "").lower()
+    slug = (dir_name if dir_name is not None else DIR_NAME).replace("_", "").lower()
     return _PACKED_EMBEDDINGS_DIR / f"{CHORD_EDIT_MODEL}-{t_delta}-{slug}.pt"
 
 
-def _expected_packed_meta() -> dict:
+def _expected_packed_meta(*, dir_name: str | None = None) -> dict:
     """Meta that a valid packed cache must carry."""
     return {
         "model": CHORD_EDIT_MODEL,
         "pipeline_type": CHORD_EDIT_PIPELINE_TYPE,
         "layout": "img_tokens_src_tar_pooled_v1",
         "image_size": int(CHORD_EDIT_IMAGE_SIZE),
-        "dir_name": DIR_NAME,
+        "dir_name": dir_name if dir_name is not None else DIR_NAME,
         "target_t_delta": TARGET_T_DELTA,
     }
 
@@ -74,6 +79,8 @@ def _load_pt(path: str | Path) -> torch.Tensor:
 def _load_packed_cache(
     packed_path: Path,
     sample_ids: list[str],
+    *,
+    dir_name: str | None = None,
 ) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor] | None:
     """Packed tables sliced to sample_ids, or None (missing / bad meta / coverage)."""
 
@@ -93,7 +100,7 @@ def _load_packed_cache(
     if not isinstance(meta, dict):
         print(f"{packed_path} has no meta. Repacking...")
         return None
-    for key, expected in _expected_packed_meta().items():
+    for key, expected in _expected_packed_meta(dir_name=dir_name).items():
         if meta.get(key) != expected:
             print(f"{packed_path} meta mismatch: {key}={meta.get(key)!r} expected {expected!r}. Repacking...")
             return None
@@ -123,9 +130,11 @@ def _save_packed_cache(
     packed_path: Path,
     sample_ids: list[str],
     tables: dict[str, torch.Tensor],
+    *,
+    dir_name: str | None = None,
 ) -> None:
     """Atomically write the packed table dict with meta from scattered files."""
-    meta = _expected_packed_meta() | {
+    meta = _expected_packed_meta(dir_name=dir_name) | {
         "source": "scattered",
         "img_shape": tuple(tables["img"].shape[1:]),
         "text_shape": tuple(tables["src"].shape[1:]),
@@ -140,13 +149,19 @@ def _save_packed_cache(
 def _pack_scattered_cache(
     samples_df: pd.DataFrame,
     packed_path: Path,
+    *,
+    scattered_dir: Path | None = None,
+    dir_name: str | None = None,
 ) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor] | None:
     """Pack scattered per-sample .pt files into packed tables."""
     sample_ids = samples_df[SAMPLE_ID_COL].tolist()
     if not sample_ids:
         raise ValueError("Expected samples to pack")
 
-    missing = [sid for sid in sample_ids if not _scattered_path(sid, "img").exists()]
+    missing = [
+        sid for sid in sample_ids
+        if not _scattered_path(sid, "img", scattered_dir=scattered_dir).exists()
+    ]
     if missing:
         preview = ", ".join(missing[:5])
         more = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
@@ -157,9 +172,9 @@ def _pack_scattered_cache(
     # that peak memory stays ~1x table size (no row lists + torch.stack copy).
     # Image token shapes are kept as saved; text vectors are already pooled.
     n = len(sample_ids)
-    img_probe_path = _scattered_path(sample_ids[0], "img")
+    img_probe_path = _scattered_path(sample_ids[0], "img", scattered_dir=scattered_dir)
     img_shape = _img_token_shape(_load_pt(img_probe_path), img_probe_path)
-    src_probe_path = _scattered_path(sample_ids[0], "src")
+    src_probe_path = _scattered_path(sample_ids[0], "src", scattered_dir=scattered_dir)
     text_shape = _text_shape(_load_pt(src_probe_path), src_probe_path)
     img_emb = torch.empty((n, *img_shape), dtype=torch.float32)
     src_emb = torch.empty((n, *text_shape), dtype=torch.float32)
@@ -169,9 +184,9 @@ def _pack_scattered_cache(
         sid = sample_ids[i]
         return (
             i,
-            _load_pt(_scattered_path(sid, "img")),
-            _load_pt(_scattered_path(sid, "src")),
-            _load_pt(_scattered_path(sid, "tar")),
+            _load_pt(_scattered_path(sid, "img", scattered_dir=scattered_dir)),
+            _load_pt(_scattered_path(sid, "src", scattered_dir=scattered_dir)),
+            _load_pt(_scattered_path(sid, "tar", scattered_dir=scattered_dir)),
         )
 
     def _check(t: torch.Tensor, i: int, kind: str, shape: tuple[int, ...]) -> torch.Tensor:
@@ -188,12 +203,15 @@ def _pack_scattered_cache(
             tar_emb[i] = _check(tar_t.reshape(-1), i, "target", text_shape)
 
     tables = {"img": img_emb, "src": src_emb, "tar": tar_emb}
-    _save_packed_cache(packed_path, sample_ids, tables)
+    _save_packed_cache(packed_path, sample_ids, tables, dir_name=dir_name)
     return sample_ids, img_emb, src_emb, tar_emb
 
 
 def get_embeddings(
     samples: pd.DataFrame,
+    *,
+    scattered_dir: Path | None = None,
+    dir_name: str | None = None,
 ) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return CPU tables (img, src, tar), packed for training.
 
@@ -201,13 +219,18 @@ def get_embeddings(
     cross-attention regressor consumes the token structure directly. src/tar
     are (n, D) masked-mean-pooled prompt vectors, the pipeline's own
     source.pt / target.pt, so no pooling happens in the model.
+
+    Optional scattered_dir / dir_name point at a non-default dataset root
+    (used for PIE-Bench when --pie-bench mixes UltraEdit train with PIE test).
     """
-    packed_path = _get_packed_path()
+    packed_path = _get_packed_path(dir_name=dir_name)
     sample_ids = samples[SAMPLE_ID_COL].tolist()
 
-    cached = _load_packed_cache(packed_path, sample_ids)
+    cached = _load_packed_cache(packed_path, sample_ids, dir_name=dir_name)
     if cached is None:
-        cached = _pack_scattered_cache(samples, packed_path)
+        cached = _pack_scattered_cache(
+            samples, packed_path, scattered_dir=scattered_dir, dir_name=dir_name,
+        )
         if cached is None:
             raise RuntimeError(f"Embeddings unavailable: {packed_path} cannot cover {len(sample_ids)} requested.")
         print("Loaded scattered embeddings from cache.")
@@ -217,13 +240,48 @@ def get_embeddings(
     return cached
 
 
+def get_embeddings_mixed(
+    samples: pd.DataFrame,
+) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Load embeddings, routing pie_*-prefixed ids to PIE_SCATTERED_DIR when PIE_BENCH."""
+    if not PIE_BENCH:
+        return get_embeddings(samples)
+
+    sids = samples[SAMPLE_ID_COL].astype(str)
+    is_pie = sids.str.startswith(PIE_SAMPLE_ID_PREFIX)
+    ue_samples = samples.loc[~is_pie].copy()
+    pie_samples = samples.loc[is_pie].copy()
+
+    parts: list[tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    if len(ue_samples):
+        parts.append(get_embeddings(ue_samples))
+    if len(pie_samples):
+        # Disk folders use unprefixed ids; remap back to pie_* for the shared table.
+        pie_raw = pie_samples.copy()
+        pie_raw[SAMPLE_ID_COL] = pie_raw[SAMPLE_ID_COL].str.removeprefix(PIE_SAMPLE_ID_PREFIX)
+        raw_ids, img, src, tar = get_embeddings(
+            pie_raw,
+            scattered_dir=PIE_SCATTERED_DIR,
+            dir_name=PIE_BENCH_DIR_NAME,
+        )
+        parts.append(([PIE_SAMPLE_ID_PREFIX + sid for sid in raw_ids], img, src, tar))
+    if not parts:
+        raise ValueError("Expected samples with embeddings")
+
+    sample_ids = [sid for part in parts for sid in part[0]]
+    img_emb = torch.cat([part[1] for part in parts], dim=0)
+    src_emb = torch.cat([part[2] for part in parts], dim=0)
+    tar_emb = torch.cat([part[3] for part in parts], dim=0)
+    return sample_ids, img_emb, src_emb, tar_emb
+
+
 def get_embeddings_by_sample(
     df: pd.DataFrame,
     device: torch.device | str,
 ) -> dict[str, dict[str, torch.Tensor]]:
     """Embeddings keyed by sample_id, on device."""
     samples = df.drop_duplicates(subset=SAMPLE_ID_COL).sort_values(SAMPLE_ID_COL)
-    sample_ids, img_emb, src_emb, tar_emb = get_embeddings(samples)
+    sample_ids, img_emb, src_emb, tar_emb = get_embeddings_mixed(samples)
     img_emb, src_emb, tar_emb = img_emb.to(device), src_emb.to(device), tar_emb.to(device)
 
     return {sid: {

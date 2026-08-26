@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from embeddings import get_embeddings
+from embeddings import get_embeddings_mixed
 from settings import *
 
 ID_TO_SPLIT_NAME = "id_to_split.csv"
@@ -123,7 +123,7 @@ def create_cell_tensors(
     """Build device-resident CellTensors for each split, sharing one embedding table."""
     frames = [X for X, _ in splits_df.values()]
     samples = pd.concat(frames, ignore_index=True).drop_duplicates(SAMPLE_ID_COL).sort_values(SAMPLE_ID_COL)
-    sample_ids, img_emb, src_emb, tar_emb = get_embeddings(samples)
+    sample_ids, img_emb, src_emb, tar_emb = get_embeddings_mixed(samples)
 
     # Build the shared embedding table.
     emb_table = EmbeddingTable(
@@ -154,7 +154,12 @@ Dataframes.
 def _prep_sample_id(value) -> str:
     return f"{int(value):08d}"
 
-def load_df(metrics_csv: Path | None = None, inputs_csv: Path | None = None) -> pd.DataFrame:
+def load_df(
+    metrics_csv: Path | None = None,
+    inputs_csv: Path | None = None,
+    *,
+    apply_max_samples: bool = True,
+) -> pd.DataFrame:
     """Load metrics, attach source-image paths and prompts, one row per cell."""
     metrics_cols = [SAMPLE_ID_COL, T_START_COL, T_END_COL, T_DELTA_COL, *TARGET_COLS]
     inputs_cols = [SAMPLE_ID_COL, SOURCE_PROMPT_COL, TARGET_PROMPT_COL, IMAGE_PATH_COL, MASK_PATH_COL]
@@ -186,8 +191,9 @@ def load_df(metrics_csv: Path | None = None, inputs_csv: Path | None = None) -> 
 
     # Optional slice of a large dataset, taken after the completeness filter so
     # the count is samples that will actually train. Sorted, so the slice is the
-    # same set on every run and across configurations.
-    if MAX_SAMPLES is not None:
+    # same set on every run and across configurations. Skipped for PIE-Bench
+    # (MAX_SAMPLES only applies to the UltraEdit pool).
+    if apply_max_samples and MAX_SAMPLES is not None:
         keep = np.sort(metrics_df[SAMPLE_ID_COL].unique())[:MAX_SAMPLES]
         if len(keep) < MAX_SAMPLES:
             print(f"{MAX_SAMPLES=} exceeds the {len(keep)} complete samples available; using all of them.")
@@ -220,6 +226,26 @@ def load_df(metrics_csv: Path | None = None, inputs_csv: Path | None = None) -> 
         on=SAMPLE_ID_COL,
         how="left",
     ).reset_index(drop=True)
+
+
+def load_pie_bench_xy() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """All labeled PIE-Bench samples as (X, y), with pie_-prefixed sample ids."""
+    data_df = load_df(PIE_METRICS_CSV, PIE_INPUTS_CSV, apply_max_samples=False)
+    X_df, y_df = prepare_df(data_df)
+    X_df = X_df.copy()
+    X_df[SAMPLE_ID_COL] = PIE_SAMPLE_ID_PREFIX + X_df[SAMPLE_ID_COL].astype(str)
+    return X_df, y_df
+
+
+def build_splits_df() -> dict[str, tuple[pd.DataFrame, pd.DataFrame]]:
+    """Train/val/test frames; with PIE_BENCH, UltraEdit test is replaced by PIE-Bench."""
+    data_df = load_df()
+    X_df, y_df = prepare_df(data_df)
+    train_X, val_X, test_X, train_y, val_y, test_y = split_df(X_df, y_df)
+    if PIE_BENCH:
+        test_X, test_y = load_pie_bench_xy()
+    return {"train": (train_X, train_y), "val": (val_X, val_y), "test": (test_X, test_y)}
+
 
 
 def prepare_df(data_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -306,11 +332,17 @@ def load_split_df(run_dir: Path) -> dict[str, pd.DataFrame]:
     if not splits_path.exists():
         raise FileNotFoundError(f"Missing splits at {splits_path}. Run train.py first.")
     splits_df = pd.read_csv(splits_path, dtype={SAMPLE_ID_COL: str, "split": str})
-    df = load_df()
+    ue_df = load_df()
+    pie_df = None
+    if PIE_BENCH:
+        pie_df = load_df(PIE_METRICS_CSV, PIE_INPUTS_CSV, apply_max_samples=False)
+        pie_df = pie_df.copy()
+        pie_df[SAMPLE_ID_COL] = PIE_SAMPLE_ID_PREFIX + pie_df[SAMPLE_ID_COL].astype(str)
     out: dict[str, pd.DataFrame] = {}
     for name in ("train", "val", "test"):
         split_ids = splits_df.loc[splits_df["split"] == name, SAMPLE_ID_COL]
-        out[name] = df.loc[df[SAMPLE_ID_COL].isin(split_ids)].reset_index(drop=True)
+        source = pie_df if (PIE_BENCH and name == "test") else ue_df
+        out[name] = source.loc[source[SAMPLE_ID_COL].isin(split_ids)].reset_index(drop=True)
     return out
 
 

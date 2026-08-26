@@ -38,6 +38,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the grid surface predictor")
     # Read off argv by settings.py at import time, before this parser runs.
     parser.add_argument("--settings-path", default=None)
+    parser.add_argument(
+        "--pie-bench",
+        action="store_true",
+        help="Replace the UltraEdit test split with PIE_Bench_v1 for the current CHORD_EDIT_MODEL",
+    )
     return parser.parse_args()
 
 
@@ -456,15 +461,14 @@ def main() -> None:
     np.random.seed(SEED)
 
     # Load, prepare, and split the data into train/val/test sets.
-    data_df = load_df()
-    X_df, y_df = prepare_df(data_df)
-    train_X, val_X, test_X, train_y, val_y, test_y = split_df(X_df, y_df)
-    splits_df = {"train": (train_X, train_y), "val": (val_X, val_y), "test": (test_X, test_y)}
+    splits_df = build_splits_df()
+    train_X, val_X, test_X = splits_df["train"][0], splits_df["val"][0], splits_df["test"][0]
+    test_note = f" (from {PIE_BENCH_DIR_NAME})" if PIE_BENCH else ""
     print(
         f"Dataset splits:\n"
         f"  train: {len(train_X)} cells ({train_X[SAMPLE_ID_COL].nunique()} samples)\n"
         f"  val: {len(val_X)} cells ({val_X[SAMPLE_ID_COL].nunique()} samples)\n"
-        f"  test: {len(test_X)} cells ({test_X[SAMPLE_ID_COL].nunique()} samples)"
+        f"  test: {len(test_X)} cells ({test_X[SAMPLE_ID_COL].nunique()} samples){test_note}"
     )
 
     # Initialize the model and train it.
