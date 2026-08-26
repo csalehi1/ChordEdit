@@ -196,6 +196,12 @@ def eval_split(
         out[f"rho_{name}"] = med
         out[f"rho_{name}_image"] = med_img
         out[f"gain_{name}"] = float(t_i.gather(-1, chosen).squeeze(-1).mean().item())
+        # How much the predictions move from sample to sample, per cell, relative
+        # to how much the truth moves. A ratio near 0 means the model emits
+        # essentially one surface for every input regardless of the image.
+        out[f"spread_ratio_{name}"] = float(
+            (p_i.std(dim=0).mean() / t_i.std(dim=0).mean().clamp_min(1e-12)).item()
+        )
 
     return out
 

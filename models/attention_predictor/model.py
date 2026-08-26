@@ -64,8 +64,36 @@ def combine_edit_features(f_src: torch.Tensor, f_tar: torch.Tensor) -> torch.Ten
 Predictor.
 """
 
-class VisualTokenizer(nn.Module):
-    """Project the spatial VAE latent into cross-attention tokens, P_v."""
+"""
+VisionFeaturizer: spatial flattening + VisionProjector (P_v) -> F_v.
+"""
+
+class VisionProjector(nn.Module):
+    """Project flattened visual tokens to attn_dim, P_v."""
+
+    def __init__(
+        self,
+        token_dim: int,
+        attn_dim: int,
+        n_tokens: int,
+        use_pos_emb: bool = USE_POS_EMB,
+    ):
+        super().__init__()
+        self.proj = nn.Linear(token_dim, attn_dim)
+        self.pos_emb = nn.Parameter(torch.zeros(n_tokens, attn_dim)) if use_pos_emb else None
+
+    def forward(
+        self,
+        tokens: torch.Tensor,  # (N, N_v, token_dim)
+    ) -> torch.Tensor:         # (N, N_v, d)
+        tokens = self.proj(tokens)
+        if self.pos_emb is not None:
+            tokens = tokens + self.pos_emb
+        return tokens
+
+
+class VisionFeaturizer(nn.Module):
+    """Spatially flatten the VAE latent, then VisionProjector -> F_v."""
 
     def __init__(
         self,
@@ -76,7 +104,7 @@ class VisualTokenizer(nn.Module):
     ):
         super().__init__()
         channels, height, width = img_shape
-        
+
         if height != width:
             raise ValueError(f"Expected {img_shape} to be a square")
         if patch_size < 1 or height % patch_size != 0:
@@ -88,35 +116,36 @@ class VisualTokenizer(nn.Module):
         self.n_grid = height // patch_size
         self.n_tokens = self.n_grid ** 2
         self.token_dim = channels * patch_size ** 2
+        self.projector = VisionProjector(
+            self.token_dim, attn_dim, self.n_tokens, use_pos_emb=use_pos_emb,
+        )
 
-        self.proj = nn.Linear(self.token_dim, attn_dim)
-        self.pos_emb = nn.Parameter(torch.zeros(self.n_tokens, attn_dim)) if use_pos_emb else None
+    def spatial_flatten(
+        self,
+        img_emb: torch.Tensor,  # (N, C, S, S)
+    ) -> torch.Tensor:          # (N, N_v, token_dim)
+        """Split the latent into patch tokens; patch_size 1 is one token per position."""
+        n = img_emb.shape[0]
+        if tuple(img_emb.shape[1:]) != (self.channels, self.side, self.side):
+            raise ValueError(f"Expected {img_emb.shape} == (N, {self.channels}, {self.side}, {self.side})")
+        g, p = self.n_grid, self.patch_size
+        tokens = img_emb.reshape(n, self.channels, g, p, g, p)
+        return tokens.permute(0, 2, 4, 1, 3, 5).reshape(n, self.n_tokens, self.token_dim)
 
     def forward(
         self,
         img_emb: torch.Tensor,  # (N, C, S, S)
     ) -> torch.Tensor:          # (N, N_v, d)
         """Return the projected visual tokens F_v serving as keys and values."""
-        n = img_emb.shape[0]
-        
-        if tuple(img_emb.shape[1:]) != (self.channels, self.side, self.side):
-            raise ValueError(f"Expected {img_emb.shape} == (N, {self.channels}, {self.side}, {self.side})")
+        return self.projector(self.spatial_flatten(img_emb))
 
-        # Split both spatial axes into (n_grid, patch_size) and gather each
-        # patch's channels and pixels into one token vector. With patch_size 1
-        # this is the plain spatial flattening, one token per latent position.
-        g, p = self.n_grid, self.patch_size
-        tokens = img_emb.reshape(n, self.channels, g, p, g, p)
-        tokens = tokens.permute(0, 2, 4, 1, 3, 5).reshape(n, self.n_tokens, self.token_dim)
 
-        tokens = self.proj(tokens)
-        if self.pos_emb is not None:
-            tokens = tokens + self.pos_emb
-        return tokens
-
+"""
+TextFeaturizer: concatenation + TextProjector (P_t) + reshape -> F_t.
+"""
 
 class TextProjector(nn.Module):
-    """Concatenate then project the source and target prompts, P_t."""
+    """Project concatenated source/target prompts, P_t: R^{2D} -> R^{2d}."""
 
     def __init__(
         self,
@@ -125,8 +154,26 @@ class TextProjector(nn.Module):
     ):
         super().__init__()
         self.attn_dim = attn_dim
-        # Concatenate the two pooled prompts along features, then one projection.
         self.proj = nn.Linear(2 * text_dim, 2 * attn_dim)
+
+    def forward(
+        self,
+        pair: torch.Tensor,  # (N, 2 * D_txt)
+    ) -> torch.Tensor:       # (N, 2 * d)
+        return self.proj(pair)
+
+
+class TextFeaturizer(nn.Module):
+    """Concatenate pooled prompts, TextProjector, reshape to (N, 2, d) -> F_t."""
+
+    def __init__(
+        self,
+        text_dim: int,
+        attn_dim: int = ATTN_DIM,
+    ):
+        super().__init__()
+        self.attn_dim = attn_dim
+        self.projector = TextProjector(text_dim, attn_dim=attn_dim)
 
     def forward(
         self,
@@ -134,15 +181,16 @@ class TextProjector(nn.Module):
         tar_emb: torch.Tensor,  # (N, D_txt)
     ) -> torch.Tensor:          # (N, 2, d)
         """Return the prompt queries F_t, source first then target."""
-
         if src_emb.shape != tar_emb.shape:
             raise ValueError(f"Expected {src_emb.shape} == {tar_emb.shape}")
-
-        # The prompts arrive pooled to one vector each, E_text(c) -- the
-        # pipeline's masked mean over token positions -- so concatenate and project.
+        # Prompts arrive pooled to one vector each (pipeline masked mean).
         pair = torch.cat([src_emb, tar_emb], dim=-1)
-        return self.proj(pair).reshape(src_emb.shape[0], 2, self.attn_dim)
+        return self.projector(pair).reshape(src_emb.shape[0], 2, self.attn_dim)
 
+
+"""
+CrossAttentionPooler: CrossAttn(Q=F_t, K=F_v, V=F_v).
+"""
 
 class CrossAttentionPooler(nn.Module):
     """Ground the prompt queries in the visual tokens, CrossAttn(Q=F_t, K=F_v, V=F_v)."""
@@ -167,7 +215,11 @@ class CrossAttentionPooler(nn.Module):
         return grounded
 
 
-class Combiner(nn.Module):
+"""
+TextCombiner: C_theta(z_edit) -> h.
+"""
+
+class TextCombiner(nn.Module):
     """Shallow MLP C_theta compressing z_edit to the edit descriptor h."""
 
     def __init__(
@@ -219,10 +271,10 @@ class AttentionRegressor(nn.Module):
         # Bounded outputs are only meaningful where the targets are bounded.
         self.bounded = PREDICTION_SPACE == "deltas"
 
-        self.tokenizer = VisualTokenizer(img_shape, attn_dim=attn_dim)
-        self.text_proj = TextProjector(text_dim, attn_dim=attn_dim)
+        self.vision_featurizer = VisionFeaturizer(img_shape, attn_dim=attn_dim)
+        self.text_featurizer = TextFeaturizer(text_dim, attn_dim=attn_dim)
         self.cross_attn = CrossAttentionPooler(attn_dim=attn_dim)
-        self.combiner = Combiner(attn_dim=attn_dim)
+        self.combiner = TextCombiner(attn_dim=attn_dim)
 
         # G_PSNR and G_CLIP are independently parameterized readouts of the shared
         # edit descriptor, one scalar per timestep-grid cell.
@@ -259,8 +311,8 @@ class AttentionRegressor(nn.Module):
     ) -> torch.Tensor:          # (N, n_cells, 2)
         """Return per-cell (psnr, clip) predictions, standardized where active."""
         # Ground both prompts in the source image with one cross-attention pass.
-        tokens = self.tokenizer(img_emb)
-        queries = self.text_proj(src_emb, tar_emb)
+        tokens = self.vision_featurizer(img_emb)
+        queries = self.text_featurizer(src_emb, tar_emb)
         grounded = self.cross_attn(queries, tokens)
         f_src, f_tar = grounded[:, 0], grounded[:, 1]
 
