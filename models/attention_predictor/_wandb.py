@@ -28,17 +28,60 @@ WANDB_PROJECT = "attention-predictor"
 WANDB_MODE = "online"                             # "online", "offline", or "disabled"
 WANDB_GROUP = f"{CHORD_EDIT_MODEL}_{DIR_NAME}"    # optional label grouping related runs
 
+WANDB_TRACK_TRAINING = True
+WANDB_TRACK_SELECTION = True
+WANDB_TRACK_PER_COMPONENT = False
+
+
 # Pinned to the package dir so the key is found whatever the working directory.
 load_dotenv(Path(_DIR) / ".env")
 
-# Short names for the long metric columns, so the panel titles stay readable.
+# Short names for the long metric columns, so that panel titles stay readable.
 _ALIASES = {PSNR_COL: "psnr", CLIP_COL: "clip"}
 
+# Key sets matching metrics.training_metrics / selection_metrics / per_component_metrics.
+_TRAINING_KEYS = frozenset({
+    "loss", "regression_loss", "ranking_loss", "phi_spearman",
+})
+_SELECTION_KEYS = frozenset({
+    "regret_median", "regret_p90", "gain_mean",
+    "improvement_rate", "deviate_rate",
+    "top1_accuracy", "top5_accuracy", "top10_accuracy",
+})
 
-def _prefixed(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
-    """Prefix one split's metrics for wandb, shortening the long column names."""
+
+def _per_component_keys() -> frozenset[str]:
+    """Bare col names plus the prefixed keys per_component_metrics emits."""
+    cols = (PSNR_COL, CLIP_COL, *{_ALIASES[c] for c in (PSNR_COL, CLIP_COL)})
+    keys: set[str] = set()
+    for col in cols:
+        keys.update({
+            col,
+            f"delta_{col}", f"mae_{col}", f"rmse_{col}", f"r2_{col}",
+            f"rho_{col}", f"gain_{col}", f"regret_{col}",
+        })
+    return frozenset(keys)
+
+
+_PER_COMPONENT_KEYS = _per_component_keys()
+
+
+def _tracked(metrics: dict[str, float]) -> dict[str, float]:
+    """Keep only the metric groups enabled by WANDB_TRACK_*."""
+    keep: set[str] = set()
+    if WANDB_TRACK_TRAINING:
+        keep |= _TRAINING_KEYS
+    if WANDB_TRACK_SELECTION:
+        keep |= _SELECTION_KEYS
+    if WANDB_TRACK_PER_COMPONENT:
+        keep |= _PER_COMPONENT_KEYS
+    return {k: v for k, v in metrics.items() if k in keep}
+
+
+def _log_prep(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
+    """Prefix one split's tracked metrics for wandb, shortening long column names."""
     out = {}
-    for key, value in metrics.items():
+    for key, value in _tracked(metrics).items():
         for col, alias in _ALIASES.items():
             key = key.replace(col, alias)
         out[f"{prefix}/{key}"] = value
@@ -52,16 +95,22 @@ def init_run(run_dir: Path, config_extra: dict):
     try:
         import wandb
     except ImportError:
-        print("wandb is not installed; continuing without tracking. pip install wandb")
+        print("Missing wandb, continuing without tracking.")
         return None
     if WANDB_MODE == "online" and not os.environ.get("WANDB_API_KEY"):
-        print(f"No WANDB_API_KEY in {Path(_DIR) / '.env'}; continuing without tracking.")
+        print(f"No WANDB_API_KEY in {Path(_DIR) / '.env'}, continuing without tracking.")
         return None
 
-    # CONFIG is the same dict save_run_settings writes, so the tracked config
-    # and the run's settings.json snapshot agree by construction.
-    config = dict(CONFIG) | config_extra | {"commit": current_commit_id()}
-    tags = [str(t) for t in (CHORD_EDIT_MODEL, DIR_NAME)]
+    # The CONFIG dict is the same as the one save_run_settings writes.
+    config = dict(CONFIG) | config_extra | {
+        "commit": current_commit_id(),
+        "WANDB_TRACK_TRAINING": WANDB_TRACK_TRAINING,
+        "WANDB_TRACK_SELECTION": WANDB_TRACK_SELECTION,
+        "WANDB_TRACK_PER_COMPONENT": WANDB_TRACK_PER_COMPONENT,
+    }
+    tags = [str(t) for t in (CHORD_EDIT_MODEL, DIR_NAME, run_dir.name)]
+    if PIE_BENCH:
+        tags.append("pie-bench")
     try:
         run = wandb.init(
             entity=WANDB_ENTITY or None,
@@ -93,14 +142,14 @@ def log_epoch(
     lr: float,
     seconds: float,
 ) -> None:
-    """Log one epoch's train and val metrics under split-prefixed keys."""
+    """Record one epoch's metrics under split-prefixed keys."""
     if run is None:
         return
     run.log({
-        **_prefixed("train", train_regression),
-        **_prefixed("train", train_selection),
-        **_prefixed("val", val_regression),
-        **_prefixed("val", val_selection),
+        **_log_prep("train", train_regression),
+        **_log_prep("train", train_selection),
+        **_log_prep("val", val_regression),
+        **_log_prep("val", val_selection),
         "lr": lr,
         "epoch_seconds": seconds,
     }, step=epoch)
@@ -114,23 +163,19 @@ def log_summary(
     best_epoch: int,
     epochs_ran: int,
 ) -> None:
-    """Record final quality in the run summary.
-
-    Summary rather than log, so the runs table ranks on the best checkpoint's
-    quality instead of whatever the last epoch happened to produce.
-    """
+    """Record final metrics in the run summary."""
     if run is None:
         return
     run.summary.update({
-        **_prefixed("test", test_regression),
-        **_prefixed("test", test_selection),
-        **_prefixed("val_best", val_best_selection),
+        **_log_prep("test", test_regression),
+        **_log_prep("test", test_selection),
+        **_log_prep("val_best", val_best_selection),
         "best_epoch": best_epoch,
         "epochs_ran": epochs_ran,
     })
 
 
 def finish_run(run) -> None:
-    """Close the run. Safe to call on None and after an exception."""
+    """Finish the run."""
     if run is not None:
         run.finish()
