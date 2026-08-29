@@ -141,11 +141,11 @@ class VisionFeaturizer(nn.Module):
 
 
 """
-TextFeaturizer: concatenation + TextProjector (P_t) + reshape -> F_t.
+TextFeaturizer: token-dim concatenation + TextProjector (P_t) -> F_t.
 """
 
 class TextProjector(nn.Module):
-    """Project concatenated source/target prompts, P_t: R^{2D} -> R^{2d}."""
+    """Project each prompt token, P_t: R^{D} -> R^{d}, shared across the pair."""
 
     def __init__(
         self,
@@ -154,17 +154,17 @@ class TextProjector(nn.Module):
     ):
         super().__init__()
         self.attn_dim = attn_dim
-        self.proj = nn.Linear(2 * text_dim, 2 * attn_dim)
+        self.proj = nn.Linear(text_dim, attn_dim)
 
     def forward(
         self,
-        pair: torch.Tensor,  # (N, 2 * D_txt)
-    ) -> torch.Tensor:       # (N, 2 * d)
+        pair: torch.Tensor,  # (N, 2, D_txt)
+    ) -> torch.Tensor:       # (N, 2, d)
         return self.proj(pair)
 
 
 class TextFeaturizer(nn.Module):
-    """Concatenate pooled prompts, TextProjector, reshape to (N, 2, d) -> F_t."""
+    """Concatenate pooled prompt tokens along the token dim, TextProjector -> F_t."""
 
     def __init__(
         self,
@@ -177,15 +177,18 @@ class TextFeaturizer(nn.Module):
 
     def forward(
         self,
-        src_emb: torch.Tensor,  # (N, D_txt)
-        tar_emb: torch.Tensor,  # (N, D_txt)
+        src_emb: torch.Tensor,  # (N, 1, D_txt)
+        tar_emb: torch.Tensor,  # (N, 1, D_txt)
     ) -> torch.Tensor:          # (N, 2, d)
         """Return the prompt queries F_t, source first then target."""
         if src_emb.shape != tar_emb.shape:
             raise ValueError(f"Expected {src_emb.shape} == {tar_emb.shape}")
-        # Prompts arrive pooled to one vector each (pipeline masked mean).
-        pair = torch.cat([src_emb, tar_emb], dim=-1)
-        return self.projector(pair).reshape(src_emb.shape[0], 2, self.attn_dim)
+        if src_emb.dim() != 3:
+            raise ValueError(f"Expected {tuple(src_emb.shape)} == (N, 1, D_txt)")
+        # Prompts arrive pooled to one token each (pipeline masked mean), so the
+        # pair concatenates along the token dim and P_t maps each token to d.
+        pair = torch.cat([src_emb, tar_emb], dim=-2)
+        return self.projector(pair)
 
 
 """
@@ -306,8 +309,8 @@ class AttentionRegressor(nn.Module):
     def forward(
         self,
         img_emb: torch.Tensor,  # (N, C, S, S)
-        src_emb: torch.Tensor,  # (N, D_txt)
-        tar_emb: torch.Tensor,  # (N, D_txt)
+        src_emb: torch.Tensor,  # (N, 1, D_txt)
+        tar_emb: torch.Tensor,  # (N, 1, D_txt)
     ) -> torch.Tensor:          # (N, n_cells, 2)
         """Return per-cell (psnr, clip) predictions, standardized where active."""
         # Ground both prompts in the source image with one cross-attention pass.
@@ -342,8 +345,8 @@ class AttentionModel(nn.Module):
     def pred_cells(
         self,
         img_emb: torch.Tensor,  # (N, C, S, S)
-        src_emb: torch.Tensor,  # (N, D_txt)
-        tar_emb: torch.Tensor,  # (N, D_txt)
+        src_emb: torch.Tensor,  # (N, 1, D_txt)
+        tar_emb: torch.Tensor,  # (N, 1, D_txt)
     ) -> torch.Tensor:          # (N, n_cells, 2)
         """Predict per-cell (psnr, clip) in PREDICTION_SPACE units."""
         return self.regressor.destandardize(self.regressor(img_emb, src_emb, tar_emb))
@@ -493,10 +496,10 @@ class TimestepSelector:
         needs no retraining.
         """
         device = self.model.regressor.target_mean.device
-        # Accept one unbatched sample: (C, S, S) latents and (D,) prompts.
+        # Accept one unbatched sample: (C, S, S) latents and (1, D) prompts.
         img = (img_emb.unsqueeze(0) if img_emb.dim() == 3 else img_emb).to(device)
-        src = (src_emb.unsqueeze(0) if src_emb.dim() == 1 else src_emb).to(device)
-        tar = (tar_emb.unsqueeze(0) if tar_emb.dim() == 1 else tar_emb).to(device)
+        src = (src_emb.unsqueeze(0) if src_emb.dim() == 2 else src_emb).to(device)
+        tar = (tar_emb.unsqueeze(0) if tar_emb.dim() == 2 else tar_emb).to(device)
         preds = self.model.pred_cells(img, src, tar)
 
         # Map out of PREDICTION_SPACE before anything is scored.

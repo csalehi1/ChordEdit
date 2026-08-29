@@ -24,8 +24,8 @@ class EmbeddingTable:
     """One embedding-table row per unique sample_id."""
 
     img: torch.Tensor   # (n_samples, C, S, S)
-    src: torch.Tensor   # (n_samples, D_txt)
-    tar: torch.Tensor   # (n_samples, D_txt)
+    src: torch.Tensor   # (n_samples, 1, D_txt)
+    tar: torch.Tensor   # (n_samples, 1, D_txt)
 
 
 @dataclass(frozen=True)

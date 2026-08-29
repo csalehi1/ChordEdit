@@ -217,7 +217,7 @@ def train(
     Train the grid surface predictor and save run artifacts.
 
     Saves regressor_weights.pt {regressor_state_dict, target_mean, target_std,
-    target_cols, prediction_space, img_shape (C, S, S), text_shape (D,),
+    target_cols, prediction_space, img_shape (C, S, S), text_shape (1, D),
     cell_t_pairs, t_start_values, t_end_values}, mean_surface.pt,
     id_to_split.csv, and regression_metrics.json.
     """

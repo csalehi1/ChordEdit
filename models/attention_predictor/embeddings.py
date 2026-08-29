@@ -39,10 +39,10 @@ def _img_token_shape(probe: torch.Tensor, path) -> tuple[int, ...]:
 
 
 def _text_shape(probe: torch.Tensor, path) -> tuple[int, ...]:
-    """Validate a stored pooled text vector (D,) or (1, D) and return (D,)."""
+    """Validate a stored pooled text vector (D,) or (1, D) and return (1, D)."""
     if probe.numel() != probe.shape[-1]:
         raise ValueError(f"Expected a pooled text vector (D,) or (1, D), got {tuple(probe.shape)} in {path}.")
-    return (int(probe.shape[-1]),)
+    return (1, int(probe.shape[-1]))
 
 
 """
@@ -61,7 +61,7 @@ def _expected_packed_meta(*, dir_name: str | None = None) -> dict:
     return {
         "model": CHORD_EDIT_MODEL,
         "pipeline_type": CHORD_EDIT_PIPELINE_TYPE,
-        "layout": "img_tokens_src_tar_pooled_v1",
+        "layout": "img_tokens_src_tar_pooled_v2",
         "image_size": int(CHORD_EDIT_IMAGE_SIZE),
         "dir_name": dir_name if dir_name is not None else DIR_NAME,
         "target_t_delta": TARGET_T_DELTA,
@@ -198,9 +198,10 @@ def _pack_scattered_cache(
         # Load the embeddings in parallel using a thread pool.
         for i, img_t, src_t, tar_t in tqdm(pool.map(_load_row, range(n)), total=n, desc="Packing embeddings", unit="sample"):
             img_emb[i] = _check(img_t, i, "image", img_shape)
-            # Text rows may be saved as (D,) or (1, D); flatten before checking.
-            src_emb[i] = _check(src_t.reshape(-1), i, "source", text_shape)
-            tar_emb[i] = _check(tar_t.reshape(-1), i, "target", text_shape)
+            # Text rows may be saved as (D,) or (1, D); the table keeps the
+            # single-token layout (1, D) that the text featurizer consumes.
+            src_emb[i] = _check(src_t.reshape(1, -1), i, "source", text_shape)
+            tar_emb[i] = _check(tar_t.reshape(1, -1), i, "target", text_shape)
 
     tables = {"img": img_emb, "src": src_emb, "tar": tar_emb}
     _save_packed_cache(packed_path, sample_ids, tables, dir_name=dir_name)
@@ -217,8 +218,8 @@ def get_embeddings(
 
     img keeps the saved token shape (n, C, S, S) VAE latents; the
     cross-attention regressor consumes the token structure directly. src/tar
-    are (n, D) masked-mean-pooled prompt vectors, the pipeline's own
-    source.pt / target.pt, so no pooling happens in the model.
+    are (n, 1, D) masked-mean-pooled prompt vectors, one text token each, the
+    pipeline's own source.pt / target.pt, so no pooling happens in the model.
 
     Optional scattered_dir / dir_name point at a non-default dataset root
     (used for PIE-Bench when --pie-bench mixes UltraEdit train with PIE test).
