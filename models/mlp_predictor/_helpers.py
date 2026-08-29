@@ -61,7 +61,7 @@ def load_run_settings(run_dir: Path):
     --settings-path on the current command line.
     """
     run_dir = Path(run_dir)
-    already = [n for n in ("_data", "embeddings", "model_m", "model_t") if n in sys.modules]
+    already = [n for n in ("_data", "embeddings", "model", "_wandb") if n in sys.modules]
     if already:
         raise RuntimeError(
             f"load_run_settings() must be called before importing modules that bind settings "
@@ -71,7 +71,7 @@ def load_run_settings(run_dir: Path):
     path = run_dir / SETTINGS_FILENAME
     if not path.exists():
         raise FileNotFoundError(
-            f"Missing {path}. Re-run train_m.py to save the config for this run."
+            f"Missing {path}. Re-run train.py to save the config for this run."
         )
     spec = importlib.util.spec_from_file_location("settings", _SETTINGS_MODULE)
     if spec is None or spec.loader is None:
@@ -137,10 +137,10 @@ def timestep_pairs_from_df(df: pd.DataFrame) -> np.ndarray:
 
 
 def calc_phi(deltas: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
-    """settings.T_TARGET_PHI on normalized deltas."""
+    """settings.SCORE_PHI on normalized deltas."""
     if weights is None:
-        return _s().T_TARGET_PHI(deltas)
-    return _s().T_TARGET_PHI(deltas, weights=weights)
+        return _s().SCORE_PHI(deltas)
+    return _s().SCORE_PHI(deltas, weights=weights)
 
 
 def delta_metric_grids(
@@ -173,7 +173,7 @@ def phi_from_delta_grids(
     delta_grids: np.ndarray,
     weights: np.ndarray | tuple[float, float] | None = None,
 ) -> np.ndarray:
-    """settings.T_TARGET_PHI over (n_samples, n_start, n_end, 2) delta grids."""
+    """settings.SCORE_PHI over (n_samples, n_start, n_end, 2) delta grids."""
     b, n1, n2, c = delta_grids.shape
     deltas = torch.as_tensor(delta_grids.reshape(b, n1 * n2, c), dtype=torch.float64)
     w = None if weights is None else torch.as_tensor(weights, dtype=torch.float64)
@@ -210,37 +210,50 @@ def format_metric_table(
             return ""
         return format(sel[key], fmt)
 
-    target_cols = list(_s().M_TARGET_COLS)
+    target_cols = list(_s().TARGET_COLS)
     split_w = max(5, *(len(name) for name, _, _ in rows))
-    loss_w = max(4, *(len(f"{m['loss']:.4f}") for _, m, _ in rows))
+    # Prefer selection's train-objective loss when present (includes ranking).
+    def _loss(m: dict[str, float], sel: dict[str, float] | None) -> float:
+        if sel and "loss" in sel:
+            return float(sel["loss"])
+        return float(m["loss"])
+
+    loss_w = max(4, *(len(f"{_loss(m, sel):.4f}") for _, m, sel in rows))
     target_ws = [
         max(len(col), *(len(_mae_r2(m, col)) for _, m, _ in rows))
         for col in target_cols
     ]
-    phi_vals = [_sel(sel, "phi_spearman", ".3f") for _, _, sel in rows]
-    reg_vals = [_sel(sel, "regret_median", ".3f") for _, _, sel in rows]
-    phi_w = max(len("phi rho"), *(len(v) for v in phi_vals))
-    reg_w = max(len("regret"), *(len(v) for v in reg_vals))
+    # Selection columns, appended after the per-target block. A key missing from
+    # the selection dict renders blank rather than raising.
+    sel_cols = (
+        ("phi rho", "phi_spearman"),
+        ("regret", "regret_median"),
+        ("gain", "gain_mean"),
+        ("top1", "top1_accuracy"),
+    )
+    sel_vals = [[_sel(sel, key, ".3f") for _, _, sel in rows] for _, key in sel_cols]
+    sel_ws = [max(len(head), *(len(v) for v in vals)) for (head, _), vals in zip(sel_cols, sel_vals)]
 
     header = (
         f"{'split':<{split_w}}  {'loss':<{loss_w}}  "
         + "  ".join(f"{col:<{w}}" for col, w in zip(target_cols, target_ws))
-        + f"  {'phi rho':<{phi_w}}  {'regret':<{reg_w}}"
+        + "  "
+        + "  ".join(f"{head:<{w}}" for (head, _), w in zip(sel_cols, sel_ws))
     )
     lines = [f"    {header}"]
-    for (name, metrics, sel), phi, reg in zip(rows, phi_vals, reg_vals):
+    for i, (name, metrics, sel) in enumerate(rows):
         cells = "  ".join(
             f"{_mae_r2(metrics, col):<{w}}" for col, w in zip(target_cols, target_ws)
         )
+        sel_cells = "  ".join(f"{vals[i]:<{w}}" for vals, w in zip(sel_vals, sel_ws))
         lines.append(
-            f"    {name:<{split_w}}  {metrics['loss']:<{loss_w}.4f}  {cells}"
-            f"  {phi:<{phi_w}}  {reg:<{reg_w}}"
+            f"    {name:<{split_w}}  {_loss(metrics, sel):<{loss_w}.4f}  {cells}  {sel_cells}"
         )
     return "\n".join(lines)
 
 
 """
-T mean surface.
+Grid indexing and the mean surface.
 """
 
 MEAN_SURFACE_NAME = "mean_surface.pt"
@@ -271,11 +284,36 @@ def calc_mean_surface(cells) -> dict:
         "t_start_values": torch.as_tensor(t_start_values, dtype=torch.float64),
         "t_end_values": torch.as_tensor(t_end_values, dtype=torch.float64),
         "mean_true_delta": grid,
-        "target_space": str(s.M_TARGET_SPACE),
+        "prediction_space": str(s.PREDICTION_SPACE),
         "split": "train",
         "n_samples": cells.n_grids,
-        "target_cols": list(s.M_TARGET_COLS),
+        "target_cols": list(s.TARGET_COLS),
     }
+
+
+def mean_surface_from_dict(
+    surface: dict,
+    t_start_values: np.ndarray,
+    t_end_values: np.ndarray,
+) -> np.ndarray:
+    """mean_surface dict -> (n_start, n_end, 2) mean target grid.
+
+    Raises when the mean surface's grid axes do not match the selector's, so a
+    stale mean surface can never be silently applied to the wrong grid.
+    """
+    cal_start = np.asarray(surface["t_start_values"], dtype=np.float64)
+    cal_end = np.asarray(surface["t_end_values"], dtype=np.float64)
+    if not (
+        len(cal_start) == len(t_start_values)
+        and len(cal_end) == len(t_end_values)
+        and np.allclose(cal_start, np.asarray(t_start_values, dtype=np.float64))
+        and np.allclose(cal_end, np.asarray(t_end_values, dtype=np.float64))
+    ):
+        raise ValueError(
+            f"Expected ({cal_start.tolist()}, {cal_end.tolist()}) == "
+            f"({np.asarray(t_start_values).tolist()}, {np.asarray(t_end_values).tolist()})"
+        )
+    return np.asarray(surface["mean_true_delta"], dtype=np.float64)
 
 
 def gather_at_pairs(surface: dict, t_pairs: torch.Tensor) -> torch.Tensor:

@@ -1,4 +1,4 @@
-# train_t.py
+# selector.py
 
 """
 Evaluate timestep selector T on the test split.
@@ -6,10 +6,10 @@ Evaluate timestep selector T on the test split.
     Model architecture:
     T(img, src_prompt, tar_prompt) -> (t_start, t_end)
 
-Run after train_m.py:
+Run after train.py:
 
-    python train_t.py
-    python train_t.py --run-dir runs/UltraEdit_Region_10000/20260101_120000
+    python selector.py
+    python selector.py --run-dir runs/UltraEdit_Region_10000/20260101_120000
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ import pandas as pd
 import torch
 
 from _helpers import *
+from metrics import *
 
 
 # Parse command line arguments.
@@ -50,9 +51,34 @@ load_run_settings(RUN_DIR)
 
 from _data import ID_TO_SPLIT_NAME, df_to_metric_grids, load_split_df
 from embeddings import get_embeddings_by_sample
-from model_m import SurrogateModel
-from model_t import TimestepSelector, gate_metrics, per_image_spearman, regret
+from model import SurrogateModel, TimestepSelector
 from settings import *
+
+
+def labeled_surfaces(
+    true_phi: np.ndarray,   # (S, n_start, n_end), NaN outside the labeled set
+    pred_phi: np.ndarray,
+    default_i: int,
+    default_j: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Flatten the phi grids to the cells labeled for every test image.
+
+    Keeping one candidate set for all images is what makes their ranks
+    comparable. Returns (true, pred, default_col) ready for metrics.py.
+    """
+    n = true_phi.shape[0]
+    flat_true = true_phi.reshape(n, -1)
+    flat_pred = pred_phi.reshape(n, -1)
+    keep = np.isfinite(flat_true).all(axis=0) & np.isfinite(flat_pred).all(axis=0)
+    default_flat = default_i * true_phi.shape[2] + default_j
+    if not keep[default_flat]:
+        raise ValueError("The default cell is not labeled for every test image")
+
+    return (
+        torch.as_tensor(flat_true[:, keep], dtype=torch.float64),
+        torch.as_tensor(flat_pred[:, keep], dtype=torch.float64),
+        int(np.cumsum(keep)[default_flat] - 1),
+    )
 
 
 def eval(run_dir: Path) -> dict:
@@ -84,14 +110,16 @@ def eval(run_dir: Path) -> dict:
     print(f"Device: {device}.")
     ckpt = torch.load(weights_path, map_location=device, weights_only=False)
     cell_t_pairs = ckpt["cell_t_pairs"].cpu().numpy()
-    model = SurrogateModel(int(ckpt["img_dim"]), int(ckpt["text_dim"]), int(cell_t_pairs.shape[0]), device=device)
+    img_shape = tuple(int(v) for v in ckpt["img_shape"])
+    text_dim = int(tuple(ckpt["text_shape"])[-1])
+    model = SurrogateModel(img_shape, text_dim, int(cell_t_pairs.shape[0]), device=device)
     model.regressor.load_state_dict(ckpt["regressor_state_dict"])
     model.regressor.set_target_standardization(ckpt["target_mean"], ckpt["target_std"])
     model.regressor.to(device).eval()
 
     # Initialize the timestep selector.
     surface = torch.load(surface_path, map_location="cpu", weights_only=True)
-    mean_surface = np.asarray(surface["mean_true_delta"], dtype=np.float64) if M_TARGET_SPACE == "residual" else None
+    mean_surface = np.asarray(surface["mean_true_delta"], dtype=np.float64) if PREDICTION_SPACE == "residuals" else None
     t_selector = TimestepSelector(model, cell_t_pairs, t_start_values=t_start_values, t_end_values=t_end_values, mean_surface=mean_surface)
     default_i, default_j = t_selector._default_i, t_selector._default_j
 
@@ -122,18 +150,26 @@ def eval(run_dir: Path) -> dict:
     test_selections = [s for s in all_selections if s["sample_id"] in test_pos]
 
     # Compute metrics on the test selections only.
-    reg = regret(true_phi, pred_phi)
-    rho_phi = per_image_spearman(true_phi, pred_phi)
-    gate = gate_metrics(true_phi, pred_phi, default_i, default_j, NOISE_FLOOR_PHI)
+    t_phi, p_phi, default_col = labeled_surfaces(true_phi, pred_phi, default_i, default_j)
+    training = training_metrics(
+        t_phi, p_phi, default_col,
+        mse_weight=1.0,
+        ranking_weight=RANKING_LOSS_WEIGHT,
+        ranking_top_k=(None if RANKING_TOP_K <= 0 else RANKING_TOP_K),
+    )
+    selection = selection_metrics(t_phi, p_phi, default_col)
     metrics = {
         "run_dir": str(run_dir),
         "n_test_images": len(test_sample_ids),
         "grid": f"{len(t_start_values)}x{len(t_end_values)}",
         "n_labeled_pairs": int(cell_t_pairs.shape[0]),
-        "regret_median": float(np.median(reg)),
-        "regret_p90": float(np.percentile(reg, 90)),
-        "spearman_m_median": float(np.nanmedian(rho_phi)),  # JSON key kept for saved-run schema
-        "gate": gate,
+        "n_scored_cells": int(t_phi.shape[-1]),
+        "prediction_space": str(PREDICTION_SPACE),
+        "score_fn": str(SCORE_FN),
+        # Kept under its historical name for consumers of this file.
+        "spearman_phi_median": training["phi_spearman"],
+        **training,
+        **selection,
         "dataset_dir": str(DATASET_DIR),
         "default_t_start": DEFAULT_T_START,
         "default_t_end": DEFAULT_T_END,
@@ -142,7 +178,7 @@ def eval(run_dir: Path) -> dict:
     # Save test metrics / selections; CSV covers every sample_id in the run.
     out_metrics = run_dir / "selection_metrics.json"
     out_selections = run_dir / "selections.json"
-    scorer = T_TARGET_FN if "alpha" not in signature(T_TARGET_FNS[T_TARGET_FN][0]).parameters else f"{T_TARGET_FN}_a{int(PHI_ALPHA)}"
+    scorer = SCORE_FN if "alpha" not in signature(SCORE_FNS[SCORE_FN][0]).parameters else f"{SCORE_FN}_a{int(PHI_ALPHA)}"
     start_col, end_col = f"{scorer}_t_start", f"{scorer}_t_end"
     out_predictions = run_dir / f"id_to_selections_{DIR_NAME.replace('_', '').lower()}.csv"
     with open(out_metrics, "w") as f:
@@ -153,12 +189,11 @@ def eval(run_dir: Path) -> dict:
         [{"sample_id": s["sample_id"], start_col: s["t_start"], end_col: s["t_end"]} for s in all_selections]
     ).to_csv(out_predictions, index=False)
 
-    print(f"T eval on {len(test_sample_ids)} test images ({len(all_sample_ids)} selections)  run={run_dir.name}")
+    print(f"Selector eval on {len(test_sample_ids)} test images ({len(all_sample_ids)} selections)  run={run_dir.name}")
     print(f"  regret median={metrics['regret_median']:.4f}  p90={metrics['regret_p90']:.4f}")
-    print(f"  spearman phi median={metrics['spearman_m_median']:.3f}")
     print(
-        f"  gate precision={gate['precision']:.3f}  recall={gate['recall']:.3f}  "
-        f"({gate['n_flagged']} flagged)"
+        f"  rho_phi={metrics['spearman_phi_median']:.4f}  gain={metrics['gain_mean']:.4f}  "
+        + "  ".join(f"top{k}={metrics[f'top{k}_accuracy']:.4f}" for k in TOP_K_VALUES)
     )
     print(f"Saved {out_metrics}")
     print(f"Saved {out_selections}")

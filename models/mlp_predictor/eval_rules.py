@@ -21,6 +21,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+from scipy.stats import spearmanr
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -41,20 +42,40 @@ load_run_settings(_ARGS.runs[0])
 from _data import df_to_metric_grids, load_split_df
 from _helpers import phi_from_delta_grids, resolve_device
 from embeddings import get_embeddings_by_sample
-from model_t import TimestepSelector, per_image_spearman, regret
-from model_m import SurrogateModel
+from model import SurrogateModel, TimestepSelector
 from settings import *
+
+
+def per_image_spearman(true_grid: np.ndarray, pred_grid: np.ndarray) -> np.ndarray:
+    """Rank correlation within each image's timestep grid (over labeled cells).
+
+    Lives here rather than in metrics.py: these grids are (S, n_start, n_end)
+    numpy with NaN outside the labeled set, not metrics.py's flattened torch
+    surfaces over one shared candidate set.
+    """
+    rhos = []
+    for k in range(true_grid.shape[0]):
+        t, p = true_grid[k].ravel(), pred_grid[k].ravel()
+        labeled = np.isfinite(t) & np.isfinite(p)
+        if labeled.sum() < 2:
+            rhos.append(np.nan)
+            continue
+        rho, _ = spearmanr(t[labeled], p[labeled])
+        rhos.append(np.nan if rho is None else float(rho))
+    return np.array(rhos)
 
 
 def load_selector(run_dir: Path, t_start_values, t_end_values, device) -> TimestepSelector:
     ckpt = torch.load(run_dir / "regressor_weights.pt", map_location=device, weights_only=False)
     cell_t_pairs = ckpt["cell_t_pairs"].cpu().numpy()
-    model = SurrogateModel(int(ckpt["img_dim"]), int(ckpt["text_dim"]), int(cell_t_pairs.shape[0]), device=device)
+    img_shape = tuple(int(v) for v in ckpt["img_shape"])
+    text_dim = int(tuple(ckpt["text_shape"])[-1])
+    model = SurrogateModel(img_shape, text_dim, int(cell_t_pairs.shape[0]), device=device)
     model.regressor.load_state_dict(ckpt["regressor_state_dict"])
     model.regressor.set_target_standardization(ckpt["target_mean"], ckpt["target_std"])
     model.regressor.to(device).eval()
     surface = torch.load(run_dir / "mean_surface.pt", map_location="cpu", weights_only=True)
-    mean_surface = np.asarray(surface["mean_true_delta"], dtype=np.float64) if M_TARGET_SPACE == "residual" else None
+    mean_surface = np.asarray(surface["mean_true_delta"], dtype=np.float64) if PREDICTION_SPACE == "residuals" else None
     return TimestepSelector(model, cell_t_pairs, t_start_values=t_start_values, t_end_values=t_end_values, mean_surface=mean_surface)
 
 

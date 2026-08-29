@@ -18,40 +18,52 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from settings import *
 
 _PACKED_EMBEDDINGS_DIR = Path(__file__).resolve().parent / ".cache" / "packed_embeddings"
-_SCATTERED_EMBEDDINGS_DIR = SCATTERED_DIR / "annotation_embeddings"
-_EMB_FILES = {"img": "image.pt", "src": "source.pt", "tar": "target.pt"}
+_EMB_FILES = {"img": "image_tokens.pt", "src": "source.pt", "tar": "target.pt"}
 
 
-def _scattered_path(sample_id: str, kind: str) -> Path:
-    return _SCATTERED_EMBEDDINGS_DIR / sample_id / _EMB_FILES[kind]
+def _scattered_path(
+    sample_id: str,
+    kind: str,
+    *,
+    scattered_dir: Path | None = None,
+) -> Path:
+    root = (scattered_dir if scattered_dir is not None else SCATTERED_DIR) / "annotation_embeddings"
+    return root / sample_id / _EMB_FILES[kind]
 
 
-def _text_dim(probe: torch.Tensor, path) -> int:
-    """Validate a stored packing-ready text vector and return its dim."""
+def _img_token_shape(probe: torch.Tensor, path) -> tuple[int, ...]:
+    """Validate a stored latent token tensor (C, S, S) and return its shape."""
+    if probe.ndim != 3 or probe.shape[-1] != probe.shape[-2]:
+        raise ValueError(f"Expected {tuple(probe.shape)} == (C, S, S) in {path}")
+    return tuple(probe.shape)
+
+
+def _text_shape(probe: torch.Tensor, path) -> tuple[int, ...]:
+    """Validate a stored pooled text vector (D,) or (1, D) and return (1, D)."""
     if probe.numel() != probe.shape[-1]:
         raise ValueError(f"Expected a pooled text vector (D,) or (1, D), got {tuple(probe.shape)} in {path}.")
-    return int(probe.shape[-1])
+    return (1, int(probe.shape[-1]))
 
 
 """
 Packed/scattered caches.
 """
 
-def _get_packed_path() -> Path:
-    """Packed cache path for the current settings."""
+def _get_packed_path(*, dir_name: str | None = None) -> Path:
+    """Packed cache path for the current settings (or an override dir_name)."""
     t_delta = f"{TARGET_T_DELTA}".replace(".", "p")
-    slug = DIR_NAME.replace("_", "").lower()
+    slug = (dir_name if dir_name is not None else DIR_NAME).replace("_", "").lower()
     return _PACKED_EMBEDDINGS_DIR / f"{CHORD_EDIT_MODEL}-{t_delta}-{slug}.pt"
 
 
-def _expected_packed_meta() -> dict:
+def _expected_packed_meta(*, dir_name: str | None = None) -> dict:
     """Meta that a valid packed cache must carry."""
     return {
         "model": CHORD_EDIT_MODEL,
         "pipeline_type": CHORD_EDIT_PIPELINE_TYPE,
-        "layout": "img_src_tar_v1",
+        "layout": "img_tokens_src_tar_pooled_v2",
         "image_size": int(CHORD_EDIT_IMAGE_SIZE),
-        "dir_name": DIR_NAME,
+        "dir_name": dir_name if dir_name is not None else DIR_NAME,
         "target_t_delta": TARGET_T_DELTA,
     }
 
@@ -67,6 +79,8 @@ def _load_pt(path: str | Path) -> torch.Tensor:
 def _load_packed_cache(
     packed_path: Path,
     sample_ids: list[str],
+    *,
+    dir_name: str | None = None,
 ) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor] | None:
     """Packed tables sliced to sample_ids, or None (missing / bad meta / coverage)."""
 
@@ -86,12 +100,14 @@ def _load_packed_cache(
     if not isinstance(meta, dict):
         print(f"{packed_path} has no meta. Repacking...")
         return None
-    for key, expected in _expected_packed_meta().items():
+    for key, expected in _expected_packed_meta(dir_name=dir_name).items():
         if meta.get(key) != expected:
             print(f"{packed_path} meta mismatch: {key}={meta.get(key)!r} expected {expected!r}. Repacking...")
             return None
-    if data["img"].shape[1] != meta.get("img_dim") or data["src"].shape[1] != meta.get("text_dim"):
-        print(f"{packed_path} table dims do not match meta. Repacking...")
+    img_shape = tuple(meta.get("img_shape") or ())
+    text_shape = tuple(meta.get("text_shape") or ())
+    if tuple(data["img"].shape[1:]) != img_shape or tuple(data["src"].shape[1:]) != text_shape:
+        print(f"{packed_path} table shapes do not match meta. Repacking...")
         return None
     id_to_i = {sid: i for i, sid in enumerate(data["sids"])}
     n_missing = sum(sid not in id_to_i for sid in sample_ids)
@@ -114,12 +130,14 @@ def _save_packed_cache(
     packed_path: Path,
     sample_ids: list[str],
     tables: dict[str, torch.Tensor],
+    *,
+    dir_name: str | None = None,
 ) -> None:
     """Atomically write the packed table dict with meta from scattered files."""
-    meta = _expected_packed_meta() | {
+    meta = _expected_packed_meta(dir_name=dir_name) | {
         "source": "scattered",
-        "img_dim": int(tables["img"].shape[1]),
-        "text_dim": int(tables["src"].shape[1]),
+        "img_shape": tuple(tables["img"].shape[1:]),
+        "text_shape": tuple(tables["src"].shape[1:]),
     }
     packed_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = Path(str(packed_path) + ".tmp")
@@ -131,73 +149,79 @@ def _save_packed_cache(
 def _pack_scattered_cache(
     samples_df: pd.DataFrame,
     packed_path: Path,
+    *,
+    scattered_dir: Path | None = None,
+    dir_name: str | None = None,
 ) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor] | None:
     """Pack scattered per-sample .pt files into packed tables."""
     sample_ids = samples_df[SAMPLE_ID_COL].tolist()
     if not sample_ids:
-        raise ValueError("No samples to pack")
+        raise ValueError("Expected samples to pack")
 
-    missing = [sid for sid in sample_ids if not _scattered_path(sid, "img").exists()]
+    missing = [
+        sid for sid in sample_ids
+        if not _scattered_path(sid, "img", scattered_dir=scattered_dir).exists()
+    ]
     if missing:
         preview = ", ".join(missing[:5])
         more = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
         print(f"Scattered embeddings missing {len(missing)} sample_id(s): {preview}{more}")
         return None
 
-    # Probe dims from the first sample, then preallocate the packed tables so
+    # Probe shapes from the first sample, then preallocate the packed tables so
     # that peak memory stays ~1x table size (no row lists + torch.stack copy).
+    # Image token shapes are kept as saved; text vectors are already pooled.
     n = len(sample_ids)
-    img_dim = _load_pt(_scattered_path(sample_ids[0], "img")).numel()
-    src_probe_path = _scattered_path(sample_ids[0], "src")
-    text_dim = _text_dim(_load_pt(src_probe_path), src_probe_path)
-    img_emb = torch.empty((n, img_dim), dtype=torch.float32)
-    src_emb = torch.empty((n, text_dim), dtype=torch.float32)
-    tar_emb = torch.empty((n, text_dim), dtype=torch.float32)
+    img_probe_path = _scattered_path(sample_ids[0], "img", scattered_dir=scattered_dir)
+    img_shape = _img_token_shape(_load_pt(img_probe_path), img_probe_path)
+    src_probe_path = _scattered_path(sample_ids[0], "src", scattered_dir=scattered_dir)
+    text_shape = _text_shape(_load_pt(src_probe_path), src_probe_path)
+    img_emb = torch.empty((n, *img_shape), dtype=torch.float32)
+    src_emb = torch.empty((n, *text_shape), dtype=torch.float32)
+    tar_emb = torch.empty((n, *text_shape), dtype=torch.float32)
 
     def _load_row(i: int):
         sid = sample_ids[i]
         return (
             i,
-            _load_pt(_scattered_path(sid, "img")),
-            _load_pt(_scattered_path(sid, "src")),
-            _load_pt(_scattered_path(sid, "tar")),
+            _load_pt(_scattered_path(sid, "img", scattered_dir=scattered_dir)),
+            _load_pt(_scattered_path(sid, "src", scattered_dir=scattered_dir)),
+            _load_pt(_scattered_path(sid, "tar", scattered_dir=scattered_dir)),
         )
 
-    def _check(t: torch.Tensor, i: int, kind: str, dim: int) -> torch.Tensor:
-        if t.numel() != dim:
-            raise ValueError(f"{kind} numel {t.numel()} != {dim} for sample {sample_ids[i]}")
-        return t.reshape(-1)
+    def _check(t: torch.Tensor, i: int, kind: str, shape: tuple[int, ...]) -> torch.Tensor:
+        if tuple(t.shape) != shape:
+            raise ValueError(f"Expected {tuple(t.shape)} == {shape} for {kind} sample {sample_ids[i]}")
+        return t
 
     with ThreadPoolExecutor(max_workers=32) as pool:
         # Load the embeddings in parallel using a thread pool.
         for i, img_t, src_t, tar_t in tqdm(pool.map(_load_row, range(n)), total=n, desc="Packing embeddings", unit="sample"):
-            img_emb[i] = _check(img_t, i, "image", img_dim)
-            src_emb[i] = _check(src_t, i, "source", text_dim)
-            tar_emb[i] = _check(tar_t, i, "target", text_dim)
+            img_emb[i] = _check(img_t, i, "image", img_shape)
+            # Text rows may be saved as (D,) or (1, D); the table keeps the
+            # single-token layout (1, D) that the text featurizer consumes.
+            src_emb[i] = _check(src_t.reshape(1, -1), i, "source", text_shape)
+            tar_emb[i] = _check(tar_t.reshape(1, -1), i, "target", text_shape)
 
     tables = {"img": img_emb, "src": src_emb, "tar": tar_emb}
-    _save_packed_cache(packed_path, sample_ids, tables)
+    _save_packed_cache(packed_path, sample_ids, tables, dir_name=dir_name)
     return sample_ids, img_emb, src_emb, tar_emb
 
 
 def _apply_img_emb_source(samples: pd.DataFrame, img_emb: torch.Tensor) -> torch.Tensor:
-    """The image table the regressor sees, per IMG_EMB_SOURCE.
+    """The image table the regressor sees, per IMG_EMB_SOURCE, (n, C, S, S).
 
-    "vae+clip" concatenates the two so that the image input stays a single
-    tensor; the regressor splits it back apart on the known CLIP width, which
-    keeps every caller (CellTensors, the checkpoint's img_dim, train_t) unchanged.
+    The packed table holds the latent tokens attention_predictor's featurizer
+    consumes, and VisionFeaturizer needs that grid, so the table is passed
+    through unchanged. The CLIP image sources have no latent grid to featurize
+    and are rejected here rather than deeper in the model.
     """
     if IMG_EMB_SOURCE == "vae":
         return img_emb
-
-    from clip_image import CLIP_IMG_DIM, get_clip_image_embeddings
-
-    clip_emb = get_clip_image_embeddings(samples)
-    if clip_emb.shape[0] != img_emb.shape[0] or clip_emb.shape[1] != CLIP_IMG_DIM:
-        raise ValueError(f"CLIP image table {tuple(clip_emb.shape)} does not match {tuple(img_emb.shape)}")
-    if IMG_EMB_SOURCE == "clip":
-        return clip_emb
-    return torch.cat([img_emb, clip_emb], dim=1)
+    raise ValueError(
+        f"{IMG_EMB_SOURCE=} is not compatible with the visual featurizer, "
+        f"which needs the (C, S, S) VAE latent; expected 'vae'"
+    )
 
 
 def _apply_text_emb_source(
@@ -205,7 +229,11 @@ def _apply_text_emb_source(
     src_emb: torch.Tensor,
     tar_emb: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The (source, target) prompt tables the regressor sees, per TEXT_EMB_SOURCE."""
+    """The (source, target) prompt tables the regressor sees, per TEXT_EMB_SOURCE.
+
+    Both branches keep the single-token (n, 1, D) layout the packed table uses,
+    so the regressor takes token 0 whichever encoder produced the vector.
+    """
     if TEXT_EMB_SOURCE == "sd":
         return src_emb, tar_emb
 
@@ -214,19 +242,35 @@ def _apply_text_emb_source(
     both = get_clip_text_embeddings(samples)
     if both.shape[0] != src_emb.shape[0] or both.shape[1] != 2 * CLIP_TXT_DIM:
         raise ValueError(f"CLIP text table {tuple(both.shape)} does not match {tuple(src_emb.shape)}")
-    return both[:, :CLIP_TXT_DIM].contiguous(), both[:, CLIP_TXT_DIM:].contiguous()
+    return (
+        both[:, :CLIP_TXT_DIM].unsqueeze(1).contiguous(),
+        both[:, CLIP_TXT_DIM:].unsqueeze(1).contiguous(),
+    )
 
 
 def get_embeddings(
     samples: pd.DataFrame,
+    *,
+    scattered_dir: Path | None = None,
+    dir_name: str | None = None,
 ) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return CPU embedding tables (img, src, tar), packed for training."""
-    packed_path = _get_packed_path()
+    """Return CPU tables (img, src, tar), packed for training.
+
+    img keeps the saved token shape (n, C, S, S) VAE latents; the
+    cross-attention regressor consumes the token structure directly. src/tar
+    are (n, 1, D) masked-mean-pooled prompt vectors, one text token each, the
+    pipeline's own source.pt / target.pt, so no pooling happens in the model.
+
+    Optional scattered_dir / dir_name point at a non-default dataset root.
+    """
+    packed_path = _get_packed_path(dir_name=dir_name)
     sample_ids = samples[SAMPLE_ID_COL].tolist()
 
-    cached = _load_packed_cache(packed_path, sample_ids)
+    cached = _load_packed_cache(packed_path, sample_ids, dir_name=dir_name)
     if cached is None:
-        cached = _pack_scattered_cache(samples, packed_path)
+        cached = _pack_scattered_cache(
+            samples, packed_path, scattered_dir=scattered_dir, dir_name=dir_name,
+        )
         if cached is None:
             raise RuntimeError(f"Embeddings unavailable: {packed_path} cannot cover {len(sample_ids)} requested.")
         print("Loaded scattered embeddings from cache.")

@@ -23,9 +23,9 @@ ID_TO_SPLIT_NAME = "id_to_split.csv"
 class EmbeddingTable:
     """One embedding row per unique sample_id."""
 
-    img: torch.Tensor   # (n_samples, img_dim)
-    src: torch.Tensor   # (n_samples, text_dim)
-    tar: torch.Tensor   # (n_samples, text_dim)
+    img: torch.Tensor   # (n_samples, C, S, S)
+    src: torch.Tensor   # (n_samples, 1, text_dim)
+    tar: torch.Tensor   # (n_samples, 1, text_dim)
 
 
 @dataclass(frozen=True)
@@ -34,7 +34,8 @@ class CellTensors:
 
     sample_idx: torch.Tensor     # (N,)
     t: torch.Tensor              # (N, 2)
-    y: torch.Tensor              # (N, C)
+    y: torch.Tensor              # (N, C) PREDICTION_SPACE targets
+    y_raw: torch.Tensor          # (N, C) measured PSNR/CLIP
     emb_table: EmbeddingTable
     grid_rows: torch.Tensor      # (S, n_cells)
     grid_baseline: torch.Tensor  # (S,)
@@ -138,10 +139,11 @@ def create_cell_tensors(
     for name, (X_df, y_df) in splits_df.items():
         sample_idx = torch.tensor([sid_to_idx[sid] for sid in X_df[SAMPLE_ID_COL].tolist()], dtype=torch.long, device=device)
         t = torch.tensor(X_df[[T_START_COL, T_END_COL]].values, dtype=torch.float, device=device)
-        y = torch.tensor(y_df[list(M_TARGET_COLS)].values, dtype=torch.float, device=device)
+        y = torch.tensor(y_df[list(TARGET_COLS)].values, dtype=torch.float, device=device)
+        y_raw = torch.tensor(X_df[[f"{c}__raw" for c in TARGET_COLS]].values, dtype=torch.float, device=device)
         grid_rows, grid_baseline = _build_grid_index(sample_idx, t, (DEFAULT_T_START, DEFAULT_T_END))
         out[name] = CellTensors(
-            sample_idx=sample_idx, t=t, y=y, emb_table=emb_table,
+            sample_idx=sample_idx, t=t, y=y, y_raw=y_raw, emb_table=emb_table,
             grid_rows=grid_rows, grid_baseline=grid_baseline,
         )
     return out
@@ -156,16 +158,16 @@ def _prep_sample_id(value) -> str:
 
 def load_df(metrics_csv: Path | None = None, inputs_csv: Path | None = None) -> pd.DataFrame:
     """Load metrics, attach source-image paths and prompts, one row per cell."""
-    metrics_cols = [SAMPLE_ID_COL, T_START_COL, T_END_COL, T_DELTA_COL, *M_TARGET_COLS]
+    metrics_cols = [SAMPLE_ID_COL, T_START_COL, T_END_COL, T_DELTA_COL, *TARGET_COLS]
     inputs_cols = [SAMPLE_ID_COL, SOURCE_PROMPT_COL, TARGET_PROMPT_COL, IMAGE_PATH_COL, MASK_PATH_COL]
 
     # Clean metrics CSV: drop rows that do not have target component metrics or t_delta.
     metrics_csv = metrics_csv or METRICS_CSV
     metrics_df = pd.read_csv(metrics_csv)
     n_before = len(metrics_df)
-    metrics_df = metrics_df.dropna(subset=list(M_TARGET_COLS)).reset_index(drop=True)
+    metrics_df = metrics_df.dropna(subset=list(TARGET_COLS)).reset_index(drop=True)
     if len(metrics_df) < n_before:
-        print(f"Dropped {n_before - len(metrics_df)} metric rows missing {list(M_TARGET_COLS)}.")
+        print(f"Dropped {n_before - len(metrics_df)} metric rows missing {list(TARGET_COLS)}.")
     metrics_df[SAMPLE_ID_COL] = metrics_df[SAMPLE_ID_COL].map(_prep_sample_id)
     if TARGET_T_DELTA is not None:
         if TARGET_T_DELTA not in metrics_df[T_DELTA_COL].values:
@@ -174,7 +176,7 @@ def load_df(metrics_csv: Path | None = None, inputs_csv: Path | None = None) -> 
 
     # Keep only samples with a complete grid. A sample missing cells cannot take
     # part in the ranking loss or in T selection: its per-sample deltas are
-    # undefined without every candidate, and train_t requires one shared set of
+    # undefined without every candidate, and the selector requires one shared set of
     # labeled (t_start, t_end) pairs across the split.
     cells_per_sample = metrics_df.groupby(SAMPLE_ID_COL)[SAMPLE_ID_COL].transform("size")
     n_cells = int(cells_per_sample.mode().iat[0])
@@ -226,8 +228,11 @@ def prepare_df(data_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Split a loaded table into features X and per-sample normalized delta targets y."""
     from scores import compute_delta_df
 
-    X_df = data_df.drop(columns=list(M_TARGET_COLS)).copy()
-    y_df = compute_delta_df(data_df, *M_TARGET_COLS)
+    X_df = data_df.drop(columns=list(TARGET_COLS)).copy()
+    # Measured PSNR/CLIP for raw-scale comparison metrics; ride along on X through split.
+    for col in TARGET_COLS:
+        X_df[f"{col}__raw"] = data_df[col].to_numpy()
+    y_df = compute_delta_df(data_df, *TARGET_COLS)
     return X_df, y_df
 
 
@@ -262,7 +267,7 @@ def split_df(
 
     Xy_df = pd.concat([X_df.reset_index(drop=True), y_df.reset_index(drop=True)], axis=1)
     train, val, test = split_df_by_sample(Xy_df)
-    target_cols = list(M_TARGET_COLS)
+    target_cols = list(TARGET_COLS)
     return (
         train.drop(columns=target_cols),
         val.drop(columns=target_cols),
@@ -295,7 +300,7 @@ def load_split_df(run_dir: Path) -> dict[str, pd.DataFrame]:
     run_dir = Path(run_dir)
     splits_path = run_dir / ID_TO_SPLIT_NAME
     if not splits_path.exists():
-        raise FileNotFoundError(f"Missing splits at {splits_path}. Run train_m.py first.")
+        raise FileNotFoundError(f"Missing splits at {splits_path}. Run train.py first.")
     splits_df = pd.read_csv(splits_path, dtype={SAMPLE_ID_COL: str, "split": str})
     df = load_df()
     out: dict[str, pd.DataFrame] = {}

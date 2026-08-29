@@ -48,7 +48,7 @@ def _cfg(name, default=_REQUIRED):
     """One value from settings.json, with a readable error when it is absent.
 
     Keys added after a run was trained pass a default so that the run's
-    settings snapshot still loads when train_t.py replays it.
+    settings snapshot still loads when selector.py replays it.
     """
     if name not in CONFIG:
         if default is _REQUIRED:
@@ -78,9 +78,9 @@ GENERATED_DIR = Path(f"/shared/ssd_30T/mirick/generated/{CHORD_EDIT_MODEL}/0p0/{
 DATASET_DIR = Path(f"/shared/ssd_30T/mirick/datasets/ultra_edit/{DIR_NAME}")
 SCATTERED_DIR = Path(f"/shared/ssd_30T/mirick/embeddings/{CHORD_EDIT_MODEL}/{DIR_NAME}")
 
-# Map the package root from next to train_m.py or the copy saved under runs/.
+# Map the package root from next to model.py or the copy saved under runs/.
 _here = Path(__file__).resolve().parent
-_package_dir = _here if (_here / "model_m.py").exists() else _here.parents[2]
+_package_dir = _here if (_here / "model.py").exists() else _here.parents[2]
 
 # NOTE: Set this to the directory where the model runs will be saved.
 RUNS_DIR = _package_dir / "runs" / DIR_NAME
@@ -133,28 +133,37 @@ M model settings.
 """
 
 # Regression targets in the loaded dataframe.
-M_TARGET_COLS = (PSNR_COL, CLIP_COL)
-M_TARGET_LABELS = {PSNR_COL: "PSNR-Unedited", CLIP_COL: "CLIP-Edited"}
+TARGET_COLS = (PSNR_COL, CLIP_COL)
+TARGET_LABELS = {PSNR_COL: "PSNR-Unedited", CLIP_COL: "CLIP-Edited"}
 
-# Select from "residual" or "delta". Targets are always per-sample normalized
-# deltas Delta (scores.calc_normalized_deltas); "residual" additionally
+# Select from "residuals" or "deltas". Targets are always per-sample normalized
+# deltas Delta (scores.calc_normalized_deltas); "residuals" additionally
 # subtracts the train split's mean true delta surface (saved to the run as
 # mean_surface.pt), so the towers regress how an image deviates from the
-# population surface and T adds the surface back at selection time. "delta"
+# population surface and T adds the surface back at selection time. "deltas"
 # regresses the full deltas with no offset.
-M_TARGET_SPACE = str(_cfg("M_TARGET_SPACE"))
-if M_TARGET_SPACE not in ("residual", "delta"):
-    raise ValueError(f"Unknown {M_TARGET_SPACE=}; expected 'residual' or 'delta'")
+PREDICTION_SPACE = str(_cfg("PREDICTION_SPACE"))
+if PREDICTION_SPACE not in ("deltas", "residuals"):
+    raise ValueError(f"Unknown {PREDICTION_SPACE=}")
 
 _MAX_SAMPLES = _cfg("MAX_SAMPLES")
 MAX_SAMPLES = None if _MAX_SAMPLES is None else int(_MAX_SAMPLES)
 
 USE_CENTER_CROP = bool(_cfg("USE_CENTER_CROP"))
 
-# Select from "linear" or "conv". "Linear" projects the flattened VAE
-# latents with a single Linear layer. "conv" projects with a
-# convolutional layer.
-IMG_ENCODER = str(_cfg("IMG_ENCODER"))
+# Side of the square latent patches forming the visual tokens. The VAE latent
+# is (4, S, S) with S = CHORD_EDIT_IMAGE_SIZE // 8, so PATCH_SIZE p gives
+# (S // p) ** 2 tokens of dim 4 * p ** 2, the same F_v attention_predictor
+# builds. Those tokens are mean-pooled to one vector for these flat towers, and
+# the projection is linear, so pooling commutes with it: p sets how much
+# within-patch spatial detail survives the average. p = S keeps all of it.
+LATENT_SIDE = CHORD_EDIT_IMAGE_SIZE // 8
+PATCH_SIZE = int(_cfg("PATCH_SIZE"))
+if PATCH_SIZE < 1 or LATENT_SIDE % PATCH_SIZE != 0:
+    raise ValueError(f"Expected {PATCH_SIZE=} to divide {LATENT_SIDE=}")
+
+# Learned positional embedding on the visual tokens.
+USE_POS_EMB = bool(_cfg("USE_POS_EMB"))
 
 # Which image representation the regressor sees. "vae" is the flattened SD VAE
 # latent the model has always used. "clip" replaces it with a mean-pooled
@@ -202,6 +211,8 @@ EARLY_STOP_PATIENCE = int(_cfg("EARLY_STOP_PATIENCE"))
 # Metric used to pick the best-epoch checkpoint. Select from
 # "val_phi_spearman", "val_regret", "val_gain_mean", or "val_loss".
 CKPT_METRIC = str(_cfg("CKPT_METRIC"))
+if CKPT_METRIC not in ("val_phi_spearman", "val_regret", "val_gain_mean", "val_loss"):
+    raise ValueError(f"Unknown {CKPT_METRIC=}")
 # Number of sample grids concatenated per training batch.
 GRIDS_PER_BATCH = int(_cfg("GRIDS_PER_BATCH"))
 # Exponential moving average of the weights.
@@ -216,21 +227,21 @@ T model settings.
 """
 
 # Scalar objective phi for timestep selection and M^ ranking loss.
-T_TARGET_FNS = {
+SCORE_FNS = {
     "naive": (naive_score, "Naive Score"),
     "cara": (cara_score, "CARA Score"),
     "linex": (linex_score, "LINEX Score"),
 }
-T_TARGET_FN = str(_cfg("T_TARGET_FN"))
-if T_TARGET_FN not in T_TARGET_FNS:
-    raise ValueError(f"Unknown {T_TARGET_FN=}")
-_T_SCORE_FN, T_TARGET_LABEL = T_TARGET_FNS[T_TARGET_FN]
+SCORE_FN = str(_cfg("SCORE_FN"))
+if SCORE_FN not in SCORE_FNS:
+    raise ValueError(f"Unknown {SCORE_FN=}")
+_SCORE_FN, SCORE_LABEL = SCORE_FNS[SCORE_FN]
 
 PHI_ALPHA = float(_cfg("PHI_ALPHA"))
-_T_SCORE_KW = {"alpha": PHI_ALPHA} if "alpha" in _signature(_T_SCORE_FN).parameters else {}
-T_TARGET_PHI = partial(_T_SCORE_FN, **_T_SCORE_KW)  # Torch phi(Delta)
-T_TARGET_PHI_DF = partial(score_df, score_fn=_T_SCORE_FN, **_T_SCORE_KW)  # DataFrame
-T_TARGET_COL = f"{T_TARGET_FN}_score"
+_SCORE_KW = {"alpha": PHI_ALPHA} if "alpha" in _signature(_SCORE_FN).parameters else {}
+SCORE_PHI = partial(_SCORE_FN, **_SCORE_KW)  # Torch phi(Delta)
+SCORE_PHI_DF = partial(score_df, score_fn=_SCORE_FN, **_SCORE_KW)  # DataFrame
+SCORE_COL = f"{SCORE_FN}_score"
 
 # Baseline timestep bounds from the ChordEdit paper.
 # NOTE: Must be set to match (0.9-t_delta, 0.3)
