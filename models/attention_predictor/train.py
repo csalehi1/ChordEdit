@@ -29,6 +29,7 @@ import torch
 from _data import *
 from _helpers import *
 from _wandb import finish_run, init_run, log_epoch, log_summary
+from metrics import *
 from model import AttentionModel, deltas_from_preds
 from settings import *
 
@@ -75,9 +76,7 @@ def eval_regression(
     How well the predictor reproduces the two metric surfaces.
 
     loss         calc_loss over the split, grid-count weighted
-    mae_<col>    mean absolute error, one key per target column
-    rmse_<col>   root mean squared error
-    r2_<col>     coefficient of determination against the split's own mean
+    per-col      see metrics.per_component_metrics
     """
 
     # Evaluate in chunks of 256 grids.
@@ -86,7 +85,7 @@ def eval_regression(
     model.regressor.eval()
     mean, std = model.regressor.target_mean, model.regressor.target_std
 
-    preds, trues = [], []
+    preds, trues, bases = [], [], []
     loss_sum, n_grids = 0.0, 0
     for (img, src, tar, y), baseline in cells.iter_grids(EVAL_CHUNK, shuffle=False):
         out = model.regressor(img, src, tar)
@@ -94,24 +93,19 @@ def eval_regression(
         # Weight each chunk by its grid count, since the last chunk is short.
         loss_sum += calc_loss(out, y_std, baseline, mean_surface).item() * y.shape[0]
         n_grids += y.shape[0]
-        preds.append(model.regressor.destandardize(out).reshape(-1, y.shape[-1]))
-        trues.append(y.reshape(-1, y.shape[-1]))
+        preds.append(model.regressor.destandardize(out))
+        trues.append(y)
+        bases.append(baseline)
     pred = torch.cat(preds)
     true = torch.cat(trues)
-    err = pred - true
+    baseline = torch.cat(bases)
+    # No phi here: pick the cell with the best predicted primary column.
+    chosen = pred[..., 0].argmax(dim=-1)
 
-    # Calculate the metrics for each target column.
-    metrics: dict[str, float] = {}
-    metrics["loss"] = loss_sum / max(n_grids, 1)
-    for i, col in enumerate(TARGET_COLS):
-        e = err[:, i]
-        ss_res = (e ** 2).sum()
-        ss_tot = ((true[:, i] - true[:, i].mean()) ** 2).sum().clamp(min=1e-12)
-        metrics[f"mae_{col}"] = e.abs().mean().item()
-        metrics[f"rmse_{col}"] = (e ** 2).mean().sqrt().item()
-        metrics[f"r2_{col}"] = (1 - ss_res / ss_tot).item()
-
-    return metrics
+    return {
+        "loss": loss_sum / max(n_grids, 1),
+        **per_component_metrics(true, pred, TARGET_COLS, chosen, baseline),
+    }
 
 
 @torch.no_grad()
@@ -124,37 +118,10 @@ def eval_selection(
     """
     How well the predicted surfaces serve selection, not regression.
 
-    phi_spearman         median per-grid rank correlation of predicted vs
-                            true phi; how well the whole surface is ordered
-    regret_median/_p90   true phi lost by picking argmax(predicted phi)
-                            instead of the true best cell; lower is better
-    gain_mean            mean true phi at the picked cell. True phi at the
-                            default cell is 0, so this is gain over the default
-    improvement_rate     fraction of grids whose pick beats the default
-    deviate_rate         fraction of grids that pick a non-default cell
-
-    rho_<col>            median rank correlation of that metric's surface
-    rho_<col>_image      the same after removing the per-cell population
-                            mean, i.e. only the image-specific variation
-    delta_at_pick_<col>  mean true delta of that metric at the picked cell
+    Predicts whole grids, maps both sides into delta space, and hands the phi
+    surfaces to metrics.training_metrics and metrics.selection_metrics; each
+    metric column is then scored by metrics.per_component_metrics.
     """
-
-    def _row_ranks(x: torch.Tensor) -> torch.Tensor:
-        """Ordinal ranks along the last axis (ties broken by position)."""
-        order = x.argsort(dim=-1)
-        ranks = torch.empty_like(order)
-        positions = torch.arange(x.shape[-1], device=x.device).expand_as(order)
-        ranks.scatter_(-1, order, positions)
-        return ranks.to(x.dtype)
-
-    def _row_spearman(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """Per-row Spearman rho between two (S, N) score matrices."""
-        ra, rb = _row_ranks(a), _row_ranks(b)
-        ra = ra - ra.mean(dim=-1, keepdim=True)
-        rb = rb - rb.mean(dim=-1, keepdim=True)
-        num = (ra * rb).sum(dim=-1)
-        den = ra.norm(dim=-1) * rb.norm(dim=-1)
-        return num / den.clamp_min(1e-12)
 
     model.regressor.eval()
     device = cells.t.device
@@ -175,33 +142,12 @@ def eval_selection(
     baseline = torch.cat(base_parts)
     true_phi = calc_phi(true_deltas)
     pred_phi = calc_phi(pred_deltas)
+    chosen = pred_phi.argmax(dim=-1)
 
-    rho = _row_spearman(true_phi, pred_phi)
-    rho = rho[~rho.isnan()]
-    chosen = pred_phi.argmax(dim=-1, keepdim=True)
-    gain = true_phi.gather(-1, chosen).squeeze(-1)  # true phi(default) == 0
-    reg = true_phi.max(dim=-1).values - gain
-
-    # Per-metric rank agreement, and the true delta the picks land on: a selector
-    # that trades CLIP away for PSNR shows up in these and not in phi.
-    per_metric: dict[str, float] = {}
-    for i, col in enumerate(("psnr", "clip")):
-        t_i, p_i = true_deltas[..., i], pred_deltas[..., i]
-        med = lambda x: float(x[~x.isnan()].quantile(0.5).item()) if x[~x.isnan()].numel() else float("nan")
-        per_metric[f"rho_{col}"] = med(_row_spearman(t_i, p_i))
-        per_metric[f"rho_{col}_image"] = med(_row_spearman(t_i - t_i.mean(dim=0, keepdim=True), p_i - p_i.mean(dim=0, keepdim=True)))
-        per_metric[f"delta_at_pick_{col}"] = float(t_i.gather(-1, chosen).squeeze(-1).mean().item())
-
-    # Use quantile(0.5) and not median() because torch's median takes the lower
-    # of the two middle values, while numpy (and so selector.py) averages them.
     return {
-        "phi_spearman": float(rho.quantile(0.5).item()) if rho.numel() else float("nan"),
-        "regret_median": float(reg.quantile(0.5).item()),
-        "regret_p90": float(reg.quantile(0.9).item()),
-        "gain_mean": float(gain.mean().item()),
-        "improvement_rate": float((gain > 0).double().mean().item()),
-        "deviate_rate": float((chosen.squeeze(-1) != baseline).double().mean().item()),
-        **per_metric,
+        **training_metrics(true_phi, pred_phi, baseline),
+        **selection_metrics(true_phi, pred_phi, baseline),
+        **per_component_metrics(true_deltas, pred_deltas, ("psnr", "clip"), chosen, baseline),
     }
 
 

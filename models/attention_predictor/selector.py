@@ -24,6 +24,7 @@ import pandas as pd
 import torch
 
 from _helpers import *
+from metrics import *
 
 
 # Parse command line arguments.
@@ -42,8 +43,34 @@ load_run_settings(RUN_DIR)
 
 from _data import ID_TO_SPLIT_NAME, df_to_metric_grids, load_split_df
 from embeddings import get_embeddings_by_sample
-from model import TimestepSelector, gate_metrics, load_timestep_selector, per_image_spearman, regret
+from model import TimestepSelector, load_timestep_selector
 from settings import *
+
+
+def labeled_surfaces(
+    true_phi: np.ndarray,   # (S, n_start, n_end), NaN outside the labeled set
+    pred_phi: np.ndarray,
+    default_i: int,
+    default_j: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Flatten the phi grids to the cells labeled for every test image.
+
+    Keeping one candidate set for all images is what makes their ranks
+    comparable. Returns (true, pred, default_col) ready for metrics.py.
+    """
+    n = true_phi.shape[0]
+    flat_true = true_phi.reshape(n, -1)
+    flat_pred = pred_phi.reshape(n, -1)
+    keep = np.isfinite(flat_true).all(axis=0) & np.isfinite(flat_pred).all(axis=0)
+    default_flat = default_i * true_phi.shape[2] + default_j
+    if not keep[default_flat]:
+        raise ValueError("The default cell is not labeled for every test image")
+
+    return (
+        torch.as_tensor(flat_true[:, keep], dtype=torch.float64),
+        torch.as_tensor(flat_pred[:, keep], dtype=torch.float64),
+        int(np.cumsum(keep)[default_flat] - 1),
+    )
 
 
 def eval(run_dir: Path) -> dict:
@@ -103,20 +130,21 @@ def eval(run_dir: Path) -> dict:
     test_selections = [s for s in all_selections if s["sample_id"] in test_pos]
 
     # Compute metrics on the test selections only.
-    reg = regret(true_phi, pred_phi)
-    rho_phi = per_image_spearman(true_phi, pred_phi)
-    gate = gate_metrics(true_phi, pred_phi, default_i, default_j, NOISE_FLOOR_PHI)
+    t_phi, p_phi, default_col = labeled_surfaces(true_phi, pred_phi, default_i, default_j)
+    training = training_metrics(t_phi, p_phi, default_col)
+    selection = selection_metrics(t_phi, p_phi, default_col)
     metrics = {
         "run_dir": str(run_dir),
         "n_test_images": len(test_sample_ids),
         "grid": f"{len(t_start_values)}x{len(t_end_values)}",
         "n_labeled_pairs": int(n_labeled_pairs),
+        "n_scored_cells": int(t_phi.shape[-1]),
         "prediction_space": str(PREDICTION_SPACE),
         "score_fn": str(SCORE_FN),
-        "regret_median": float(np.median(reg)),
-        "regret_p90": float(np.percentile(reg, 90)),
-        "spearman_phi_median": float(np.nanmedian(rho_phi)),
-        "gate": gate,
+        # Kept under its historical name for consumers of this file.
+        "spearman_phi_median": training["phi_spearman"],
+        **training,
+        **selection,
         "dataset_dir": str(DATASET_DIR),
         "default_t_start": DEFAULT_T_START,
         "default_t_end": DEFAULT_T_END,
@@ -138,8 +166,11 @@ def eval(run_dir: Path) -> dict:
 
     print(f"Selector eval on {len(test_sample_ids)} test images ({len(all_sample_ids)} selections)  run={run_dir.name}")
     print(f"  regret median={metrics['regret_median']:.4f}  p90={metrics['regret_p90']:.4f}")
+    print(
+        f"  rho_phi={metrics['spearman_phi_median']:.4f}  gain={metrics['gain_mean']:.4f}  "
+        + "  ".join(f"top{k}={metrics[f'top{k}_accuracy']:.4f}" for k in TOP_K_VALUES)
+    )
     print(f"  spearman phi median={metrics['spearman_phi_median']:.3f}")
-    print(f"  gate precision={gate['precision']:.3f}  recall={gate['recall']:.3f}  ({gate['n_flagged']} flagged)")
     print(f"Saved {out_metrics}")
     print(f"Saved {out_selections}")
     print(f"Saved {out_predictions}")

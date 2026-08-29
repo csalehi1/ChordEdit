@@ -24,7 +24,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from scipy.stats import spearmanr
 
 from _helpers import (
     MEAN_SURFACE_NAME,
@@ -185,8 +184,6 @@ class TextFeaturizer(nn.Module):
             raise ValueError(f"Expected {src_emb.shape} == {tar_emb.shape}")
         if src_emb.dim() != 3:
             raise ValueError(f"Expected {tuple(src_emb.shape)} == (N, 1, D_txt)")
-        # Prompts arrive pooled to one token each (pipeline masked mean), so the
-        # pair concatenates along the token dim and P_t maps each token to d.
         pair = torch.cat([src_emb, tar_emb], dim=-2)
         return self.projector(pair)
 
@@ -355,51 +352,6 @@ class AttentionModel(nn.Module):
 """
 Selector.
 """
-
-def per_image_spearman(true_grid: np.ndarray, pred_grid: np.ndarray) -> np.ndarray:
-    """Rank correlation within each image's timestep grid (over labeled cells)."""
-    rhos = []
-    for k in range(true_grid.shape[0]):
-        t, p = true_grid[k].ravel(), pred_grid[k].ravel()
-        labeled = np.isfinite(t) & np.isfinite(p)
-        if labeled.sum() < 2:
-            rhos.append(np.nan)
-            continue
-        rho, _ = spearmanr(t[labeled], p[labeled])
-        rhos.append(np.nan if rho is None else float(rho))
-    return np.array(rhos)
-
-
-def regret(true_phi: np.ndarray, pred_phi: np.ndarray) -> np.ndarray:
-    """True phi at argmax(pred_phi) minus true phi at argmax(true_phi); lower is better."""
-    out = np.zeros(true_phi.shape[0])
-    for k in range(true_phi.shape[0]):
-        chosen = np.unravel_index(np.nanargmax(pred_phi[k]), pred_phi[k].shape)
-        out[k] = np.nanmax(true_phi[k]) - true_phi[k][chosen]
-    return out
-
-
-def gate_metrics(
-    true_phi: np.ndarray,
-    pred_phi: np.ndarray,
-    default_i: int,
-    default_j: int,
-    noise_floor: float,
-) -> dict:
-    """Deviate-or-default gate: precision/recall for flagged improvable images."""
-    default_phi = true_phi[:, default_i, default_j]
-    truly_improvable = (np.nanmax(true_phi, axis=(1, 2)) - default_phi) > noise_floor
-    pred_gain = np.nanmax(pred_phi, axis=(1, 2)) - pred_phi[:, default_i, default_j]
-    flagged = pred_gain > noise_floor
-    tp = int(np.sum(flagged & truly_improvable))
-    return {
-        "precision": tp / max(int(flagged.sum()), 1),
-        "recall": tp / max(int(truly_improvable.sum()), 1),
-        "n_flagged": int(flagged.sum()),
-        "n_improvable": int(truly_improvable.sum()),
-        "noise_floor": noise_floor,
-    }
-
 
 @dataclass
 class TimestepGridResult:

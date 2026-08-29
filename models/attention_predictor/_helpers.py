@@ -214,24 +214,31 @@ def format_metric_table(
         max(len(col), *(len(_mae_r2(m, col)) for _, m, _ in rows))
         for col in target_cols
     ]
-    phi_vals = [_sel(sel, "phi_spearman", ".3f") for _, _, sel in rows]
-    reg_vals = [_sel(sel, "regret_median", ".3f") for _, _, sel in rows]
-    phi_w = max(len("phi rho"), *(len(v) for v in phi_vals))
-    reg_w = max(len("regret"), *(len(v) for v in reg_vals))
+    # Selection columns, appended after the per-target block. A key missing from
+    # the selection dict renders blank rather than raising.
+    sel_cols = (
+        ("phi rho", "phi_spearman"),
+        ("regret", "regret_median"),
+        ("gain", "gain_mean"),
+        ("top1", "top1_accuracy"),
+    )
+    sel_vals = [[_sel(sel, key, ".3f") for _, _, sel in rows] for _, key in sel_cols]
+    sel_ws = [max(len(head), *(len(v) for v in vals)) for (head, _), vals in zip(sel_cols, sel_vals)]
 
     header = (
         f"{'split':<{split_w}}  {'loss':<{loss_w}}  "
         + "  ".join(f"{col:<{w}}" for col, w in zip(target_cols, target_ws))
-        + f"  {'phi rho':<{phi_w}}  {'regret':<{reg_w}}"
+        + "  "
+        + "  ".join(f"{head:<{w}}" for (head, _), w in zip(sel_cols, sel_ws))
     )
     lines = [f"    {header}"]
-    for (name, metrics, sel), phi, reg in zip(rows, phi_vals, reg_vals):
+    for i, (name, metrics, _) in enumerate(rows):
         cells = "  ".join(
             f"{_mae_r2(metrics, col):<{w}}" for col, w in zip(target_cols, target_ws)
         )
+        sel_cells = "  ".join(f"{vals[i]:<{w}}" for vals, w in zip(sel_vals, sel_ws))
         lines.append(
-            f"    {name:<{split_w}}  {metrics['loss']:<{loss_w}.4f}  {cells}"
-            f"  {phi:<{phi_w}}  {reg:<{reg_w}}"
+            f"    {name:<{split_w}}  {metrics['loss']:<{loss_w}.4f}  {cells}  {sel_cells}"
         )
     return "\n".join(lines)
 
