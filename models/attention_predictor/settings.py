@@ -191,6 +191,14 @@ EPOCHS = int(_cfg("EPOCHS"))
 LR = float(_cfg("LR"))
 WEIGHT_DECAY = float(_cfg("WEIGHT_DECAY"))
 
+# Phi-space objective terms. A weight of 0 disables that term. top_k null = all cells.
+MSE_LOSS_WEIGHT = float(_cfg("MSE_LOSS_WEIGHT"))
+_MSE_LOSS_TOP_K = _cfg("MSE_LOSS_TOP_K")
+MSE_LOSS_TOP_K = None if _MSE_LOSS_TOP_K is None else int(_MSE_LOSS_TOP_K)
+RANKING_LOSS_WEIGHT = float(_cfg("RANKING_LOSS_WEIGHT"))
+_RANKING_LOSS_TOP_K = _cfg("RANKING_LOSS_TOP_K")
+RANKING_LOSS_TOP_K = None if _RANKING_LOSS_TOP_K is None else int(_RANKING_LOSS_TOP_K)
+
 # Select from "none" or "cosine".
 LR_SCHEDULER = str(_cfg("LR_SCHEDULER"))
 # Stop when the checkpoint metric has not improved for this many epochs.

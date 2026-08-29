@@ -53,12 +53,47 @@ def calc_loss(
     baseline_idx: torch.Tensor,                # (G,)
     mean_surface: torch.Tensor | None = None,  # (n_cells, 2)
 ) -> torch.Tensor:
-    """Calculate MSE between pred and true phi scores over the timestep grid."""
-    pred_deltas = deltas_from_preds(pred, baseline_idx, mean_surface)
-    true_deltas = deltas_from_preds(true, baseline_idx, mean_surface)
-    pred_phi = calc_phi(pred_deltas)
-    true_phi = calc_phi(true_deltas)
-    return torch.nn.functional.mse_loss(pred_phi, true_phi)
+    """Weighted phi MSE and/or pairwise ranking. A weight of 0 drops that term."""
+
+    def mse_loss(
+        pred_phi: torch.Tensor,
+        true_phi: torch.Tensor,
+        top_k: int | None = None,
+    ) -> torch.Tensor:
+        """MSE over all cells, or only the true top-k when top_k is set."""
+        if top_k is not None and top_k < true_phi.shape[-1]:
+            idx = true_phi.topk(top_k, dim=-1).indices
+            pred_phi = pred_phi.gather(-1, idx)
+            true_phi = true_phi.gather(-1, idx)
+        return torch.nn.functional.mse_loss(pred_phi, true_phi)
+
+    def ranking_loss(
+        pred_phi: torch.Tensor,
+        true_phi: torch.Tensor,
+        top_k: int | None = None,
+    ) -> torch.Tensor:
+        """Mean softplus of inverted pairwise margins over pairs with true_u > true_v."""
+        if pred_phi.shape[-1] < 2:
+            return pred_phi.new_zeros(())
+        diff_true = true_phi.unsqueeze(-1) - true_phi.unsqueeze(-2)
+        diff_pred = pred_phi.unsqueeze(-1) - pred_phi.unsqueeze(-2)
+        mask = diff_true > 0
+        if top_k is not None and top_k < true_phi.shape[-1]:
+            idx = true_phi.topk(top_k, dim=-1).indices
+            is_top = torch.zeros_like(true_phi, dtype=torch.bool).scatter_(-1, idx, True)
+            mask = mask & is_top.unsqueeze(-1)
+        if not mask.any():
+            return pred_phi.new_zeros(())
+        return torch.nn.functional.softplus(-diff_pred[mask]).mean()
+
+    pred_phi = calc_phi(deltas_from_preds(pred, baseline_idx, mean_surface))
+    true_phi = calc_phi(deltas_from_preds(true, baseline_idx, mean_surface))
+    loss = pred_phi.new_zeros(())
+    if MSE_LOSS_WEIGHT > 0:
+        loss = loss + MSE_LOSS_WEIGHT * mse_loss(pred_phi, true_phi, top_k=MSE_LOSS_TOP_K)
+    if RANKING_LOSS_WEIGHT > 0:
+        loss = loss + RANKING_LOSS_WEIGHT * ranking_loss(pred_phi, true_phi, top_k=RANKING_LOSS_TOP_K)
+    return loss
 
 
 """
