@@ -178,11 +178,19 @@ def eval_selection(
     true_phi = calc_phi(true_deltas)
     pred_phi = calc_phi(pred_deltas)
     chosen = pred_phi.argmax(dim=-1)
+    true_raw = cells.y_raw[cells.grid_rows].double()
 
     return {
-        **training_metrics(true_phi, pred_phi, baseline),
+        **training_metrics(
+            true_phi, pred_phi, baseline,
+            mse_weight=MSE_LOSS_WEIGHT,
+            ranking_weight=RANKING_LOSS_WEIGHT,
+            mse_top_k=MSE_LOSS_TOP_K,
+            ranking_top_k=RANKING_LOSS_TOP_K,
+        ),
         **selection_metrics(true_phi, pred_phi, baseline),
         **per_component_metrics(true_deltas, pred_deltas, ("psnr", "clip"), chosen, baseline),
+        **comparison_metrics(true_phi, true_raw, ("psnr", "clip"), chosen, baseline),
     }
 
 

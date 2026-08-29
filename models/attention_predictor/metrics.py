@@ -35,20 +35,43 @@ model-free baselines are scored by exactly the same code.
 
 
 @torch.no_grad()
-def regression_loss_scores(true_phi: torch.Tensor, pred_phi: torch.Tensor) -> torch.Tensor:
-    """(N,) MSE of pred vs true phi over the cells of each sample."""
+def regression_loss_scores(
+    true_phi: torch.Tensor,
+    pred_phi: torch.Tensor,
+    top_k: int | None = None,
+) -> torch.Tensor:
+    """(N,) MSE of pred vs true phi over the cells of each sample.
+
+    When top_k is set, only the true top-k cells of each row contribute.
+    """
+    if top_k is not None and top_k < true_phi.shape[-1]:
+        idx = true_phi.topk(top_k, dim=-1).indices
+        true_phi = true_phi.gather(-1, idx)
+        pred_phi = pred_phi.gather(-1, idx)
     return ((pred_phi - true_phi) ** 2).mean(dim=-1)
 
 
 @torch.no_grad()
-def ranking_loss_scores(true_phi: torch.Tensor, pred_phi: torch.Tensor, chunk: int = 64) -> torch.Tensor:
-    """(N,) mean per-sample logistic pairwise loss over pairs with true_u > true_v."""
+def ranking_loss_scores(
+    true_phi: torch.Tensor,
+    pred_phi: torch.Tensor,
+    top_k: int | None = None,
+    chunk: int = 64,
+) -> torch.Tensor:
+    """(N,) mean per-sample logistic pairwise loss over pairs with true_u > true_v.
+
+    When top_k is set, only pairs whose higher cell is in the true top-k remain.
+    """
     out = true_phi.new_full((true_phi.shape[0],), float("nan"))
     for k in range(0, true_phi.shape[0], chunk):
         t, p = true_phi[k : k + chunk], pred_phi[k : k + chunk]
         diff_true = t.unsqueeze(-1) - t.unsqueeze(-2)
         diff_pred = p.unsqueeze(-1) - p.unsqueeze(-2)
         mask = diff_true > 0
+        if top_k is not None and top_k < t.shape[-1]:
+            idx = t.topk(top_k, dim=-1).indices
+            is_top = torch.zeros_like(t, dtype=torch.bool).scatter_(-1, idx, True)
+            mask = mask & is_top.unsqueeze(-1)
         n_pairs = mask.sum(dim=(-1, -2))
         sums = (F.softplus(-diff_pred) * mask).sum(dim=(-1, -2))
         out[k : k + chunk] = torch.where(n_pairs > 0, sums / n_pairs, out.new_full((), float("nan")))
@@ -127,22 +150,36 @@ def training_metrics(
     true_phi: torch.Tensor,                # (N, |T|)
     pred_phi: torch.Tensor,                # (N, |T|)
     baseline_idx: int | torch.Tensor,      # unused; kept for a uniform call site
+    *,
+    mse_weight: float = 1.0,
+    ranking_weight: float = 0.0,
+    mse_top_k: int | None = None,
+    ranking_top_k: int | None = None,
 ) -> dict[str, float]:
     """
     How well the predicted phi surface matches the true one.
 
-    regression_loss
-    ranking_loss
+    loss
+    loss_regression
+    loss_ranking
     phi_spearman
     """
     assert true_phi.shape == pred_phi.shape
-    mse = regression_loss_scores(true_phi, pred_phi)
-    rank = ranking_loss_scores(true_phi, pred_phi)
+    mse = regression_loss_scores(true_phi, pred_phi, top_k=mse_top_k)
+    rank = ranking_loss_scores(true_phi, pred_phi, top_k=ranking_top_k)
     rank_finite = rank[~rank.isnan()]
     rho = rank_correlation_scores(true_phi, pred_phi)
+    regression = float(mse.mean().item()) if mse.numel() else float("nan")
+    ranking = float(rank_finite.mean().item()) if rank_finite.numel() else float("nan")
+    loss = 0.0
+    if mse_weight > 0 and mse.numel():
+        loss += mse_weight * regression
+    if ranking_weight > 0 and rank_finite.numel():
+        loss += ranking_weight * ranking
     return {
-        "regression_loss": float(mse.mean().item()) if mse.numel() else float("nan"),
-        "ranking_loss": float(rank_finite.mean().item()) if rank_finite.numel() else float("nan"),
+        "loss": float(loss),
+        "loss_regression": regression,
+        "loss_ranking": ranking,
         "phi_spearman": float(rho.quantile(0.5).item()) if rho.numel() else float("nan"),
     }
 
@@ -239,4 +276,46 @@ def per_component_metrics(
         out[f"gain_{col}"] = float(delta.mean().item())
         out[f"regret_{col}"] = float((t_best - t_pick).mean().item())
     
+    return out
+
+
+def comparison_metrics(
+    true_phi: torch.Tensor,                    # (N, |T|)
+    true: torch.Tensor,                        # (N, |T|, C) raw PSNR/CLIP
+    cols: tuple[str, ...] | list[str],
+    chosen: torch.Tensor,                      # (N,) or (N, 1)
+    baseline_idx: int | torch.Tensor,          # default cell, shared or per sample
+) -> dict[str, float]:
+    """
+    Selected-vs-default levels and deltas for phi and each raw component column.
+
+    Component surfaces are measured PSNR/CLIP (dB / CLIP points), not
+    per-sample normalized deltas. Means are absolute levels at the pick and
+    selected-default deltas in those units.
+
+    phi / delta_phi
+    <col> / delta_<col>
+    """
+    assert true_phi.ndim == 2 and true.ndim == 3
+    assert true.shape[:2] == true_phi.shape and true.shape[-1] == len(cols)
+    n = true_phi.shape[0]
+    pick = chosen.reshape(-1)
+    assert pick.shape == (n,)
+    if not isinstance(baseline_idx, torch.Tensor):
+        baseline_idx = torch.full((n,), int(baseline_idx), device=true_phi.device, dtype=torch.long)
+    baseline_idx = baseline_idx.reshape(-1)
+    assert baseline_idx.shape == (n,)
+
+    phi_pick = true_phi.gather(-1, pick.reshape(-1, 1)).squeeze(-1)
+    phi_base = true_phi.gather(-1, baseline_idx.reshape(-1, 1)).squeeze(-1)
+    out: dict[str, float] = {
+        "phi": float(phi_pick.mean().item()),
+        "delta_phi": float((phi_pick - phi_base).mean().item()),
+    }
+    for i, col in enumerate(cols):
+        t = true[..., i]
+        t_pick = t.gather(-1, pick.reshape(-1, 1)).squeeze(-1)
+        t_base = t.gather(-1, baseline_idx.reshape(-1, 1)).squeeze(-1)
+        out[col] = float(t_pick.mean().item())
+        out[f"delta_{col}"] = float((t_pick - t_base).mean().item())
     return out

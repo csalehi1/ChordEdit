@@ -131,7 +131,13 @@ def eval(run_dir: Path) -> dict:
 
     # Compute metrics on the test selections only.
     t_phi, p_phi, default_col = labeled_surfaces(true_phi, pred_phi, default_i, default_j)
-    training = training_metrics(t_phi, p_phi, default_col)
+    training = training_metrics(
+        t_phi, p_phi, default_col,
+        mse_weight=MSE_LOSS_WEIGHT,
+        ranking_weight=RANKING_LOSS_WEIGHT,
+        mse_top_k=MSE_LOSS_TOP_K,
+        ranking_top_k=RANKING_LOSS_TOP_K,
+    )
     selection = selection_metrics(t_phi, p_phi, default_col)
     metrics = {
         "run_dir": str(run_dir),

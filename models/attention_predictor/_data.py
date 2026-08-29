@@ -34,7 +34,8 @@ class CellTensors:
 
     sample_idx: torch.Tensor     # (N,)
     t: torch.Tensor              # (N, 2)
-    y: torch.Tensor              # (N, C)
+    y: torch.Tensor              # (N, C) PREDICTION_SPACE targets
+    y_raw: torch.Tensor          # (N, C) measured PSNR/CLIP
     emb_table: EmbeddingTable
     grid_rows: torch.Tensor      # (S, n_cells)
     grid_baseline: torch.Tensor  # (S,)
@@ -139,9 +140,10 @@ def create_cell_tensors(
         sample_idx = torch.tensor([sid_to_idx[sid] for sid in X_df[SAMPLE_ID_COL].tolist()], dtype=torch.long, device=device)
         t = torch.tensor(X_df[[T_START_COL, T_END_COL]].values, dtype=torch.float, device=device)
         y = torch.tensor(y_df[list(TARGET_COLS)].values, dtype=torch.float, device=device)
+        y_raw = torch.tensor(X_df[[f"{c}__raw" for c in TARGET_COLS]].values, dtype=torch.float, device=device)
         grid_rows, grid_baseline = _build_grid_index(sample_idx, t, (DEFAULT_T_START, DEFAULT_T_END))
         out[name] = CellTensors(
-            sample_idx=sample_idx, t=t, y=y, emb_table=emb_table,
+            sample_idx=sample_idx, t=t, y=y, y_raw=y_raw, emb_table=emb_table,
             grid_rows=grid_rows, grid_baseline=grid_baseline,
         )
     return out
@@ -259,6 +261,9 @@ def prepare_df(data_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     from scores import compute_delta_df
 
     X_df = data_df.drop(columns=list(TARGET_COLS)).copy()
+    # Measured PSNR/CLIP for raw-scale comparison metrics; ride along on X through split.
+    for col in TARGET_COLS:
+        X_df[f"{col}__raw"] = data_df[col].to_numpy()
     if PREDICTION_SPACE == "raws":
         y_df = data_df.loc[:, list(TARGET_COLS)].copy()
     else:

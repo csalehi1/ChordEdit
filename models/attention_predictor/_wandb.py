@@ -31,6 +31,7 @@ WANDB_GROUP = f"{CHORD_EDIT_MODEL}_{DIR_NAME}"    # optional label grouping rela
 WANDB_TRACK_TRAINING = True
 WANDB_TRACK_SELECTION = True
 WANDB_TRACK_PER_COMPONENT = False
+WANDB_TRACK_COMPARISONS = True
 
 
 # Pinned to the package dir so the key is found whatever the working directory.
@@ -39,14 +40,18 @@ load_dotenv(Path(_DIR) / ".env")
 # Short names for the long metric columns, so that panel titles stay readable.
 _ALIASES = {PSNR_COL: "psnr", CLIP_COL: "clip"}
 
-# Key sets matching metrics.training_metrics / selection_metrics / per_component_metrics.
+# Key sets matching metrics.training_metrics / selection_metrics / per_component_metrics /
+# comparison_metrics.
 _TRAINING_KEYS = frozenset({
-    "loss", "regression_loss", "ranking_loss", "phi_spearman",
+    "loss", "loss_regression", "loss_ranking", "phi_spearman",
 })
 _SELECTION_KEYS = frozenset({
     "regret_median", "regret_p90", "gain_mean",
     "improvement_rate", "deviate_rate",
     "top1_accuracy", "top5_accuracy", "top10_accuracy",
+})
+_COMPARISON_KEYS = frozenset({
+    "phi", "delta_phi", "psnr", "delta_psnr", "clip", "delta_clip",
 })
 
 
@@ -75,6 +80,8 @@ def _tracked(metrics: dict[str, float]) -> dict[str, float]:
         keep |= _SELECTION_KEYS
     if WANDB_TRACK_PER_COMPONENT:
         keep |= _PER_COMPONENT_KEYS
+    if WANDB_TRACK_COMPARISONS:
+        keep |= _COMPARISON_KEYS
     return {k: v for k, v in metrics.items() if k in keep}
 
 
@@ -107,6 +114,7 @@ def init_run(run_dir: Path, config_extra: dict):
         "WANDB_TRACK_TRAINING": WANDB_TRACK_TRAINING,
         "WANDB_TRACK_SELECTION": WANDB_TRACK_SELECTION,
         "WANDB_TRACK_PER_COMPONENT": WANDB_TRACK_PER_COMPONENT,
+        "WANDB_TRACK_COMPARISONS": WANDB_TRACK_COMPARISONS,
     }
     tags = [str(t) for t in (CHORD_EDIT_MODEL, DIR_NAME, run_dir.name)]
     if PIE_BENCH:

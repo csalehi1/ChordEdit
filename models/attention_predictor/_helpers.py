@@ -209,7 +209,13 @@ def format_metric_table(
 
     target_cols = list(_s().TARGET_COLS)
     split_w = max(5, *(len(name) for name, _, _ in rows))
-    loss_w = max(4, *(len(f"{m['loss']:.4f}") for _, m, _ in rows))
+    # Prefer selection's train-objective loss when present (includes ranking).
+    def _loss(m: dict[str, float], sel: dict[str, float] | None) -> float:
+        if sel and "loss" in sel:
+            return float(sel["loss"])
+        return float(m["loss"])
+
+    loss_w = max(4, *(len(f"{_loss(m, sel):.4f}") for _, m, sel in rows))
     target_ws = [
         max(len(col), *(len(_mae_r2(m, col)) for _, m, _ in rows))
         for col in target_cols
@@ -232,13 +238,13 @@ def format_metric_table(
         + "  ".join(f"{head:<{w}}" for (head, _), w in zip(sel_cols, sel_ws))
     )
     lines = [f"    {header}"]
-    for i, (name, metrics, _) in enumerate(rows):
+    for i, (name, metrics, sel) in enumerate(rows):
         cells = "  ".join(
             f"{_mae_r2(metrics, col):<{w}}" for col, w in zip(target_cols, target_ws)
         )
         sel_cells = "  ".join(f"{vals[i]:<{w}}" for vals, w in zip(sel_vals, sel_ws))
         lines.append(
-            f"    {name:<{split_w}}  {metrics['loss']:<{loss_w}.4f}  {cells}  {sel_cells}"
+            f"    {name:<{split_w}}  {_loss(metrics, sel):<{loss_w}.4f}  {cells}  {sel_cells}"
         )
     return "\n".join(lines)
 
