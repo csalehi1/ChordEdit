@@ -281,7 +281,7 @@ def per_component_metrics(
 
 def comparison_metrics(
     true_phi: torch.Tensor,                    # (N, |T|)
-    true: torch.Tensor,                        # (N, |T|, C) raw PSNR/CLIP
+    true_cols: torch.Tensor,                        # (N, |T|, C) raw PSNR/CLIP
     cols: tuple[str, ...] | list[str],
     chosen: torch.Tensor,                      # (N,) or (N, 1)
     baseline_idx: int | torch.Tensor,          # default cell, shared or per sample
@@ -293,11 +293,13 @@ def comparison_metrics(
     per-sample normalized deltas. Means are absolute levels at the pick and
     selected-default deltas in those units.
 
-    phi / delta_phi
-    <col> / delta_<col>
+    phi
+    delta_phi
+    <col>
+    delta_<col>
     """
-    assert true_phi.ndim == 2 and true.ndim == 3
-    assert true.shape[:2] == true_phi.shape and true.shape[-1] == len(cols)
+    assert true_phi.ndim == 2 and true_cols.ndim == 3
+    assert true_cols.shape[:2] == true_phi.shape and true_cols.shape[-1] == len(cols)
     n = true_phi.shape[0]
     pick = chosen.reshape(-1)
     assert pick.shape == (n,)
@@ -313,7 +315,7 @@ def comparison_metrics(
         "delta_phi": float((phi_pick - phi_base).mean().item()),
     }
     for i, col in enumerate(cols):
-        t = true[..., i]
+        t = true_cols[..., i]
         t_pick = t.gather(-1, pick.reshape(-1, 1)).squeeze(-1)
         t_base = t.gather(-1, baseline_idx.reshape(-1, 1)).squeeze(-1)
         out[col] = float(t_pick.mean().item())
