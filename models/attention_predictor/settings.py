@@ -182,6 +182,65 @@ USE_POS_EMB = bool(_cfg("USE_POS_EMB"))
 
 ATTN_DROPOUT = float(_cfg("ATTN_DROPOUT"))
 
+# Number of pre-LN [cross-attention, FFN] residual blocks grounding the prompt
+# queries in the visual tokens. 1 with USE_ATTN_RESIDUAL off is the paper's bare
+# nn.MultiheadAttention with no residual, no norm, and no FFN.
+ATTN_LAYERS = int(_cfg("ATTN_LAYERS", 1))
+if ATTN_LAYERS < 1:
+    raise ValueError(f"Expected {ATTN_LAYERS=} >= 1")
+USE_ATTN_RESIDUAL = bool(_cfg("USE_ATTN_RESIDUAL", False))
+# Hidden width of each block's FFN, as a multiple of ATTN_DIM. 0 drops the FFN.
+FFN_MULT = float(_cfg("FFN_MULT", 0.0))
+
+# Visual key/value source. "vae" is the SD VAE latent grid the paper uses.
+# "clip" swaps in the pooled CLIP-L/14 image embedding as a single token, and
+# "vae+clip" appends it to the latent tokens. CLIP-Edited is scored with
+# CLIP-L/14, so that encoder's space is the one the label is expressible in.
+IMG_EMB_SOURCE = str(_cfg("IMG_EMB_SOURCE", "vae"))
+if IMG_EMB_SOURCE not in ("vae", "clip", "vae+clip"):
+    raise ValueError(f"Unknown {IMG_EMB_SOURCE=}")
+
+# Text key/value source. "pooled" is the pipeline's masked-mean prompt vector,
+# one query per prompt. "tokens" reads the full (77, D) sequences and their
+# padding masks, so every prompt token is its own query and pooling happens
+# after grounding rather than before it.
+TEXT_EMB_SOURCE = str(_cfg("TEXT_EMB_SOURCE", "pooled"))
+if TEXT_EMB_SOURCE not in ("pooled", "tokens"):
+    raise ValueError(f"Unknown {TEXT_EMB_SOURCE=}")
+
+# Second pooled vector per prompt, weighted by each token's novelty against the
+# other prompt (1 - max cosine similarity). Source and target prompts differ in
+# a few words, so the masked mean is mostly shared scaffold and the pooled
+# difference is attenuated by ~1/L; this pools what changed. Needs "tokens".
+USE_DIFF_SALIENCY = bool(_cfg("USE_DIFF_SALIENCY", False))
+
+# LayerNorm each z_edit segment separately instead of once over the whole
+# concatenation, so the small difference segments are not dominated by the two
+# large concat segments. Null keeps the single LayerNorm(4 * d).
+USE_SEGMENT_NORM = bool(_cfg("USE_SEGMENT_NORM", False))
+
+# Learned key/value token a query can attend to instead of the image. Target
+# tokens naming content that is not in the source image otherwise have to spend
+# their whole softmax mass on patches that do not match them.
+USE_NULL_TOKEN = bool(_cfg("USE_NULL_TOKEN", False))
+
+# Subtract the predicted default cell from every cell, so the prediction there
+# is exactly 0 as the true delta is by construction. Removes a degree of
+# freedom the heads otherwise spend learning that constraint.
+PIN_DEFAULT_CELL = bool(_cfg("PIN_DEFAULT_CELL", False))
+
+# LayerScale on each residual branch, so the block starts near-identity and the
+# text path is intact at init. Null is a plain residual add.
+_LAYERSCALE_INIT = _cfg("LAYERSCALE_INIT", None)
+LAYERSCALE_INIT = None if _LAYERSCALE_INIT is None else float(_LAYERSCALE_INIT)
+
+# Hidden width of each metric head. 0 is the paper's bare Linear(d, n_cells).
+HEAD_HIDDEN = int(_cfg("HEAD_HIDDEN", 0))
+# Give PSNR and CLIP their own combiner C_theta instead of sharing the edit
+# descriptor h. The two surfaces are driven by different things, and a shared h
+# lets the PSNR-dominated gradient set the representation for both.
+SPLIT_COMBINER = bool(_cfg("SPLIT_COMBINER", False))
+
 # Combiner C_theta mapping the difference-aware edit representation
 # z_edit (4 * ATTN_DIM) to the edit descriptor h (ATTN_DIM).
 COMBINER_HIDDEN = int(_cfg("COMBINER_HIDDEN"))
@@ -199,13 +258,32 @@ RANKING_LOSS_WEIGHT = float(_cfg("RANKING_LOSS_WEIGHT"))
 _RANKING_LOSS_TOP_K = _cfg("RANKING_LOSS_TOP_K")
 RANKING_LOSS_TOP_K = None if _RANKING_LOSS_TOP_K is None else int(_RANKING_LOSS_TOP_K)
 
+# Per-column MSE on the two delta surfaces, applied before phi scalarizes them.
+# The phi-space terms above let error trade freely between PSNR and CLIP, which
+# the PSNR column wins; these hold each head to its own column. Weight 0 for
+# both is the phi-only objective.
+PSNR_LOSS_WEIGHT = float(_cfg("PSNR_LOSS_WEIGHT", 0.0))
+CLIP_LOSS_WEIGHT = float(_cfg("CLIP_LOSS_WEIGHT", 0.0))
+
+# Listwise soft cross-entropy between softmax(pred_phi / tau) and
+# softmax(true_phi / tau) over the candidate cells. Pairwise ranking spends most
+# of its mass on easy far-apart pairs; this concentrates it at the top of the
+# ranking, which is what the selector reads.
+LISTWISE_LOSS_WEIGHT = float(_cfg("LISTWISE_LOSS_WEIGHT", 0.0))
+LISTWISE_TAU = float(_cfg("LISTWISE_TAU", 0.1))
+if LISTWISE_TAU <= 0:
+    raise ValueError(f"Expected {LISTWISE_TAU=} > 0")
+
 # Select from "none" or "cosine".
 LR_SCHEDULER = str(_cfg("LR_SCHEDULER"))
 # Stop when the checkpoint metric has not improved for this many epochs.
 EARLY_STOP_PATIENCE = int(_cfg("EARLY_STOP_PATIENCE"))
 # Metric used to pick the best-epoch checkpoint.
 CKPT_METRIC = str(_cfg("CKPT_METRIC"))
-if CKPT_METRIC not in ("val_phi_spearman", "val_regret", "val_gain_mean", "val_loss"):
+if CKPT_METRIC not in (
+    "val_phi_spearman", "val_regret", "val_gain_mean", "val_loss",
+    "val_top1_accuracy", "val_top5_accuracy", "val_rho_phi_image",
+):
     raise ValueError(f"Unknown {CKPT_METRIC=}")
 # Number of sample grids concatenated per training batch.
 GRIDS_PER_BATCH = int(_cfg("GRIDS_PER_BATCH"))
@@ -245,3 +323,25 @@ DEFAULT_T_END = float(_cfg("DEFAULT_T_END"))
 
 # Deviate-or-default gate. Minimum predicted phi gain to leave baseline timesteps.
 NOISE_FLOOR_PHI = float(_cfg("NOISE_FLOOR_PHI"))
+
+# Training-only phi. SCORE_PHI above stays the canonical scoreboard at PHI_ALPHA
+# with equal weights, so reshaping the objective (sharpening the risk aversion,
+# or paying more attention to CLIP) is a lever whose payoff is still measured on
+# an unchanged target. Null falls back to the canonical phi exactly.
+_TRAIN_PHI_ALPHA = _cfg("TRAIN_PHI_ALPHA", None)
+TRAIN_PHI_ALPHA = PHI_ALPHA if _TRAIN_PHI_ALPHA is None else float(_TRAIN_PHI_ALPHA)
+_TRAIN_PHI_WEIGHTS = _cfg("TRAIN_PHI_WEIGHTS", None)
+TRAIN_PHI_WEIGHTS = None if _TRAIN_PHI_WEIGHTS is None else tuple(float(w) for w in _TRAIN_PHI_WEIGHTS)
+if TRAIN_PHI_WEIGHTS is not None and len(TRAIN_PHI_WEIGHTS) != len(TARGET_COLS):
+    raise ValueError(f"Expected {len(TARGET_COLS)} weights, got {TRAIN_PHI_WEIGHTS=}")
+_TRAIN_SCORE_KW = {"alpha": TRAIN_PHI_ALPHA} if "alpha" in _signature(_SCORE_FN).parameters else {}
+TRAIN_SCORE_PHI = partial(_SCORE_FN, **_TRAIN_SCORE_KW)  # Torch phi(Delta) for the loss only
+
+# Selection-time levers over the already-predicted grid, so they can be swept
+# without retraining. SELECT_PHI_WEIGHTS reweights phi for ranking only, and
+# SELECT_CLIP_FLOOR restricts the argmax to cells clearing a CLIP delta.
+# Reported metrics stay on the canonical phi either way.
+_SELECT_PHI_WEIGHTS = _cfg("SELECT_PHI_WEIGHTS", None)
+SELECT_PHI_WEIGHTS = None if _SELECT_PHI_WEIGHTS is None else tuple(float(w) for w in _SELECT_PHI_WEIGHTS)
+_SELECT_CLIP_FLOOR = _cfg("SELECT_CLIP_FLOOR", None)
+SELECT_CLIP_FLOOR = None if _SELECT_CLIP_FLOOR is None else float(_SELECT_CLIP_FLOOR)

@@ -18,7 +18,48 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from settings import *
 
 _PACKED_EMBEDDINGS_DIR = Path(__file__).resolve().parent / ".cache" / "packed_embeddings"
-_EMB_FILES = {"img": "image_tokens.pt", "src": "source.pt", "tar": "target.pt"}
+_EMB_FILES = {
+    "img": "image_tokens.pt",
+    "src": "source.pt",
+    "tar": "target.pt",
+    "src_tokens": "source_tokens.pt",
+    "tar_tokens": "target_tokens.pt",
+    "src_mask": "source_mask.pt",
+    "tar_mask": "target_mask.pt",
+}
+
+# mlp_predictor already builds and caches the pooled CLIP-L/14 image table, and
+# its cache is keyed by DIR_NAME alone, so importing the module rather than
+# forking it means both packages read and write the same file. It does
+# `from settings import *`, which resolves to whichever settings module is
+# already bound -- this package's, or a run snapshot under selector.py.
+_MLP_DIR = Path(__file__).resolve().parents[1] / "mlp_predictor"
+
+
+def get_clip_image_table(samples: pd.DataFrame, device: torch.device | str = "cuda") -> torch.Tensor:
+    """(n, 1, D_clip) pooled CLIP-L/14 image embeddings, one row per sample.
+
+    Shaped as a single token so it can be concatenated onto the visual token
+    sequence the cross-attention reads. Encodes on a cache miss, which is why
+    the cache must be warm before a parallel sweep.
+    """
+    if str(_MLP_DIR) not in sys.path:
+        sys.path.append(str(_MLP_DIR))
+    import clip_image
+
+    # clip_image puts its own package dir at sys.path[0] on import. Drop it once
+    # the module is bound, so nothing imported later resolves to mlp_predictor's
+    # copy of a module this package also has.
+    while str(_MLP_DIR) in sys.path:
+        sys.path.remove(str(_MLP_DIR))
+
+    if PIE_BENCH:
+        raise NotImplementedError(
+            "IMG_EMB_SOURCE != 'vae' has no PIE-Bench path: clip_image caches by DIR_NAME, "
+            "so a mixed UltraEdit/PIE split would need two tables stitched together."
+        )
+    emb = clip_image.get_clip_image_embeddings(samples, device=device)
+    return emb.unsqueeze(-2).contiguous()
 
 
 def _scattered_path(
@@ -285,8 +326,148 @@ def get_embeddings_by_sample(
     sample_ids, img_emb, src_emb, tar_emb = get_embeddings_mixed(samples)
     img_emb, src_emb, tar_emb = img_emb.to(device), src_emb.to(device), tar_emb.to(device)
 
+    # The CLIP table is keyed by the frame's row order, so reindex it onto
+    # sample_ids the packed loader returned.
+    clip_emb = None
+    if IMG_EMB_SOURCE != "vae":
+        order = {sid: i for i, sid in enumerate(samples[SAMPLE_ID_COL].tolist())}
+        table = get_clip_image_table(samples, device=device).to(device)
+        clip_emb = table[[order[sid] for sid in sample_ids]]
+
     return {sid: {
         "img": img_emb[i],
         "src": src_emb[i],
         "tar": tar_emb[i],
+        "clip": None if clip_emb is None else clip_emb[i],
     } for i, sid in enumerate(sample_ids)}
+
+
+"""
+Text token tables: full (77, D) prompt sequences plus their padding masks.
+"""
+
+_TEXT_TOKEN_LAYOUT = "text_tokens_masks_v1"
+
+
+def _text_token_path(*, dir_name: str | None = None) -> Path:
+    slug = (dir_name if dir_name is not None else DIR_NAME).replace("_", "").lower()
+    return _PACKED_EMBEDDINGS_DIR / f"{CHORD_EDIT_MODEL}-texttokens-{slug}.pt"
+
+
+def _text_token_meta(*, dir_name: str | None = None) -> dict:
+    return {
+        "model": CHORD_EDIT_MODEL,
+        "layout": _TEXT_TOKEN_LAYOUT,
+        "dir_name": dir_name if dir_name is not None else DIR_NAME,
+    }
+
+
+def get_text_token_tables(
+    samples: pd.DataFrame,
+    *,
+    scattered_dir: Path | None = None,
+    dir_name: str | None = None,
+) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(sids, src_tokens, tar_tokens, src_mask, tar_mask) from the scattered tree.
+
+    Tokens are (n, 77, D) float16 on disk, masks (n, 77) bool. The pipeline's
+    pooled source.pt is the mask-weighted mean of source_tokens.pt, which is
+    asserted on a sample of rows at pack time so a mismatched mask cannot pass
+    silently.
+    """
+    sample_ids = samples[SAMPLE_ID_COL].tolist()
+    path = _text_token_path(dir_name=dir_name)
+
+    if path.exists():
+        try:
+            data = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+            meta = data.get("meta")
+            ok = isinstance(meta, dict) and all(
+                meta.get(k) == v for k, v in _text_token_meta(dir_name=dir_name).items()
+            )
+            id_to_i = {sid: i for i, sid in enumerate(data["sids"])} if ok else {}
+            if ok and not any(sid not in id_to_i for sid in sample_ids):
+                idxs = [id_to_i[sid] for sid in sample_ids]
+                print("Loaded packed text tokens from cache.")
+                return (
+                    sample_ids,
+                    data["src_tokens"][idxs].float(), data["tar_tokens"][idxs].float(),
+                    data["src_mask"][idxs].contiguous(), data["tar_mask"][idxs].contiguous(),
+                )
+            print(f"{path} unusable for this request. Repacking...")
+        except Exception as e:
+            print(f"Failed to load {path} ({e}). Repacking...")
+
+    n = len(sample_ids)
+    probe = _load_pt(_scattered_path(sample_ids[0], "src_tokens", scattered_dir=scattered_dir))
+    if probe.ndim != 2:
+        raise ValueError(f"Expected (T, D) prompt tokens, got {tuple(probe.shape)}")
+    shape = tuple(probe.shape)
+    src_tok = torch.empty((n, *shape), dtype=torch.float16)
+    tar_tok = torch.empty((n, *shape), dtype=torch.float16)
+    src_msk = torch.empty((n, shape[0]), dtype=torch.bool)
+    tar_msk = torch.empty((n, shape[0]), dtype=torch.bool)
+
+    def _load_row(i: int):
+        sid = sample_ids[i]
+        out = [i]
+        for kind in ("src_tokens", "tar_tokens", "src_mask", "tar_mask"):
+            fp = _scattered_path(sid, kind, scattered_dir=scattered_dir)
+            if not fp.exists():
+                raise FileNotFoundError(f"Missing {fp}")
+            out.append(torch.load(fp, map_location="cpu", weights_only=True))
+        return tuple(out)
+
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        for i, st, tt, sm, tm in tqdm(
+            pool.map(_load_row, range(n)), total=n, desc="Packing text tokens", unit="sample"
+        ):
+            for name, t in (("source", st), ("target", tt)):
+                if tuple(t.shape) != shape:
+                    raise ValueError(f"Expected {shape} for {name} tokens of {sample_ids[i]}, got {tuple(t.shape)}")
+            src_tok[i], tar_tok[i] = st.half(), tt.half()
+            src_msk[i], tar_msk[i] = sm.bool().reshape(-1), tm.bool().reshape(-1)
+
+    _verify_pooling(sample_ids, src_tok, src_msk, "src", scattered_dir=scattered_dir)
+
+    meta = _text_token_meta(dir_name=dir_name) | {"text_shape": shape}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(str(path) + ".tmp")
+    torch.save({
+        "sids": list(sample_ids), "meta": meta,
+        "src_tokens": src_tok.contiguous().clone(), "tar_tokens": tar_tok.contiguous().clone(),
+        "src_mask": src_msk.contiguous().clone(), "tar_mask": tar_msk.contiguous().clone(),
+    }, tmp)
+    tmp.replace(path)
+    print(f"Saved packed text tokens: {path}")
+    return sample_ids, src_tok.float(), tar_tok.float(), src_msk, tar_msk
+
+
+def _verify_pooling(
+    sample_ids: list[str],
+    tokens: torch.Tensor,
+    masks: torch.Tensor,
+    kind: str,
+    *,
+    scattered_dir: Path | None = None,
+    n_check: int = 64,
+) -> None:
+    """Assert the masked mean of the packed tokens reproduces the pooled vector.
+
+    This is what proves the stored padding masks are the ones the pipeline
+    pooled with; a mask off by a token would still look plausible otherwise.
+    """
+    step = max(1, len(sample_ids) // n_check)
+    checked = 0
+    for i in range(0, len(sample_ids), step):
+        pooled = _load_pt(_scattered_path(sample_ids[i], kind, scattered_dir=scattered_dir)).reshape(-1)
+        m = masks[i].float().unsqueeze(-1)
+        got = (tokens[i].float() * m).sum(0) / m.sum(0).clamp(min=1e-9)
+        err = (got - pooled).abs().max().item()
+        if err > 5e-3:
+            raise ValueError(
+                f"Masked mean of {kind}_tokens does not reproduce {kind}.pt for "
+                f"sample {sample_ids[i]} (max abs err {err:.3e})"
+            )
+        checked += 1
+    print(f"Verified masked-mean pooling on {checked} sampled rows (max err < 5e-3).")

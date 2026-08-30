@@ -114,8 +114,13 @@ def eval(run_dir: Path) -> dict:
     all_selections: list[dict[str, float | str | bool]] = []
     for sid in all_sample_ids:
         e = emb[sid]
-        grid = t_selector.pred_grid(e["img"], e["src"], e["tar"])
-        sel = t_selector.select_grid(grid, noise_floor=NOISE_FLOOR_PHI)
+        grid = t_selector.pred_grid(e["img"], e["src"], e["tar"], e.get("clip"))
+        sel = t_selector.select_grid(
+            grid,
+            noise_floor=NOISE_FLOOR_PHI,
+            clip_floor=SELECT_CLIP_FLOOR,
+            phi_weights=SELECT_PHI_WEIGHTS,
+        )
         all_selections.append({
             "sample_id": sid,
             "t_start": sel.t_start,

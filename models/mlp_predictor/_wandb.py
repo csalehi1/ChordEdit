@@ -44,11 +44,15 @@ _ALIASES = {PSNR_COL: "psnr", CLIP_COL: "clip"}
 # comparison_metrics.
 _TRAINING_KEYS = frozenset({
     "loss", "loss_regression", "loss_ranking", "phi_spearman",
+    # Collapse detectors: a model that has only learned the population mean
+    # surface sits at ~0 on both while every other metric looks unremarkable.
+    "rho_phi_image", "phi_spread_ratio",
 })
 _SELECTION_KEYS = frozenset({
     "regret_median", "regret_p90", "gain_mean",
     "improvement_rate", "deviate_rate",
     "top1_accuracy", "top5_accuracy", "top10_accuracy",
+    "modal_cell_frac", "n_distinct_cells",
 })
 _COMPARISON_KEYS = frozenset({
     "phi", "delta_phi", "psnr", "delta_psnr", "clip", "delta_clip",
@@ -64,6 +68,7 @@ def _per_component_keys() -> frozenset[str]:
             col,
             f"delta_{col}", f"mae_{col}", f"rmse_{col}", f"r2_{col}",
             f"rho_{col}", f"gain_{col}", f"regret_{col}",
+            f"rho_{col}_image", f"spread_ratio_{col}",
         })
     return frozenset(keys)
 

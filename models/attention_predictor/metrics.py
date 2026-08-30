@@ -40,10 +40,7 @@ def regression_loss_scores(
     pred_phi: torch.Tensor,
     top_k: int | None = None,
 ) -> torch.Tensor:
-    """(N,) MSE of pred vs true phi over the cells of each sample.
-
-    When top_k is set, only the true top-k cells of each row contribute.
-    """
+    """(N,) MSE of pred vs true phi over the cells of each sample."""
     if top_k is not None and top_k < true_phi.shape[-1]:
         idx = true_phi.topk(top_k, dim=-1).indices
         true_phi = true_phi.gather(-1, idx)
@@ -58,10 +55,7 @@ def ranking_loss_scores(
     top_k: int | None = None,
     chunk: int = 64,
 ) -> torch.Tensor:
-    """(N,) mean per-sample logistic pairwise loss over pairs with true_u > true_v.
-
-    When top_k is set, only pairs whose higher cell is in the true top-k remain.
-    """
+    """(N,) mean per-sample logistic pairwise loss over pairs with true_u > true_v."""
     out = true_phi.new_full((true_phi.shape[0],), float("nan"))
     for k in range(0, true_phi.shape[0], chunk):
         t, p = true_phi[k : k + chunk], pred_phi[k : k + chunk]
@@ -81,7 +75,7 @@ def ranking_loss_scores(
 def _top_k_accuracy_at(true_phi: torch.Tensor, chosen: torch.Tensor, k: int) -> torch.Tensor:
     """(N,) whether the chosen cell lies in the true top-k cells by phi."""
     k = min(k, true_phi.shape[-1])
-    top = true_phi.topk(k, dim=-1).indices              # (N, k)
+    top = true_phi.topk(k, dim=-1).indices
     return (top == chosen.reshape(-1, 1)).any(dim=-1)
 
 
@@ -142,6 +136,26 @@ def improvement_rate(true_phi: torch.Tensor, pred_phi: torch.Tensor) -> float:
     """Fraction of samples with strictly positive gain."""
     return float((gain_scores(true_phi, pred_phi) > 0).double().mean().item())
 
+
+def spread_ratio(true: torch.Tensor, pred: torch.Tensor) -> float:
+    """Across-image spread of the pred surface relative to the true one."""
+    assert true.shape == pred.shape and true.ndim == 2
+    if true.shape[0] < 2:
+        return float("nan")
+    den = true.double().std(dim=0).mean()
+    num = pred.double().std(dim=0).mean()
+    return float((num / den).item()) if float(den.item()) > 0 else float("nan")
+
+
+def cross_image_rho(true: torch.Tensor, pred: torch.Tensor) -> float:
+    """Median over cells of the across-image Spearman rho at a fixed cell."""
+    assert true.shape == pred.shape and true.ndim == 2
+    if true.shape[0] < 2:
+        return float("nan")
+    rho = rank_correlation_scores(true.double().T.contiguous(), pred.double().T.contiguous())
+    return float(rho.quantile(0.5).item()) if rho.numel() else float("nan")
+
+
 """
 Aggregators.
 """
@@ -163,6 +177,8 @@ def training_metrics(
     loss_regression
     loss_ranking
     phi_spearman
+    rho_phi_image
+    phi_spread_ratio
     """
     assert true_phi.shape == pred_phi.shape
     mse = regression_loss_scores(true_phi, pred_phi, top_k=mse_top_k)
@@ -181,6 +197,8 @@ def training_metrics(
         "loss_regression": regression,
         "loss_ranking": ranking,
         "phi_spearman": float(rho.quantile(0.5).item()) if rho.numel() else float("nan"),
+        "rho_phi_image": cross_image_rho(true_phi, pred_phi),
+        "phi_spread_ratio": spread_ratio(true_phi, pred_phi),
     }
 
 
@@ -197,13 +215,20 @@ def _selection_metrics_at(
     gain_mean
     improvement_rate
     deviate_rate
+    modal_cell_frac
+    n_distinct_cells
     """
     chosen = chosen.reshape(-1)
     if not isinstance(baseline_idx, torch.Tensor):
         baseline_idx = torch.full_like(chosen, int(baseline_idx))
     gain = _gain_at(true_phi, chosen)
     reg = true_phi.max(dim=-1).values - gain
+    # How concentrated the picks are. A constant selector puts modal_cell_frac at
+    # 1.0 with n_distinct_cells at 1, which no other selection metric reveals.
+    counts = torch.bincount(chosen, minlength=true_phi.shape[-1])
     return {
+        "modal_cell_frac": float((counts.max().double() / counts.sum().double()).item()),
+        "n_distinct_cells": float((counts > 0).sum().item()),
         "regret_median": float(reg.quantile(0.5).item()),
         "regret_p90": float(reg.quantile(0.9).item()),
         "gain_mean": float(gain.mean().item()),
@@ -241,6 +266,8 @@ def per_component_metrics(
     rmse_<col>
     r2_<col>
     rho_<col>
+    rho_<col>_image
+    spread_ratio_<col>
     gain_<col>
     regret_<col>
     """
@@ -273,6 +300,8 @@ def per_component_metrics(
         out[f"rmse_{col}"] = float((e ** 2).mean().sqrt().item())
         out[f"r2_{col}"] = float((1 - ss_res / ss_tot).item())
         out[f"rho_{col}"] = float(rho.quantile(0.5).item()) if rho.numel() else float("nan")
+        out[f"rho_{col}_image"] = cross_image_rho(t, p)
+        out[f"spread_ratio_{col}"] = spread_ratio(t, p)
         out[f"gain_{col}"] = float(delta.mean().item())
         out[f"regret_{col}"] = float((t_best - t_pick).mean().item())
     

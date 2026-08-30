@@ -47,13 +47,52 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def calc_train_phi(deltas: torch.Tensor) -> torch.Tensor:
+    """Training-only phi, at TRAIN_PHI_ALPHA / TRAIN_PHI_WEIGHTS.
+
+    Every reported metric keeps calling _helpers.calc_phi at the canonical
+    PHI_ALPHA with equal weights, so reshaping the objective never moves the
+    scoreboard. With both settings left null this is calc_phi exactly.
+    """
+    if TRAIN_PHI_WEIGHTS is None:
+        return TRAIN_SCORE_PHI(deltas)
+    weights = deltas.new_tensor(TRAIN_PHI_WEIGHTS)
+    return TRAIN_SCORE_PHI(deltas, weights=weights)
+
+
+def selected_cells(
+    pred_deltas: torch.Tensor,  # (N, n_cells, 2)
+    pred_phi: torch.Tensor,     # (N, n_cells)
+) -> torch.Tensor:              # (N,)
+    """Cell each sample would be sent to, under the selection-time levers.
+
+    Plain argmax of the predicted phi unless SELECT_PHI_WEIGHTS reweights the
+    ranking or SELECT_CLIP_FLOOR restricts it to cells clearing a CLIP delta.
+    Rows where the floor admits nothing keep the unrestricted argmax, matching
+    model.TimestepSelector.select_grid.
+    """
+    rank_phi = pred_phi
+    if SELECT_PHI_WEIGHTS is not None:
+        rank_phi = calc_phi(pred_deltas, weights=pred_deltas.new_tensor(SELECT_PHI_WEIGHTS))
+    if SELECT_CLIP_FLOOR is not None:
+        eligible = pred_deltas[..., 1] >= SELECT_CLIP_FLOOR
+        keep = eligible | ~eligible.any(dim=-1, keepdim=True)
+        rank_phi = rank_phi.masked_fill(~keep, -float("inf"))
+    return rank_phi.argmax(dim=-1)
+
+
 def calc_loss(
     pred: torch.Tensor,                        # (G, n_cells, 2)
     true: torch.Tensor,                        # (G, n_cells, 2)
     baseline_idx: torch.Tensor,                # (G,)
     mean_surface: torch.Tensor | None = None,  # (n_cells, 2)
 ) -> torch.Tensor:
-    """Weighted phi MSE and/or pairwise ranking. A weight of 0 drops that term."""
+    """Weighted phi MSE, pairwise ranking, listwise CE, and per-column MSE.
+
+    A weight of 0 drops that term. The first three live in phi space, where
+    error trades freely between the two metric columns; column_loss is the only
+    term that holds each head to its own column.
+    """
 
     def mse_loss(
         pred_phi: torch.Tensor,
@@ -86,13 +125,46 @@ def calc_loss(
             return pred_phi.new_zeros(())
         return torch.nn.functional.softplus(-diff_pred[mask]).mean()
 
-    pred_phi = calc_phi(deltas_from_preds(pred, baseline_idx, mean_surface))
-    true_phi = calc_phi(deltas_from_preds(true, baseline_idx, mean_surface))
+    def listwise_loss(
+        pred_phi: torch.Tensor,
+        true_phi: torch.Tensor,
+        tau: float,
+    ) -> torch.Tensor:
+        """Soft cross-entropy of softmax(pred/tau) against softmax(true/tau).
+
+        Puts the gradient where the selector reads, at the top of the ranking,
+        rather than spreading it over the easy far-apart pairs that dominate the
+        pairwise term.
+        """
+        target = torch.softmax(true_phi / tau, dim=-1)
+        return -(target * torch.log_softmax(pred_phi / tau, dim=-1)).sum(dim=-1).mean()
+
+    def column_loss(
+        pred_deltas: torch.Tensor,
+        true_deltas: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-column MSE on the delta surfaces, one weight per metric.
+
+        Weights scale each column independently rather than being renormalized,
+        so PSNR_LOSS_WEIGHT and CLIP_LOSS_WEIGHT also set this term's size
+        relative to the phi-space terms. (1, 1) is a plain unweighted MSE.
+        """
+        weights = pred_deltas.new_tensor([PSNR_LOSS_WEIGHT, CLIP_LOSS_WEIGHT])
+        return (((pred_deltas - true_deltas) ** 2) * weights).mean()
+
+    pred_deltas = deltas_from_preds(pred, baseline_idx, mean_surface)
+    true_deltas = deltas_from_preds(true, baseline_idx, mean_surface)
+    pred_phi = calc_train_phi(pred_deltas)
+    true_phi = calc_train_phi(true_deltas)
     loss = pred_phi.new_zeros(())
     if MSE_LOSS_WEIGHT > 0:
         loss = loss + MSE_LOSS_WEIGHT * mse_loss(pred_phi, true_phi, top_k=MSE_LOSS_TOP_K)
     if RANKING_LOSS_WEIGHT > 0:
         loss = loss + RANKING_LOSS_WEIGHT * ranking_loss(pred_phi, true_phi, top_k=RANKING_LOSS_TOP_K)
+    if LISTWISE_LOSS_WEIGHT > 0:
+        loss = loss + LISTWISE_LOSS_WEIGHT * listwise_loss(pred_phi, true_phi, LISTWISE_TAU)
+    if PSNR_LOSS_WEIGHT > 0 or CLIP_LOSS_WEIGHT > 0:
+        loss = loss + column_loss(pred_deltas, true_deltas)
     return loss
 
 
@@ -122,8 +194,8 @@ def eval_regression(
 
     preds, trues, bases = [], [], []
     loss_sum, n_grids = 0.0, 0
-    for (img, src, tar, y), baseline in cells.iter_grids(EVAL_CHUNK, shuffle=False):
-        out = model.regressor(img, src, tar)
+    for (img, src, tar, clip, tmask, y), baseline in cells.iter_grids(EVAL_CHUNK, shuffle=False):
+        out = model.regressor(img, src, tar, clip, tmask)
         y_std = (y - mean) / std
         # Weight each chunk by its grid count, since the last chunk is short.
         loss_sum += calc_loss(out, y_std, baseline, mean_surface).item() * y.shape[0]
@@ -164,9 +236,9 @@ def eval_selection(
     true_delta_parts, pred_delta_parts, base_parts = [], [], []
     for k in range(0, cells.n_grids, chunk_grids):
         sel = torch.arange(k, min(k + chunk_grids, cells.n_grids), device=device)
-        img, src, tar, y = cells.gather_grids(sel)
+        img, src, tar, clip, tmask, y = cells.gather_grids(sel)
         baseline = cells.grid_baseline[sel]
-        out = model.pred_cells(img, src, tar).double()
+        out = model.pred_cells(img, src, tar, clip, tmask).double()
         # Both sides leave PREDICTION_SPACE here, so phi sees deltas either way.
         pred_delta_parts.append(deltas_from_preds(out, baseline, surface))
         true_delta_parts.append(deltas_from_preds(y.double(), baseline, surface))
@@ -177,7 +249,7 @@ def eval_selection(
     baseline = torch.cat(base_parts)
     true_phi = calc_phi(true_deltas)
     pred_phi = calc_phi(pred_deltas)
-    chosen = pred_phi.argmax(dim=-1)
+    chosen = selected_cells(pred_deltas, pred_phi)
     true_raw = cells.y_raw[cells.grid_rows].double()
 
     return {
@@ -230,11 +302,24 @@ def train(
     cell_t_pairs = train_cells.t[train_cells.grid_rows[0]].detach().cpu()
     t_start_values = torch.as_tensor(np.sort(np.unique(cell_t_pairs[:, 0].numpy())), dtype=torch.float64)
     t_end_values = torch.as_tensor(np.sort(np.unique(cell_t_pairs[:, 1].numpy())), dtype=torch.float64)
-    model = AttentionModel(img_shape, text_shape[-1], train_cells.n_cells, device=device)
+    clip_table = train_cells.emb_table.clip
+    clip_shape = None if clip_table is None else tuple(int(v) for v in clip_table.shape[1:])
+    # Rows are sorted by (t_start, t_end) inside every grid, so the default cell
+    # sits at the same index in all of them; PIN_DEFAULT_CELL relies on that.
+    default_cells = torch.unique(train_cells.grid_baseline)
+    if default_cells.numel() != 1:
+        raise ValueError(f"Expected one default cell index, got {default_cells.tolist()}")
+    default_cell = int(default_cells.item())
+    model = AttentionModel(
+        img_shape, text_shape[-1], train_cells.n_cells, device=device,
+        clip_dim=None if clip_shape is None else clip_shape[-1],
+        default_cell=default_cell,
+    )
     n_params = sum(p.numel() for p in model.regressor.parameters())
     print(
         f"Predictor: {n_params / 1e6:.2f}M params, "
-        f"img {img_shape}, text {text_shape}, {train_cells.n_cells} cells, space {PREDICTION_SPACE!r}"
+        f"img {img_shape}, text {text_shape}, clip {clip_shape}, "
+        f"{train_cells.n_cells} cells, space {PREDICTION_SPACE!r}, visual {IMG_EMB_SOURCE!r}"
     )
 
     grid_shape = (len(t_start_values), len(t_end_values))
@@ -243,6 +328,7 @@ def train(
         "n_params": n_params,
         "img_shape": list(img_shape),
         "text_shape": list(text_shape),
+        "clip_shape": None if clip_shape is None else list(clip_shape),
         "n_cells": int(train_cells.n_cells),
         "grid": f"{grid_shape[0]}x{grid_shape[1]}",
         "n_train_samples": int(train_cells.n_grids),
@@ -303,10 +389,10 @@ def train(
             model.regressor.train()
 
             # Iterate over the batches.
-            for (img, src, tar, y), baseline in train_cells.iter_grids(grids_per_batch, shuffle=True):
+            for (img, src, tar, clip, tmask, y), baseline in train_cells.iter_grids(grids_per_batch, shuffle=True):
 
                 # Forward pass. Targets are z-scored to match the head outputs.
-                out = model.regressor(img, src, tar)
+                out = model.regressor(img, src, tar, clip, tmask)
                 loss = calc_loss(out, (y - y_mean) / y_std, baseline, mean_surfaces["train"])
 
                 # Backpropagate the loss.
@@ -351,6 +437,12 @@ def train(
                 score = -val_selection.get("regret_median", float("nan"))
             elif CKPT_METRIC == "val_gain_mean":
                 score = val_selection.get("gain_mean", float("nan"))
+            elif CKPT_METRIC == "val_top1_accuracy":
+                score = val_selection.get("top1_accuracy", float("nan"))
+            elif CKPT_METRIC == "val_top5_accuracy":
+                score = val_selection.get("top5_accuracy", float("nan"))
+            elif CKPT_METRIC == "val_rho_phi_image":
+                score = val_selection.get("rho_phi_image", float("nan"))
             else:
                 # Fallback to a regression-based metric.
                 score = -val_regression["loss"]
@@ -368,6 +460,7 @@ def train(
                     "prediction_space": str(PREDICTION_SPACE),
                     "img_shape": img_shape,
                     "text_shape": text_shape,
+                    "clip_shape": clip_shape,
                     "cell_t_pairs": cell_t_pairs,
                     "t_start_values": t_start_values,
                     "t_end_values": t_end_values,

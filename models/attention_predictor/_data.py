@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from embeddings import get_embeddings_mixed
+from embeddings import get_clip_image_table, get_embeddings_mixed, get_text_token_tables
 from settings import *
 
 ID_TO_SPLIT_NAME = "id_to_split.csv"
@@ -23,9 +23,11 @@ ID_TO_SPLIT_NAME = "id_to_split.csv"
 class EmbeddingTable:
     """One embedding-table row per unique sample_id."""
 
-    img: torch.Tensor   # (n_samples, C, S, S)
-    src: torch.Tensor   # (n_samples, 1, D_txt)
-    tar: torch.Tensor   # (n_samples, 1, D_txt)
+    img: torch.Tensor          # (n_samples, C, S, S)
+    src: torch.Tensor          # (n_samples, 1, D_txt), or (n_samples, T, D_txt) with "tokens"
+    tar: torch.Tensor          # (n_samples, 1, D_txt), or (n_samples, T, D_txt) with "tokens"
+    clip: torch.Tensor | None  # (n_samples, 1, D_clip), only when IMG_EMB_SOURCE uses it
+    text_masks: torch.Tensor | None = None  # (n_samples, 2, T) bool, only with "tokens"
 
 
 @dataclass(frozen=True)
@@ -52,13 +54,20 @@ class CellTensors:
         return int(self.grid_rows.shape[1])
 
     def gather_grids(self, sel: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """(img, src, tar, y) for whole grids: token tables (G, ...), y (G, n_cells, .)."""
+        """(img, src, tar, clip, text_masks, y) for whole grids, y (G, n_cells, .).
+
+        clip is None unless IMG_EMB_SOURCE asked for it; text_masks is None
+        unless TEXT_EMB_SOURCE asked for the full prompt sequences.
+        """
         rows = self.grid_rows[sel]
         sid = self.sample_idx[rows[:, 0]]
+        table = self.emb_table
         return (
-            self.emb_table.img[sid],
-            self.emb_table.src[sid],
-            self.emb_table.tar[sid],
+            table.img[sid],
+            table.src[sid],
+            table.tar[sid],
+            None if table.clip is None else table.clip[sid],
+            None if table.text_masks is None else table.text_masks[sid],
             self.y[rows],
         )
 
@@ -126,11 +135,32 @@ def create_cell_tensors(
     samples = pd.concat(frames, ignore_index=True).drop_duplicates(SAMPLE_ID_COL).sort_values(SAMPLE_ID_COL)
     sample_ids, img_emb, src_emb, tar_emb = get_embeddings_mixed(samples)
 
+    # Full prompt sequences replace the pooled vectors as the attention queries;
+    # reindexed onto the ids the packed loader returned, like the CLIP table.
+    text_masks = None
+    if TEXT_EMB_SOURCE == "tokens":
+        if PIE_BENCH:
+            raise NotImplementedError("TEXT_EMB_SOURCE='tokens' has no PIE-Bench path yet")
+        tok_ids, src_tok, tar_tok, src_msk, tar_msk = get_text_token_tables(samples)
+        order = {sid: i for i, sid in enumerate(tok_ids)}
+        idx = [order[sid] for sid in sample_ids]
+        src_emb, tar_emb = src_tok[idx], tar_tok[idx]
+        text_masks = torch.stack([src_msk[idx], tar_msk[idx]], dim=1)
+
+    # get_embeddings_mixed may reorder rows, so the CLIP table is reindexed onto
+    # the ids it returned rather than assumed to share the frame's order.
+    clip_emb = None
+    if IMG_EMB_SOURCE != "vae":
+        order = {sid: i for i, sid in enumerate(samples[SAMPLE_ID_COL].tolist())}
+        clip_emb = get_clip_image_table(samples, device=device)[[order[sid] for sid in sample_ids]]
+
     # Build the shared embedding table.
     emb_table = EmbeddingTable(
         img=img_emb.to(device),
         src=src_emb.to(device),
         tar=tar_emb.to(device),
+        clip=None if clip_emb is None else clip_emb.to(device),
+        text_masks=None if text_masks is None else text_masks.to(device),
     )
     sid_to_idx = {sid: i for i, sid in enumerate(sample_ids)}
 
