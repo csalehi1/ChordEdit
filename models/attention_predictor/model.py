@@ -120,73 +120,62 @@ class VisionProjector(nn.Module):
 
 
 class VisionFeaturizer(nn.Module):
-    """Spatially flatten the VAE latent, then VisionProjector -> F_v.
+    """Project the visual tokens to attn_dim -> F_v.
 
-    With IMG_EMB_SOURCE "vae+clip" the pooled CLIP-L/14 image embedding is
-    projected by its own linear map and appended as one more key/value token;
-    with "clip" it is the only visual token. CLIP-Edited is scored with
-    CLIP-L/14, so that encoder's space is the one the label is expressible in,
-    which the VAE latent's is not.
+    image_shape (C, S, S) is the VAE latent grid, spatially flattened into
+    patch tokens before projection. image_shape (N_tok, D) is an
+    already-tokenized sequence -- the pooled CLIP token under IMG_EMB_SOURCE
+    "clip", or the padded VAE+CLIP concatenation under "vae+clip" -- projected
+    as one stream. CLIP-Edited is scored with CLIP-L/14, so that encoder's
+    space is the one the label is expressible in, which the VAE latent's is not.
     """
 
     def __init__(
         self,
-        img_shape: tuple[int, int, int],
+        image_shape: tuple[int, ...],
         attn_dim: int = ATTN_DIM,
         patch_size: int = PATCH_SIZE,
-        img_emb_source: str = IMG_EMB_SOURCE,
-        clip_dim: int | None = None,
     ):
         super().__init__()
-        channels, height, width = img_shape
-
-        if height != width:
-            raise ValueError(f"Expected {img_shape} to be a square")
-        if patch_size < 1 or height % patch_size != 0:
-            raise ValueError(f"Expected {patch_size} to divide {height}")
-
-        self.channels = channels
-        self.side = height
-        self.patch_size = patch_size
-        self.n_grid = height // patch_size
-        self.n_tokens = self.n_grid ** 2
-        self.token_dim = channels * patch_size ** 2
-        self.img_emb_source = str(img_emb_source)
-        self.use_latent = self.img_emb_source in ("vae", "vae+clip")
-        self.projector = VisionProjector(self.token_dim, attn_dim) if self.use_latent else None
-
-        self.clip_projector = None
-        if self.img_emb_source != "vae":
-            if clip_dim is None:
-                raise ValueError(f"{img_emb_source=} needs clip_dim")
-            self.clip_projector = nn.Linear(int(clip_dim), attn_dim)
+        if len(image_shape) == 3:
+            channels, height, width = image_shape
+            if height != width:
+                raise ValueError(f"Expected {image_shape} to be a square")
+            if patch_size < 1 or height % patch_size != 0:
+                raise ValueError(f"Expected {patch_size} to divide {height}")
+            self.channels = channels
+            self.side = height
+            self.patch_size = patch_size
+            self.n_grid = height // patch_size
+            self.n_tokens = self.n_grid ** 2
+            self.token_dim = channels * patch_size ** 2
+        elif len(image_shape) == 2:
+            self.token_dim = int(image_shape[-1])
+        else:
+            raise ValueError(f"Expected (C, S, S) latents or (N_tok, D) tokens, got {image_shape}")
+        self.image_shape = tuple(int(v) for v in image_shape)
+        self.projector = VisionProjector(self.token_dim, attn_dim)
 
     def spatial_flatten(
         self,
-        img_emb: torch.Tensor,  # (N, C, S, S)
-    ) -> torch.Tensor:          # (N, N_v, token_dim)
+        image_tokens: torch.Tensor,  # (N, C, S, S)
+    ) -> torch.Tensor:               # (N, N_v, token_dim)
         """Split the latent into patch tokens; patch_size 1 is one token per position."""
-        n = img_emb.shape[0]
-        if tuple(img_emb.shape[1:]) != (self.channels, self.side, self.side):
-            raise ValueError(f"Expected {img_emb.shape} == (N, {self.channels}, {self.side}, {self.side})")
+        n = image_tokens.shape[0]
+        if tuple(image_tokens.shape[1:]) != (self.channels, self.side, self.side):
+            raise ValueError(f"Expected {image_tokens.shape} == (N, {self.channels}, {self.side}, {self.side})")
         g, p = self.n_grid, self.patch_size
-        tokens = img_emb.reshape(n, self.channels, g, p, g, p)
+        tokens = image_tokens.reshape(n, self.channels, g, p, g, p)
         return tokens.permute(0, 2, 4, 1, 3, 5).reshape(n, self.n_tokens, self.token_dim)
 
     def forward(
         self,
-        img_emb: torch.Tensor,               # (N, C, S, S)
-        clip_emb: torch.Tensor | None = None,  # (N, 1, D_clip)
-    ) -> torch.Tensor:                       # (N, N_v, d)
+        image_tokens: torch.Tensor,  # (N, C, S, S) latents or (N, N_tok, D) tokens
+    ) -> torch.Tensor:               # (N, N_v, d)
         """Return the projected visual tokens F_v serving as keys and values."""
-        tokens = []
-        if self.projector is not None:
-            tokens.append(self.projector(self.spatial_flatten(img_emb)))
-        if self.clip_projector is not None:
-            if clip_emb is None:
-                raise ValueError(f"IMG_EMB_SOURCE={self.img_emb_source!r} needs clip_emb")
-            tokens.append(self.clip_projector(clip_emb))
-        return tokens[0] if len(tokens) == 1 else torch.cat(tokens, dim=-2)
+        if image_tokens.dim() == 4:
+            image_tokens = self.spatial_flatten(image_tokens)
+        return self.projector(image_tokens)
 
 
 """
@@ -364,16 +353,7 @@ CrossAttentionPooler: CrossAttn(Q=F_t, K=F_v, V=F_v).
 """
 
 class CrossAttentionBlock(nn.Module):
-    """One grounding step, CrossAttn(Q=F_t, K=F_v, V=F_v), as a pre-LN block.
-
-    The residual add is unconditional. Without it the block returns the
-    attention output alone, `sum_i a_i W_v W_p x_i`, a convex combination of
-    value vectors that are functions of the image only; the prompts are queries,
-    so they could influence the output solely by tilting a softmax. That severed
-    the text path and collapsed the predictor to one surface for every input --
-    regret 0.3045 and a single distinct cell over 999 test images, i.e. the
-    best-constant-cell baseline. See docs/RESULTS_CLAUDE.md section 5.
-    """
+    """One grounding step, CrossAttn(Q=F_t, K=F_v, V=F_v), as a pre-LN block."""
 
     def __init__(
         self,
@@ -393,10 +373,7 @@ class CrossAttentionBlock(nn.Module):
         # LayerScale: at a small init the block is near-identity, so the queries
         # reach the readout unchanged at step 0 and grounding is learned rather
         # than assumed.
-        self.gamma_attn = (
-            nn.Parameter(float(layerscale_init) * torch.ones(attn_dim))
-            if layerscale_init is not None else None
-        )
+        self.gamma_attn = nn.Parameter(float(layerscale_init) * torch.ones(attn_dim)) if layerscale_init is not None else None
         self.gamma_ffn = None
         self.ffn_norm, self.ffn = None, None
         if ffn_mult > 0:
@@ -529,12 +506,11 @@ class AttentionRegressor(nn.Module):
 
     def __init__(
         self,
-        img_shape: tuple[int, int, int],
+        image_shape: tuple[int, ...],
         text_dim: int,
         n_cells: int,
         n_targets: int = len(TARGET_COLS),
         attn_dim: int = ATTN_DIM,
-        clip_dim: int | None = None,
         default_cell: int | None = None,
     ):
         super().__init__()
@@ -558,7 +534,7 @@ class AttentionRegressor(nn.Module):
             raise ValueError(f"{PREDICTION_SPACE=} needs the default cell index")
         self.default_cell = int(default_cell) if PIN_DEFAULT_CELL else None
 
-        self.vision_featurizer = VisionFeaturizer(img_shape, attn_dim=attn_dim, clip_dim=clip_dim)
+        self.vision_featurizer = VisionFeaturizer(image_shape, attn_dim=attn_dim)
         if self.text_source == "tokens":
             self.text_featurizer = TokenTextFeaturizer(text_dim, attn_dim=attn_dim)
             self.cross_attn = TokenGrounder(attn_dim=attn_dim)
@@ -606,24 +582,25 @@ class AttentionRegressor(nn.Module):
 
     def forward(
         self,
-        img_emb: torch.Tensor,                 # (N, C, S, S)
-        src_emb: torch.Tensor,                 # (N, 1, D_txt) or (N, T, D_txt)
-        tar_emb: torch.Tensor,                 # (N, 1, D_txt) or (N, T, D_txt)
-        clip_emb: torch.Tensor | None = None,  # (N, 1, D_clip)
-        text_masks: torch.Tensor | None = None,  # (N, 2, T) bool, "tokens" only
-    ) -> torch.Tensor:                         # (N, n_cells, 2)
+        image_tokens: torch.Tensor,               # (N, C, S, S) or (N, N_tok, D)
+        source_tokens: torch.Tensor,              # (N, 1, D_txt) or (N, T, D_txt)
+        target_tokens: torch.Tensor,              # (N, 1, D_txt) or (N, T, D_txt)
+        source_mask: torch.Tensor | None = None,  # (N, T) bool, "tokens" only
+        target_mask: torch.Tensor | None = None,  # (N, T) bool, "tokens" only
+    ) -> torch.Tensor:                            # (N, n_cells, 2)
         """Return per-cell (psnr, clip) predictions, standardized where active."""
         # Ground both prompts in the source image with one cross-attention pass.
-        tokens = self.vision_featurizer(img_emb, clip_emb)
+        tokens = self.vision_featurizer(image_tokens)
         f_diff = None
         if self.text_source == "tokens":
-            if text_masks is None:
-                raise ValueError("TEXT_EMB_SOURCE='tokens' needs text_masks")
-            queries = self.text_featurizer(src_emb, tar_emb)
+            if source_mask is None or target_mask is None:
+                raise ValueError("TEXT_EMB_SOURCE='tokens' needs source_mask and target_mask")
+            text_masks = torch.stack([source_mask, target_mask], dim=1)
+            queries = self.text_featurizer(source_tokens, target_tokens)
             saliency = diff_saliency(queries, text_masks) if self.use_saliency else None
             grounded, f_diff = self.cross_attn(queries, tokens, text_masks, saliency)
         else:
-            queries = self.text_featurizer(src_emb, tar_emb)
+            queries = self.text_featurizer(source_tokens, target_tokens)
             grounded = self.cross_attn(queries, tokens)
         f_src, f_tar = grounded[:, 0], grounded[:, 1]
 
@@ -650,32 +627,30 @@ class AttentionModel(nn.Module):
 
     def __init__(
         self,
-        img_shape: tuple[int, int, int],
+        image_shape: tuple[int, ...],
         text_dim: int,
         n_cells: int,
         device: torch.device | str | None = None,
-        clip_dim: int | None = None,
         default_cell: int | None = None,
     ):
         super().__init__()
         self.regressor = AttentionRegressor(
-            img_shape, text_dim, n_cells, clip_dim=clip_dim, default_cell=default_cell,
+            image_shape, text_dim, n_cells, default_cell=default_cell,
         )
         if device is not None:
             self.regressor.to(device)
 
     def pred_cells(
         self,
-        img_emb: torch.Tensor,                 # (N, C, S, S)
-        src_emb: torch.Tensor,                 # (N, 1, D_txt)
-        tar_emb: torch.Tensor,                 # (N, 1, D_txt)
-        clip_emb: torch.Tensor | None = None,  # (N, 1, D_clip)
-        text_masks: torch.Tensor | None = None,  # (N, 2, T) bool
-    ) -> torch.Tensor:                         # (N, n_cells, 2)
+        image_tokens: torch.Tensor,               # (N, C, S, S) or (N, N_tok, D)
+        source_tokens: torch.Tensor,              # (N, 1, D_txt) or (N, T, D_txt)
+        target_tokens: torch.Tensor,              # like source_tokens
+        source_mask: torch.Tensor | None = None,  # (N, T) bool
+        target_mask: torch.Tensor | None = None,  # (N, T) bool
+    ) -> torch.Tensor:                            # (N, n_cells, 2)
         """Predict per-cell (psnr, clip) in PREDICTION_SPACE units."""
-        return self.regressor.destandardize(
-            self.regressor(img_emb, src_emb, tar_emb, clip_emb, text_masks)
-        )
+        standardized = self.regressor(image_tokens, source_tokens, target_tokens, source_mask, target_mask)
+        return self.regressor.destandardize(standardized)
 
 
 """
@@ -759,31 +734,31 @@ class TimestepSelector:
     @torch.no_grad()
     def pred_grid(
         self,
-        img_emb: torch.Tensor,
-        src_emb: torch.Tensor,
-        tar_emb: torch.Tensor,
-        clip_emb: torch.Tensor | None = None,
-        text_masks: torch.Tensor | None = None,
+        image_tokens: torch.Tensor,               # (C, S, S) or (N_tok, D), one sample
+        source_tokens: torch.Tensor,              # (1, D_txt) or (T, D_txt)
+        target_tokens: torch.Tensor,              # like source_tokens
+        source_mask: torch.Tensor | None = None,  # (T,) bool
+        target_mask: torch.Tensor | None = None,  # (T,) bool
     ) -> TimestepGridResult:
         """
         Single predictor forward covering every labeled (t_start, t_end) cell.
 
-        Scatters the predictions into the grid, maps them to deltas
+        Takes ONE unbatched sample's embeddings (embeddings.SampleEmbeddings
+        fields). Scatters the predictions into the grid, maps them to deltas
         (deltas_from_preds), and scores them with phi (settings.SCORE_PHI).
         Because the predictor estimates the two metric surfaces rather than the
         scalarized objective, re-scoring a saved run under a different SCORE_FN
         needs no retraining.
         """
         device = self.model.regressor.target_mean.device
-        # Accept one unbatched sample: (C, S, S) latents and (1, D) prompts.
-        img = (img_emb.unsqueeze(0) if img_emb.dim() == 3 else img_emb).to(device)
-        src = (src_emb.unsqueeze(0) if src_emb.dim() == 2 else src_emb).to(device)
-        tar = (tar_emb.unsqueeze(0) if tar_emb.dim() == 2 else tar_emb).to(device)
-        clip = None if clip_emb is None else (clip_emb.unsqueeze(0) if clip_emb.dim() == 2 else clip_emb).to(device)
-        masks = None if text_masks is None else (
-            text_masks.unsqueeze(0) if text_masks.dim() == 2 else text_masks
-        ).to(device)
-        preds = self.model.pred_cells(img, src, tar, clip, masks)
+        batched = lambda t: None if t is None else t.unsqueeze(0).to(device)
+        preds = self.model.pred_cells(
+            batched(image_tokens),
+            batched(source_tokens),
+            batched(target_tokens),
+            batched(source_mask),
+            batched(target_mask),
+        )
 
         # Map out of PREDICTION_SPACE before anything is scored.
         deltas = deltas_from_preds(preds, self._default_k, self._mean_surface_cells)
@@ -870,15 +845,13 @@ def load_timestep_selector(
 
     # cell_t_pairs gives the output cell count and each cell's grid position.
     cell_t_pairs = ckpt["cell_t_pairs"].cpu().numpy()
-    img_shape = tuple(int(v) for v in ckpt["img_shape"])
-    text_dim = int(tuple(ckpt["text_shape"])[-1])
-    clip_shape = ckpt.get("clip_shape")
+    image_shape = tuple(int(v) for v in ckpt["image_shape"])
+    text_dim = int(tuple(ckpt["source_shape"])[-1])
     # map_location put these on the model's device; numpy needs them back on host.
     t_start_values = np.asarray(ckpt["t_start_values"].cpu(), dtype=np.float64)
     t_end_values = np.asarray(ckpt["t_end_values"].cpu(), dtype=np.float64)
     model = AttentionModel(
-        img_shape, text_dim, int(cell_t_pairs.shape[0]), device=device,
-        clip_dim=None if clip_shape is None else int(tuple(clip_shape)[-1]),
+        image_shape, text_dim, int(cell_t_pairs.shape[0]), device=device,
         # The regressor re-baselines its surface here, so the index has to be
         # rebuilt from the checkpoint's own grid axes rather than left None.
         default_cell=default_cell_index(cell_t_pairs, t_start_values, t_end_values),

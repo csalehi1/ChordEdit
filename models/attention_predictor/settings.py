@@ -82,7 +82,7 @@ SCATTERED_DIR = Path(f"/shared/ssd_30T/mirick/embeddings/{CHORD_EDIT_MODEL}/{DIR
 
 # --pie-bench (argv) or a saved run snapshot's PIE_BENCH: replace the UltraEdit
 # test split with labeled PIE-Bench samples. Persist into CONFIG so save_run_settings
-# writes it and selector / load_split_df can replay the same test source.
+# writes it and selector / dataset.get_splits_df can replay the same test source.
 PIE_BENCH = bool(_pie_bench_from_argv() or _cfg("PIE_BENCH", False))
 CONFIG["PIE_BENCH"] = PIE_BENCH
 PIE_BENCH_DIR_NAME = "PIE_Bench_v1"
@@ -260,7 +260,7 @@ if CKPT_METRIC not in (
 ):
     raise ValueError(f"Unknown {CKPT_METRIC=}")
 # Number of sample grids concatenated per training batch.
-GRIDS_PER_BATCH = int(_cfg("GRIDS_PER_BATCH"))
+SAMPLES_PER_BATCH = int(_cfg("SAMPLES_PER_BATCH"))
 # Exponential moving average of the weights.
 EMA_DECAY = float(_cfg("EMA_DECAY"))
 

@@ -214,7 +214,7 @@ CKPT_METRIC = str(_cfg("CKPT_METRIC"))
 if CKPT_METRIC not in ("val_phi_spearman", "val_regret", "val_gain_mean", "val_loss"):
     raise ValueError(f"Unknown {CKPT_METRIC=}")
 # Number of sample grids concatenated per training batch.
-GRIDS_PER_BATCH = int(_cfg("GRIDS_PER_BATCH"))
+SAMPLES_PER_BATCH = int(_cfg("SAMPLES_PER_BATCH"))
 # Exponential moving average of the weights.
 EMA_DECAY = float(_cfg("EMA_DECAY"))
 

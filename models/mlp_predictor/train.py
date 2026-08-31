@@ -225,7 +225,7 @@ def train(
         best_val_loss = float("inf")
         history: list[dict] = []
         n_cells, n_samples = len(train_X), train_X[SAMPLE_ID_COL].nunique()
-        grids_per_batch = max(1, int(GRIDS_PER_BATCH))
+        grids_per_batch = max(1, int(SAMPLES_PER_BATCH))
         ema_state = {k: v.detach().clone() for k, v in model.regressor.state_dict().items()} if EMA_DECAY > 0 else None
 
         # Iterate over the epochs.

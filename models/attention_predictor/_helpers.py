@@ -16,10 +16,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import torch
-
-from scores import calc_norm_deltas
 
 SETTINGS_FILENAME = "settings.json"
 _PACKAGE_DIR = Path(__file__).resolve().parent
@@ -61,7 +58,7 @@ def load_run_settings(run_dir: Path):
     --settings-path on the current command line.
     """
     run_dir = Path(run_dir)
-    already = [n for n in ("_data", "embeddings", "model", "_wandb") if n in sys.modules]
+    already = [n for n in ("dataloader", "dataset", "embeddings", "model", "_wandb") if n in sys.modules]
     if already:
         raise RuntimeError(
             f"load_run_settings() must be called before importing modules that bind settings "
@@ -107,6 +104,11 @@ def resolve_run_dir(runs_dir: Path, run_dir: Path | None = None) -> Path:
     return candidates[-1]
 
 
+def prep_sample_id(value) -> str:
+    """Zero-pad a raw id to the 8-digit sample_id used everywhere."""
+    return f"{int(value):08d}"
+
+
 def resolve_device(gpu: int | str | None = None) -> torch.device:
     """Resolve the device to use for the model."""
     if gpu is None:
@@ -116,54 +118,11 @@ def resolve_device(gpu: int | str | None = None) -> torch.device:
     return torch.device(f"cuda:{int(gpu)}")
 
 
-def grid_axes_from_df(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-    """Sorted unique (t_start, t_end) grid axes."""
-    s = _s()
-    return (
-        np.sort(np.asarray(df[s.T_START_COL].unique())),
-        np.sort(np.asarray(df[s.T_END_COL].unique())),
-    )
-
-
-def timestep_pairs_from_df(df: pd.DataFrame) -> np.ndarray:
-    """Unique (t_start, t_end) pairs in df, shape (N, 2), sorted."""
-    s = _s()
-    return (
-        df.loc[:, [s.T_START_COL, s.T_END_COL]]
-        .drop_duplicates()
-        .sort_values([s.T_START_COL, s.T_END_COL])
-        .to_numpy(dtype=np.float64)
-    )
-
-
 def calc_phi(deltas: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
     """settings.SCORE_PHI on normalized deltas."""
     if weights is None:
         return _s().SCORE_PHI(deltas)
     return _s().SCORE_PHI(deltas, weights=weights)
-
-
-def delta_metric_grids(
-    psnr: np.ndarray,
-    clip: np.ndarray,
-    baseline_idx: int | np.ndarray,
-) -> np.ndarray:
-    """Per-sample normalized deltas of a stack of (PSNR, CLIP) timestep grids."""
-    psnr = np.asarray(psnr, dtype=float)
-    clip = np.asarray(clip, dtype=float)
-    if psnr.shape != clip.shape:
-        raise ValueError(f"Expected {psnr.shape} == {clip.shape}")
-    if psnr.ndim != 3:
-        raise ValueError(f"Expected {psnr.shape} == (n_samples, n_start, n_end)")
-
-    b, n1, n2 = psnr.shape
-    values = torch.as_tensor(
-        np.stack([psnr.reshape(b, n1 * n2), clip.reshape(b, n1 * n2)], axis=-1),
-        dtype=torch.float64,
-    )
-    idx = baseline_idx if isinstance(baseline_idx, int) else torch.as_tensor(baseline_idx, dtype=torch.long)
-    deltas = calc_norm_deltas(values, idx)
-    return deltas.detach().cpu().numpy().reshape(b, n1, n2, 2)
 
 
 def phi_from_delta_grids(
@@ -175,23 +134,6 @@ def phi_from_delta_grids(
     deltas = torch.as_tensor(delta_grids.reshape(b, n1 * n2, c), dtype=torch.float64)
     w = None if weights is None else torch.as_tensor(weights, dtype=torch.float64)
     return calc_phi(deltas, weights=w).detach().cpu().numpy().reshape(b, n1, n2)
-
-
-def score_metric_grids(
-    psnr: np.ndarray,
-    clip: np.ndarray,
-    baseline_idx: int | np.ndarray,
-    weights: np.ndarray | tuple[float, float] | None = None,
-) -> np.ndarray:
-    """Score a stack of (PSNR, CLIP) timestep grids into phi via per-sample deltas.
-
-    See delta_metric_grids for the grid contract. Inputs are raw metric values;
-    grids that are already deltas must go through phi_from_delta_grids instead,
-    since the min-max normalization here would rescale them a second time.
-
-    Returns: (n_samples, n_start, n_end)
-    """
-    return phi_from_delta_grids(delta_metric_grids(psnr, clip, baseline_idx), weights=weights)
 
 
 def format_metric_table(
@@ -250,7 +192,7 @@ def format_metric_table(
 
 
 """
-Grid indexing and the mean surface.
+The mean surface.
 """
 
 MEAN_SURFACE_NAME = "mean_surface.pt"
@@ -263,38 +205,6 @@ def nearest_indices(values, targets) -> np.ndarray:
     return np.abs(values[None, :] - targets[:, None]).argmin(axis=1)
 
 
-def calc_mean_surface(cells) -> dict:
-    """Mean target surface of one split's grids, keyed by the grid axes.
-
-    Averages cells.y as given, so the result is a mean *delta* surface only
-    when the targets are deltas: PREDICTION_SPACE "deltas" (and "residuals"
-    before the offset is applied). Under "raws" the targets are metric values
-    and the average is a mean PSNR/CLIP surface, which is not a usable residual
-    offset -- callers must not treat the two interchangeably. "residuals" is
-    the only space that trains against this offset; the surface is cheap enough
-    to save for every run as a record of the population trend.
-    """
-    s = _s()
-    mean_true = cells.y[cells.grid_rows].double().mean(dim=0).cpu()  # (n_cells, C)
-
-    t_pairs = cells.t[cells.grid_rows[0]].detach().cpu().numpy()  # (n_cells, 2)
-    t_start_values = np.sort(np.unique(t_pairs[:, 0]))
-    t_end_values = np.sort(np.unique(t_pairs[:, 1]))
-    i = nearest_indices(t_start_values, t_pairs[:, 0])
-    j = nearest_indices(t_end_values, t_pairs[:, 1])
-    grid = torch.full((len(t_start_values), len(t_end_values), mean_true.shape[1]), float("nan"), dtype=torch.float64,)
-    grid[i, j] = mean_true
-    return {
-        "t_start_values": torch.as_tensor(t_start_values, dtype=torch.float64),
-        "t_end_values": torch.as_tensor(t_end_values, dtype=torch.float64),
-        "mean_true_delta": grid,
-        "prediction_space": str(s.PREDICTION_SPACE),
-        "split": "train",
-        "n_samples": cells.n_grids,
-        "target_cols": list(s.TARGET_COLS),
-    }
-
-
 def mean_surface_from_dict(
     surface: dict,
     t_start_values: np.ndarray,
@@ -305,7 +215,8 @@ def mean_surface_from_dict(
     Raises when the mean surface's grid axes do not match the selector's, so a
     stale mean surface can never be silently applied to the wrong grid. The
     dict's "prediction_space" records which space it was averaged in; check it
-    before using the surface as a residual offset (see calc_mean_surface).
+    before using the surface as a residual offset (the dict is built and saved
+    by dataset.get_dataset._calc_mean_surface).
     """
     cal_start = np.asarray(surface["t_start_values"], dtype=np.float64)
     cal_end = np.asarray(surface["t_end_values"], dtype=np.float64)
@@ -328,12 +239,6 @@ def gather_at_pairs(surface: dict, t_pairs: torch.Tensor) -> torch.Tensor:
     i = nearest_indices(surface["t_start_values"], pairs[:, 0])
     j = nearest_indices(surface["t_end_values"], pairs[:, 1])
     return surface["mean_true_delta"][i, j]
-
-
-def save_mean_surface(run_dir: Path, surface: dict) -> Path:
-    out = Path(run_dir) / MEAN_SURFACE_NAME
-    torch.save(surface, out)
-    return out
 
 
 def load_mean_surface(run_dir: Path) -> dict | None:

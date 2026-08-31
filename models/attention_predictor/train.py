@@ -23,12 +23,12 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import torch
 
-from _data import *
 from _helpers import *
 from _wandb import finish_run, init_run, log_epoch, log_summary
+from dataloader import get_dataloader
+from dataset import SplitDataset, get_dataset
 from metrics import *
 from model import AttentionModel, deltas_from_preds
 from settings import *
@@ -84,7 +84,7 @@ def selected_cells(
 def calc_loss(
     pred: torch.Tensor,                        # (G, n_cells, 2)
     true: torch.Tensor,                        # (G, n_cells, 2)
-    baseline_idx: torch.Tensor,                # (G,)
+    default_cell: int | torch.Tensor,          # shared index, or (G,)
     mean_surface: torch.Tensor | None = None,  # (n_cells, 2)
 ) -> torch.Tensor:
     """Weighted phi MSE, pairwise ranking, and per-column MSE.
@@ -138,8 +138,8 @@ def calc_loss(
         weights = pred_deltas.new_tensor([PSNR_LOSS_WEIGHT, CLIP_LOSS_WEIGHT])
         return (((pred_deltas - true_deltas) ** 2) * weights).mean()
 
-    pred_deltas = deltas_from_preds(pred, baseline_idx, mean_surface)
-    true_deltas = deltas_from_preds(true, baseline_idx, mean_surface)
+    pred_deltas = deltas_from_preds(pred, default_cell, mean_surface)
+    true_deltas = deltas_from_preds(true, default_cell, mean_surface)
     pred_phi = calc_train_phi(pred_deltas)
     true_phi = calc_train_phi(true_deltas)
     loss = pred_phi.new_zeros(())
@@ -156,12 +156,15 @@ def calc_loss(
 Evaluation.
 """
 
+# Grids per forward pass during evaluation; larger than the train batch since
+# no activations are kept.
+EVAL_CHUNK = 256
+
+
 @torch.no_grad()
 def eval_regression(
     model: AttentionModel,
-    cells: CellTensors,
-    device: torch.device | None = None,
-    mean_surface: torch.Tensor | None = None,  # (n_cells, 2)
+    dataset: SplitDataset,
 ) -> dict[str, float]:
     """
     How well the predictor reproduces the two metric surfaces.
@@ -169,42 +172,33 @@ def eval_regression(
     loss         calc_loss over the split, grid-count weighted
     per-col      see metrics.per_component_metrics
     """
-
-    # Evaluate in chunks of 256 grids.
-    EVAL_CHUNK = 256
-
     model.regressor.eval()
     mean, std = model.regressor.target_mean, model.regressor.target_std
+    device = dataset.y.device
 
-    preds, trues, bases = [], [], []
-    loss_sum, n_grids = 0.0, 0
-    for (img, src, tar, clip, tmask, y), baseline in cells.iter_grids(EVAL_CHUNK, shuffle=False):
-        out = model.regressor(img, src, tar, clip, tmask)
-        y_std = (y - mean) / std
+    preds = []
+    loss_sum = 0.0
+    for k in range(0, dataset.n_samples, EVAL_CHUNK):
+        sel = torch.arange(k, min(k + EVAL_CHUNK, dataset.n_samples), device=device)
+        image_tokens, source_tokens, target_tokens, source_mask, target_mask, y = dataset.gather(sel)
+        out = model.regressor(image_tokens, source_tokens, target_tokens, source_mask, target_mask)
         # Weight each chunk by its grid count, since the last chunk is short.
-        loss_sum += calc_loss(out, y_std, baseline, mean_surface).item() * y.shape[0]
-        n_grids += y.shape[0]
+        loss_sum += calc_loss(out, (y - mean) / std, dataset.default_cell, dataset.mean_surface).item() * len(sel)
         preds.append(model.regressor.destandardize(out))
-        trues.append(y)
-        bases.append(baseline)
     pred = torch.cat(preds)
-    true = torch.cat(trues)
-    baseline = torch.cat(bases)
     # No phi here: pick the cell with the best predicted primary column.
     chosen = pred[..., 0].argmax(dim=-1)
 
     return {
-        "loss": loss_sum / max(n_grids, 1),
-        **per_component_metrics(true, pred, TARGET_COLS, chosen, baseline),
+        "loss": loss_sum / max(dataset.n_samples, 1),
+        **per_component_metrics(dataset.y, pred, TARGET_COLS, chosen, dataset.default_cell),
     }
 
 
 @torch.no_grad()
 def eval_selection(
     model: AttentionModel,
-    cells: CellTensors,
-    chunk_grids: int = 256,
-    mean_surface: torch.Tensor | None = None,  # (n_cells, 2)
+    dataset: SplitDataset,
 ) -> dict[str, float]:
     """
     How well the predicted surfaces serve selection, not regression.
@@ -213,40 +207,36 @@ def eval_selection(
     surfaces to metrics.training_metrics and metrics.selection_metrics; each
     metric column is then scored by metrics.per_component_metrics.
     """
-
     model.regressor.eval()
-    device = cells.t.device
-    surface = None if mean_surface is None else mean_surface.double().to(device)
-    true_delta_parts, pred_delta_parts, base_parts = [], [], []
-    for k in range(0, cells.n_grids, chunk_grids):
-        sel = torch.arange(k, min(k + chunk_grids, cells.n_grids), device=device)
-        img, src, tar, clip, tmask, y = cells.gather_grids(sel)
-        baseline = cells.grid_baseline[sel]
-        out = model.pred_cells(img, src, tar, clip, tmask).double()
-        # Both sides leave PREDICTION_SPACE here, so phi sees deltas either way.
-        pred_delta_parts.append(deltas_from_preds(out, baseline, surface))
-        true_delta_parts.append(deltas_from_preds(y.double(), baseline, surface))
-        base_parts.append(baseline)
+    device = dataset.y.device
+    surface = None if dataset.mean_surface is None else dataset.mean_surface.double()
+    default_cell = dataset.default_cell
 
-    true_deltas = torch.cat(true_delta_parts)
+    pred_delta_parts = []
+    for k in range(0, dataset.n_samples, EVAL_CHUNK):
+        sel = torch.arange(k, min(k + EVAL_CHUNK, dataset.n_samples), device=device)
+        image_tokens, source_tokens, target_tokens, source_mask, target_mask, _ = dataset.gather(sel)
+        out = model.pred_cells(image_tokens, source_tokens, target_tokens, source_mask, target_mask).double()
+        pred_delta_parts.append(deltas_from_preds(out, default_cell, surface))
+
+    # Both sides leave PREDICTION_SPACE here, so phi sees deltas either way.
     pred_deltas = torch.cat(pred_delta_parts)
-    baseline = torch.cat(base_parts)
+    true_deltas = deltas_from_preds(dataset.y.double(), default_cell, surface)
     true_phi = calc_phi(true_deltas)
     pred_phi = calc_phi(pred_deltas)
     chosen = selected_cells(pred_deltas, pred_phi)
-    true_raw = cells.y_raw[cells.grid_rows].double()
 
     return {
         **training_metrics(
-            true_phi, pred_phi, baseline,
+            true_phi, pred_phi, default_cell,
             mse_weight=MSE_LOSS_WEIGHT,
             ranking_weight=RANKING_LOSS_WEIGHT,
             mse_top_k=MSE_LOSS_TOP_K,
             ranking_top_k=RANKING_LOSS_TOP_K,
         ),
-        **selection_metrics(true_phi, pred_phi, baseline),
-        **per_component_metrics(true_deltas, pred_deltas, ("psnr", "clip"), chosen, baseline),
-        **comparison_metrics(true_phi, true_raw, ("psnr", "clip"), chosen, baseline),
+        **selection_metrics(true_phi, pred_phi, default_cell),
+        **per_component_metrics(true_deltas, pred_deltas, ("psnr", "clip"), chosen, default_cell),
+        **comparison_metrics(true_phi, dataset.y_raw.double(), ("psnr", "clip"), chosen, default_cell),
     }
 
 
@@ -254,17 +244,14 @@ def eval_selection(
 Training.
 """
 
-def train(
-    splits_df: dict[str, tuple[pd.DataFrame, pd.DataFrame]],
-    device: torch.device,
-) -> Path:
+def train(device: torch.device) -> Path:
     """
     Train the grid surface predictor and save run artifacts.
 
     Saves regressor_weights.pt {regressor_state_dict, target_mean, target_std,
-    target_cols, prediction_space, img_shape (C, S, S), text_shape (1, D),
-    cell_t_pairs, t_start_values, t_end_values}, mean_surface.pt,
-    id_to_split.csv, and regression_metrics.json.
+    target_cols, prediction_space, image_shape, source_shape, cell_t_pairs,
+    t_start_values, t_end_values}, and regression_metrics.json.
+    id_to_split.csv and mean_surface.pt are written by get_dataset.
     """
 
     # Create run directory to save information to.
@@ -274,70 +261,52 @@ def train(
     save_run_settings(run_dir)
     print(f"Saved settings")
 
-    # Build device-resident cell tensors for the train, val, and test sets.
-    train_X = splits_df["train"][0]
-    splits_cells = create_cell_tensors(splits_df, device)
-    train_cells, val_cells, test_cells = splits_cells["train"], splits_cells["val"], splits_cells["test"]
+    # Build the device-resident datasets; get_dataset writes id_to_split.csv
+    # (or replays an existing one) and the mean surface into run_dir.
+    bundle = get_dataset(device, run_dir)
+    train_ds, val_ds, test_ds = bundle.train, bundle.val, bundle.test
+    meta = bundle.meta
+    train_X = bundle.splits_df["train"][0]
+    test_note = f" (from {PIE_BENCH_DIR_NAME})" if PIE_BENCH else ""
+    print(
+        f"Dataset splits:\n"
+        f"  train: {train_ds.n_samples * meta.n_cells} cells ({train_ds.n_samples} samples)\n"
+        f"  val: {val_ds.n_samples * meta.n_cells} cells ({val_ds.n_samples} samples)\n"
+        f"  test: {test_ds.n_samples * test_ds.y.shape[1]} cells ({test_ds.n_samples} samples){test_note}"
+    )
 
-    # Size the predictor from the token tables and the data's grid. cell_t_pairs
-    # maps output cell k to its canonical sorted (t_start, t_end).
-    img_shape = tuple(int(v) for v in train_cells.emb_table.img.shape[1:])
-    text_shape = tuple(int(v) for v in train_cells.emb_table.src.shape[1:])
-    cell_t_pairs = train_cells.t[train_cells.grid_rows[0]].detach().cpu()
-    t_start_values = torch.as_tensor(np.sort(np.unique(cell_t_pairs[:, 0].numpy())), dtype=torch.float64)
-    t_end_values = torch.as_tensor(np.sort(np.unique(cell_t_pairs[:, 1].numpy())), dtype=torch.float64)
-    clip_table = train_cells.emb_table.clip
-    clip_shape = None if clip_table is None else tuple(int(v) for v in clip_table.shape[1:])
-    # Rows are sorted by (t_start, t_end) inside every grid, so the default cell
-    # sits at the same index in all of them; PIN_DEFAULT_CELL relies on that.
-    default_cells = torch.unique(train_cells.grid_baseline)
-    if default_cells.numel() != 1:
-        raise ValueError(f"Expected one default cell index, got {default_cells.tolist()}")
-    default_cell = int(default_cells.item())
+    # Size the predictor from the bundle's metadata. meta.t maps output cell k
+    # to its canonical sorted (t_start, t_end).
     model = AttentionModel(
-        img_shape, text_shape[-1], train_cells.n_cells, device=device,
-        clip_dim=None if clip_shape is None else clip_shape[-1],
-        default_cell=default_cell,
+        meta.image_shape, meta.source_shape[-1], meta.n_cells, device=device,
+        default_cell=meta.default_cell,
     )
     n_params = sum(p.numel() for p in model.regressor.parameters())
     print(
         f"Predictor: {n_params / 1e6:.2f}M params, "
-        f"img {img_shape}, text {text_shape}, clip {clip_shape}, "
-        f"{train_cells.n_cells} cells, space {PREDICTION_SPACE!r}, visual {IMG_EMB_SOURCE!r}"
+        f"image {meta.image_shape}, text {meta.source_shape}, "
+        f"{meta.n_cells} cells, space {PREDICTION_SPACE!r}, visual {IMG_EMB_SOURCE!r}"
     )
 
+    t_start_values = torch.as_tensor(np.sort(np.unique(meta.t[:, 0].numpy())), dtype=torch.float64)
+    t_end_values = torch.as_tensor(np.sort(np.unique(meta.t[:, 1].numpy())), dtype=torch.float64)
     grid_shape = (len(t_start_values), len(t_end_values))
 
     run = init_run(run_dir, {
         "n_params": n_params,
-        "img_shape": list(img_shape),
-        "text_shape": list(text_shape),
-        "clip_shape": None if clip_shape is None else list(clip_shape),
-        "n_cells": int(train_cells.n_cells),
+        "image_shape": list(meta.image_shape),
+        "source_shape": list(meta.source_shape),
+        "n_cells": int(meta.n_cells),
         "grid": f"{grid_shape[0]}x{grid_shape[1]}",
-        "n_train_samples": int(train_cells.n_grids),
-        "n_val_samples": int(val_cells.n_grids),
-        "n_test_samples": int(test_cells.n_grids),
+        "n_train_samples": int(train_ds.n_samples),
+        "n_val_samples": int(val_ds.n_samples),
+        "n_test_samples": int(test_ds.n_samples),
     })
-
-    # The mean surface is a mean *delta* surface, so it is only meaningful while
-    # the targets are still deltas (see _helpers.calc_mean_surface).
-    mean_surfaces: dict[str, torch.Tensor | None] = {name: None for name in splits_cells}
-    if PREDICTION_SPACE != "raws":
-        surface = calc_mean_surface(train_cells)
-        surface_path = save_mean_surface(run_dir, surface)
-        print(f"Saved {surface_path.stem}")
-        if PREDICTION_SPACE == "residuals":
-            # Anchor each cell on the train split's mean, so the heads only have
-            # to predict how a sample deviates from the population surface.
-            for name, cells in splits_cells.items():
-                mean_surfaces[name] = gather_at_pairs(surface, cells.t[cells.grid_rows[0]]).to(device=device, dtype=torch.float)
-                cells.y.sub_(gather_at_pairs(surface, cells.t).to(cells.y))
 
     # Only "raws" needs standardization; the delta spaces are already
     # commensurate and keep the buffers at identity.
     if PREDICTION_SPACE == "raws":
-        y_train = train_cells.y.detach().float().cpu()
+        y_train = train_ds.y.detach().float().reshape(-1, train_ds.y.shape[-1]).cpu()
         model.regressor.set_target_standardization(y_train.mean(0), y_train.std(0))
     print(
         "Target columns (train):\n"
@@ -355,6 +324,7 @@ def train(
     scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, EPOCHS)) if LR_SCHEDULER == "cosine" else None)
 
     y_mean, y_std = model.regressor.target_mean, model.regressor.target_std
+    loader = get_dataloader(train_ds, shuffle=True)
 
     try:
         # Train the model.
@@ -363,8 +333,7 @@ def train(
         best_epoch, since_improved = 0, 0
         best_val_loss = float("inf")
         history: list[dict] = []
-        n_cells, n_samples = len(train_X), train_X[SAMPLE_ID_COL].nunique()
-        grids_per_batch = max(1, int(GRIDS_PER_BATCH))
+        n_cells, n_samples = len(train_X), train_ds.n_samples
         ema_state = {k: v.detach().clone() for k, v in model.regressor.state_dict().items()} if EMA_DECAY > 0 else None
 
         # Iterate over the epochs.
@@ -373,11 +342,14 @@ def train(
             model.regressor.train()
 
             # Iterate over the batches.
-            for (img, src, tar, clip, tmask, y), baseline in train_cells.iter_grids(grids_per_batch, shuffle=True):
+            for batch in loader:
 
                 # Forward pass. Targets are z-scored to match the head outputs.
-                out = model.regressor(img, src, tar, clip, tmask)
-                loss = calc_loss(out, (y - y_mean) / y_std, baseline, mean_surfaces["train"])
+                out = model.regressor(
+                    batch.image_tokens, batch.source_tokens, batch.target_tokens,
+                    batch.source_mask, batch.target_mask,
+                )
+                loss = calc_loss(out, (batch.y - y_mean) / y_std, batch.default_cell, train_ds.mean_surface)
 
                 # Backpropagate the loss.
                 optimizer.zero_grad()
@@ -403,10 +375,10 @@ def train(
                 model.regressor.load_state_dict(ema_state)
 
             # Evaluate regression and selection on train and val.
-            train_regression = eval_regression(model, train_cells, device, mean_surfaces["train"])
-            train_selection = eval_selection(model, train_cells, mean_surface=mean_surfaces["train"])
-            val_regression = eval_regression(model, val_cells, device, mean_surfaces["val"])
-            val_selection = eval_selection(model, val_cells, mean_surface=mean_surfaces["val"])
+            train_regression = eval_regression(model, train_ds)
+            train_selection = eval_selection(model, train_ds)
+            val_regression = eval_regression(model, val_ds)
+            val_selection = eval_selection(model, val_ds)
 
             log_epoch(
                 run, epoch, train_regression, train_selection, val_regression, val_selection,
@@ -442,10 +414,9 @@ def train(
                     "target_std": model.regressor.target_std.cpu(),
                     "target_cols": list(TARGET_COLS),
                     "prediction_space": str(PREDICTION_SPACE),
-                    "img_shape": img_shape,
-                    "text_shape": text_shape,
-                    "clip_shape": clip_shape,
-                    "cell_t_pairs": cell_t_pairs,
+                    "image_shape": meta.image_shape,
+                    "source_shape": meta.source_shape,
+                    "cell_t_pairs": meta.t,
                     "t_start_values": t_start_values,
                     "t_end_values": t_end_values,
                 }, weights_out)
@@ -481,8 +452,8 @@ def train(
         checkpoint = torch.load(weights_out, map_location=device, weights_only=False)
         model.regressor.load_state_dict(checkpoint["regressor_state_dict"])
 
-        results = eval_regression(model, test_cells, device, mean_surfaces["test"])
-        test_sel = eval_selection(model, test_cells, mean_surface=mean_surfaces["test"])
+        results = eval_regression(model, test_ds)
+        test_sel = eval_selection(model, test_ds)
         print("\n" + format_metric_table([("test", results, test_sel)]))
 
         # Summary rather than log, so the runs table ranks on final quality
@@ -493,8 +464,7 @@ def train(
             best_epoch, len(history),
         )
 
-        # Save the splits and metrics.
-        save_splits_df(train_X, splits_df["val"][0], splits_df["test"][0], run_dir)
+        # Save metrics. Splits membership and mean surface were written by get_dataset.
         metrics_out = run_dir / "regression_metrics.json"
         with open(metrics_out, "w") as f:
             json.dump({
@@ -510,7 +480,7 @@ def train(
             }, f, indent=4)
 
         return run_dir
-    
+
     finally:
         # Always close the run: a crash mid-training should still leave a
         # finished (and correctly marked) run rather than a dangling one.
@@ -526,20 +496,10 @@ def main() -> None:
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
-    # Load, prepare, and split the data into train/val/test sets.
-    splits_df = build_splits_df()
-    train_X, val_X, test_X = splits_df["train"][0], splits_df["val"][0], splits_df["test"][0]
-    test_note = f" (from {PIE_BENCH_DIR_NAME})" if PIE_BENCH else ""
-    print(
-        f"Dataset splits:\n"
-        f"  train: {len(train_X)} cells ({train_X[SAMPLE_ID_COL].nunique()} samples)\n"
-        f"  val: {len(val_X)} cells ({val_X[SAMPLE_ID_COL].nunique()} samples)\n"
-        f"  test: {len(test_X)} cells ({test_X[SAMPLE_ID_COL].nunique()} samples){test_note}"
-    )
-
-    # Initialize the model and train it.
+    # Splits are built inside train() so get_dataset can write id_to_split.csv
+    # and the mean surface into the run directory.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    run_dir = train(splits_df, device)
+    run_dir = train(device)
     print(f"\nSaved to {run_dir.resolve()}")
 
 

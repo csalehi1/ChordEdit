@@ -25,7 +25,7 @@ import torch
 
 from _helpers import *
 from metrics import *
-
+from scores import calc_norm_deltas
 
 # Parse command line arguments.
 def parse_args() -> argparse.Namespace:
@@ -41,35 +41,27 @@ _ARGS = parse_args()
 RUN_DIR = resolve_run_dir(load_live_settings().RUNS_DIR if _ARGS.run_dir is None else None, _ARGS.run_dir)
 load_run_settings(RUN_DIR)
 
-from _data import ID_TO_SPLIT_NAME, df_to_metric_grids, load_split_df
-from embeddings import get_embeddings_by_sample
+from dataset import ID_TO_SPLIT_NAME, get_dataset
 from model import TimestepSelector, load_timestep_selector
 from settings import *
 
 
 def labeled_surfaces(
-    true_phi: np.ndarray,   # (S, n_start, n_end), NaN outside the labeled set
-    pred_phi: np.ndarray,
-    default_i: int,
-    default_j: int,
+    true_phi: np.ndarray,   # (S, n_cells)
+    pred_phi: np.ndarray,   # (S, n_cells)
+    default_cell: int,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Flatten the phi grids to the cells labeled for every test image.
-
-    Keeping one candidate set for all images is what makes their ranks
-    comparable. Returns (true, pred, default_col) ready for metrics.py.
-    """
-    n = true_phi.shape[0]
-    flat_true = true_phi.reshape(n, -1)
-    flat_pred = pred_phi.reshape(n, -1)
-    keep = np.isfinite(flat_true).all(axis=0) & np.isfinite(flat_pred).all(axis=0)
-    default_flat = default_i * true_phi.shape[2] + default_j
-    if not keep[default_flat]:
-        raise ValueError("The default cell is not labeled for every test image")
-
+    """Pack true/pred phi for metrics.py. Every sample shares the same cells."""
+    if true_phi.shape != pred_phi.shape:
+        raise ValueError(f"Expected {true_phi.shape} == {pred_phi.shape}")
+    if not (0 <= default_cell < true_phi.shape[-1]):
+        raise ValueError(f"Expected default_cell in [0, {true_phi.shape[-1]}), got {default_cell}")
+    if not np.isfinite(true_phi).all() or not np.isfinite(pred_phi).all():
+        raise ValueError("Expected finite packed phi")
     return (
-        torch.as_tensor(flat_true[:, keep], dtype=torch.float64),
-        torch.as_tensor(flat_pred[:, keep], dtype=torch.float64),
-        int(np.cumsum(keep)[default_flat] - 1),
+        torch.as_tensor(true_phi, dtype=torch.float64),
+        torch.as_tensor(pred_phi, dtype=torch.float64),
+        int(default_cell),
     )
 
 
@@ -77,7 +69,8 @@ def eval(run_dir: Path) -> dict:
     """Select (t_start, t_end) for every sample and score the test split."""
     print(f"Using settings from {run_dir / 'settings.json'}")
 
-    # Confirm that the run artifacts exist.
+    # Confirm that the run artifacts exist. get_splits_df writes this file on a
+    # new split; if it is missing here, do not draw a fresh split.
     splits_path = run_dir / ID_TO_SPLIT_NAME
     weights_path = run_dir / "regressor_weights.pt"
     if not splits_path.exists():
@@ -85,57 +78,58 @@ def eval(run_dir: Path) -> dict:
     if not weights_path.exists():
         raise FileNotFoundError(f"Missing {weights_path=}.")
 
-    # Load all splits but metrics stay on test, the selections CSV covers every sample.
-    splits = load_split_df(run_dir)
-    all_df = pd.concat([splits["train"], splits["val"], splits["test"]], ignore_index=True)
-    test_df = splits["test"]
-    all_sample_ids = sorted(all_df[SAMPLE_ID_COL].unique())
-    test_sample_ids = sorted(test_df[SAMPLE_ID_COL].unique())
-    test_pos = {sid: k for k, sid in enumerate(test_sample_ids)}
-    t_start_values = sorted(all_df[T_START_COL].unique())
-    t_end_values = sorted(all_df[T_END_COL].unique())
-
     # Load the predictor and wrap it in the selector. The checkpoint carries the
     # grid contract, and the mean surface is pulled in when the space needs it.
     device = resolve_device()
     print(f"Device: {device}.")
     t_selector = load_timestep_selector(weights_path, device=device)
-    default_i, default_j = t_selector._default_i, t_selector._default_j
     n_labeled_pairs = len(t_selector._cell_i)
+    default_k = t_selector._default_k
+    cell_i, cell_j = t_selector._cell_i, t_selector._cell_j
 
-    # Load embeddings for every sample and true test metrics for evaluation.
-    emb = get_embeddings_by_sample(all_df.drop_duplicates(SAMPLE_ID_COL), device)
-    true_psnr, _ = df_to_metric_grids(test_df, test_sample_ids, t_start_values, t_end_values, PSNR_COL)
-    true_clip, _ = df_to_metric_grids(test_df, test_sample_ids, t_start_values, t_end_values, CLIP_COL)
-    true_phi = score_metric_grids(true_psnr, true_clip, default_i * len(t_end_values) + default_j)
+    # Replay the run's split membership; the selections CSV covers every
+    # sample, metrics stay on test.
+    bundle = get_dataset(device, run_dir)
+    test_ds = bundle.test
+    test_sample_ids = list(test_ds.sample_ids)
+    test_pos = {sid: k for k, sid in enumerate(test_sample_ids)}
 
-    # Select (t_start, t_end) for every sample; fill pred grids only for test metrics.
-    pred_psnr, pred_clip, pred_phi = np.zeros_like(true_psnr), np.zeros_like(true_clip), np.zeros_like(true_phi)
+    # True test metrics: y_raw is (S, n_cells, 2) in the same canonical
+    # (t_start, t_end)-sorted cell order the selector's cell_t_pairs use.
+    true_raw = test_ds.y_raw.double().cpu()
+    true_phi = calc_phi(calc_norm_deltas(true_raw, default_k)).numpy()
+
+    # Select (t_start, t_end) for every sample; fill packed pred phi for test metrics.
+    pred_phi = np.zeros_like(true_phi)
     all_selections: list[dict[str, float | str | bool]] = []
-    for sid in all_sample_ids:
-        e = emb[sid]
-        grid = t_selector.pred_grid(e["img"], e["src"], e["tar"], e.get("clip"), e.get("tmask"))
-        sel = t_selector.select_grid(
-            grid,
-            noise_floor=NOISE_FLOOR_PHI,
-            clip_floor=SELECT_CLIP_FLOOR,
-            phi_weights=SELECT_PHI_WEIGHTS,
-        )
-        all_selections.append({
-            "sample_id": sid,
-            "t_start": sel.t_start,
-            "t_end": sel.t_end,
-            "deviate": sel.deviate,
-            "pred_gain": sel.pred_gain,
-        })
-        if sid in test_pos:
-            k = test_pos[sid]
-            pred_psnr[k], pred_clip[k], pred_phi[k] = grid.psnr_grid, grid.clip_grid, grid.phi_grid
+    for name in ("train", "val", "test"):
+        split = bundle.splits[name]
+        for sid in split.sample_ids:
+            x = split[sid].x
+            grid = t_selector.pred_grid(
+                x.image_tokens, x.source_tokens, x.target_tokens, x.source_mask, x.target_mask,
+            )
+            sel = t_selector.select_grid(
+                grid,
+                noise_floor=NOISE_FLOOR_PHI,
+                clip_floor=SELECT_CLIP_FLOOR,
+                phi_weights=SELECT_PHI_WEIGHTS,
+            )
+            all_selections.append({
+                "sample_id": sid,
+                "t_start": sel.t_start,
+                "t_end": sel.t_end,
+                "deviate": sel.deviate,
+                "pred_gain": sel.pred_gain,
+            })
+            if name == "test":
+                pred_phi[test_pos[sid]] = grid.phi_grid[cell_i, cell_j]
 
+    all_selections.sort(key=lambda s: s["sample_id"])
     test_selections = [s for s in all_selections if s["sample_id"] in test_pos]
 
     # Compute metrics on the test selections only.
-    t_phi, p_phi, default_col = labeled_surfaces(true_phi, pred_phi, default_i, default_j)
+    t_phi, p_phi, default_col = labeled_surfaces(true_phi, pred_phi, default_k)
     training = training_metrics(
         t_phi, p_phi, default_col,
         mse_weight=MSE_LOSS_WEIGHT,
@@ -147,7 +141,7 @@ def eval(run_dir: Path) -> dict:
     metrics = {
         "run_dir": str(run_dir),
         "n_test_images": len(test_sample_ids),
-        "grid": f"{len(t_start_values)}x{len(t_end_values)}",
+        "grid": f"{t_selector.n_start}x{t_selector.n_end}",
         "n_labeled_pairs": int(n_labeled_pairs),
         "n_scored_cells": int(t_phi.shape[-1]),
         "prediction_space": str(PREDICTION_SPACE),
@@ -175,7 +169,7 @@ def eval(run_dir: Path) -> dict:
         [{"sample_id": s["sample_id"], start_col: s["t_start"], end_col: s["t_end"]} for s in all_selections]
     ).to_csv(out_predictions, index=False)
 
-    print(f"Selector eval on {len(test_sample_ids)} test images ({len(all_sample_ids)} selections)  run={run_dir.name}")
+    print(f"Selector eval on {len(test_sample_ids)} test images ({len(all_selections)} selections)  run={run_dir.name}")
     print(f"  regret median={metrics['regret_median']:.4f}  p90={metrics['regret_p90']:.4f}")
     print(
         f"  rho_phi={metrics['spearman_phi_median']:.4f}  gain={metrics['gain_mean']:.4f}  "

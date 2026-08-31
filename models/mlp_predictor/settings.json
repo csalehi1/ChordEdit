@@ -29,7 +29,7 @@
   "PREDICTION_SPACE": "residuals",
   "MAX_SAMPLES": null,
   "CKPT_METRIC": "val_phi_spearman",
-  "GRIDS_PER_BATCH": 32,
+  "SAMPLES_PER_BATCH": 32,
   "RANKING_LOSS_WEIGHT": 3.0,
   "RANKING_TOP_K": 0,
   "PSNR_LOSS_WEIGHT": 1.0,

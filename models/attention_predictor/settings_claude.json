@@ -35,7 +35,7 @@
   "EARLY_STOP_PATIENCE": 0,
   "EMA_DECAY": 0.0,
   "CKPT_METRIC": "val_phi_spearman",
-  "GRIDS_PER_BATCH": 32,
+  "SAMPLES_PER_BATCH": 32,
   "MSE_LOSS_WEIGHT": 3.0,
   "MSE_LOSS_TOP_K": null,
   "RANKING_LOSS_WEIGHT": 3.0,
