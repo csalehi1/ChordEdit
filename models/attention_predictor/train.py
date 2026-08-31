@@ -87,11 +87,11 @@ def calc_loss(
     baseline_idx: torch.Tensor,                # (G,)
     mean_surface: torch.Tensor | None = None,  # (n_cells, 2)
 ) -> torch.Tensor:
-    """Weighted phi MSE, pairwise ranking, listwise CE, and per-column MSE.
+    """Weighted phi MSE, pairwise ranking, and per-column MSE.
 
-    A weight of 0 drops that term. The first three live in phi space, where
-    error trades freely between the two metric columns; column_loss is the only
-    term that holds each head to its own column.
+    A weight of 0 drops that term. The first two live in phi space, where error
+    trades freely between the two metric columns; column_loss is the only term
+    that holds each head to its own column.
     """
 
     def mse_loss(
@@ -125,20 +125,6 @@ def calc_loss(
             return pred_phi.new_zeros(())
         return torch.nn.functional.softplus(-diff_pred[mask]).mean()
 
-    def listwise_loss(
-        pred_phi: torch.Tensor,
-        true_phi: torch.Tensor,
-        tau: float,
-    ) -> torch.Tensor:
-        """Soft cross-entropy of softmax(pred/tau) against softmax(true/tau).
-
-        Puts the gradient where the selector reads, at the top of the ranking,
-        rather than spreading it over the easy far-apart pairs that dominate the
-        pairwise term.
-        """
-        target = torch.softmax(true_phi / tau, dim=-1)
-        return -(target * torch.log_softmax(pred_phi / tau, dim=-1)).sum(dim=-1).mean()
-
     def column_loss(
         pred_deltas: torch.Tensor,
         true_deltas: torch.Tensor,
@@ -161,8 +147,6 @@ def calc_loss(
         loss = loss + MSE_LOSS_WEIGHT * mse_loss(pred_phi, true_phi, top_k=MSE_LOSS_TOP_K)
     if RANKING_LOSS_WEIGHT > 0:
         loss = loss + RANKING_LOSS_WEIGHT * ranking_loss(pred_phi, true_phi, top_k=RANKING_LOSS_TOP_K)
-    if LISTWISE_LOSS_WEIGHT > 0:
-        loss = loss + LISTWISE_LOSS_WEIGHT * listwise_loss(pred_phi, true_phi, LISTWISE_TAU)
     if PSNR_LOSS_WEIGHT > 0 or CLIP_LOSS_WEIGHT > 0:
         loss = loss + column_loss(pred_deltas, true_deltas)
     return loss

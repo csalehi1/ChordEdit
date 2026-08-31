@@ -326,6 +326,19 @@ def get_embeddings_by_sample(
     sample_ids, img_emb, src_emb, tar_emb = get_embeddings_mixed(samples)
     img_emb, src_emb, tar_emb = img_emb.to(device), src_emb.to(device), tar_emb.to(device)
 
+    # The token path swaps the pooled prompt vectors for the full (77, D)
+    # sequences and their padding masks, which the regressor requires. Mirrors
+    # _data.build_embedding_table so train.py and the selector see one thing.
+    text_masks = None
+    if TEXT_EMB_SOURCE == "tokens":
+        if PIE_BENCH:
+            raise NotImplementedError("TEXT_EMB_SOURCE='tokens' has no PIE-Bench path yet")
+        tok_ids, src_tok, tar_tok, src_msk, tar_msk = get_text_token_tables(samples)
+        order = {sid: i for i, sid in enumerate(tok_ids)}
+        idx = [order[sid] for sid in sample_ids]
+        src_emb, tar_emb = src_tok[idx].to(device), tar_tok[idx].to(device)
+        text_masks = torch.stack([src_msk[idx], tar_msk[idx]], dim=1).to(device)
+
     # The CLIP table is keyed by the frame's row order, so reindex it onto
     # sample_ids the packed loader returned.
     clip_emb = None
@@ -339,6 +352,7 @@ def get_embeddings_by_sample(
         "src": src_emb[i],
         "tar": tar_emb[i],
         "clip": None if clip_emb is None else clip_emb[i],
+        "tmask": None if text_masks is None else text_masks[i],
     } for i, sid in enumerate(sample_ids)}
 
 

@@ -177,18 +177,16 @@ PATCH_SIZE = int(_cfg("PATCH_SIZE"))
 if PATCH_SIZE < 1 or LATENT_SIDE % PATCH_SIZE != 0:
     raise ValueError(f"Expected {PATCH_SIZE=} to divide {LATENT_SIDE=}")
 
-# Learned positional embedding on the visual tokens. The paper's F_v has none.
-USE_POS_EMB = bool(_cfg("USE_POS_EMB"))
-
 ATTN_DROPOUT = float(_cfg("ATTN_DROPOUT"))
 
 # Number of pre-LN [cross-attention, FFN] residual blocks grounding the prompt
-# queries in the visual tokens. 1 with USE_ATTN_RESIDUAL off is the paper's bare
-# nn.MultiheadAttention with no residual, no norm, and no FFN.
+# queries in the visual tokens. The residual add is unconditional: without it
+# the block returns the attention output alone, which is a convex combination of
+# value vectors and so a function of the image only, and the predictor collapses
+# to a constant surface. See docs/RESULTS_CLAUDE.md section 5.
 ATTN_LAYERS = int(_cfg("ATTN_LAYERS", 1))
 if ATTN_LAYERS < 1:
     raise ValueError(f"Expected {ATTN_LAYERS=} >= 1")
-USE_ATTN_RESIDUAL = bool(_cfg("USE_ATTN_RESIDUAL", False))
 # Hidden width of each block's FFN, as a multiple of ATTN_DIM. 0 drops the FFN.
 FFN_MULT = float(_cfg("FFN_MULT", 0.0))
 
@@ -213,21 +211,6 @@ if TEXT_EMB_SOURCE not in ("pooled", "tokens"):
 # a few words, so the masked mean is mostly shared scaffold and the pooled
 # difference is attenuated by ~1/L; this pools what changed. Needs "tokens".
 USE_DIFF_SALIENCY = bool(_cfg("USE_DIFF_SALIENCY", False))
-
-# LayerNorm each z_edit segment separately instead of once over the whole
-# concatenation, so the small difference segments are not dominated by the two
-# large concat segments. Null keeps the single LayerNorm(4 * d).
-USE_SEGMENT_NORM = bool(_cfg("USE_SEGMENT_NORM", False))
-
-# Learned key/value token a query can attend to instead of the image. Target
-# tokens naming content that is not in the source image otherwise have to spend
-# their whole softmax mass on patches that do not match them.
-USE_NULL_TOKEN = bool(_cfg("USE_NULL_TOKEN", False))
-
-# Subtract the predicted default cell from every cell, so the prediction there
-# is exactly 0 as the true delta is by construction. Removes a degree of
-# freedom the heads otherwise spend learning that constraint.
-PIN_DEFAULT_CELL = bool(_cfg("PIN_DEFAULT_CELL", False))
 
 # LayerScale on each residual branch, so the block starts near-identity and the
 # text path is intact at init. Null is a plain residual add.
@@ -264,15 +247,6 @@ RANKING_LOSS_TOP_K = None if _RANKING_LOSS_TOP_K is None else int(_RANKING_LOSS_
 # both is the phi-only objective.
 PSNR_LOSS_WEIGHT = float(_cfg("PSNR_LOSS_WEIGHT", 0.0))
 CLIP_LOSS_WEIGHT = float(_cfg("CLIP_LOSS_WEIGHT", 0.0))
-
-# Listwise soft cross-entropy between softmax(pred_phi / tau) and
-# softmax(true_phi / tau) over the candidate cells. Pairwise ranking spends most
-# of its mass on easy far-apart pairs; this concentrates it at the top of the
-# ranking, which is what the selector reads.
-LISTWISE_LOSS_WEIGHT = float(_cfg("LISTWISE_LOSS_WEIGHT", 0.0))
-LISTWISE_TAU = float(_cfg("LISTWISE_TAU", 0.1))
-if LISTWISE_TAU <= 0:
-    raise ValueError(f"Expected {LISTWISE_TAU=} > 0")
 
 # Select from "none" or "cosine".
 LR_SCHEDULER = str(_cfg("LR_SCHEDULER"))
@@ -317,7 +291,7 @@ SCORE_PHI_DF = partial(score_df, score_fn=_SCORE_FN, **_SCORE_KW)  # DataFrame
 SCORE_COL = f"{SCORE_FN}_score"
 
 # Baseline timestep bounds from the ChordEdit paper.
-# NOTE: Must be set to match (0.9-t_delta, 0.3)
+# NOTE: Must be set to match (0.85+t_delta, 0.3)
 DEFAULT_T_START = float(_cfg("DEFAULT_T_START"))
 DEFAULT_T_END = float(_cfg("DEFAULT_T_END"))
 

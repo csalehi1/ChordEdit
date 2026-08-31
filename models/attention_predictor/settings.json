@@ -13,7 +13,6 @@
   "ATTN_DIM": 512,
   "N_HEADS": 8,
   "PATCH_SIZE": 1,
-  "USE_POS_EMB": false,
   "ATTN_DROPOUT": 0.0,
   "COMBINER_HIDDEN": 512,
   "COMBINER_DROPOUT": 0.0,

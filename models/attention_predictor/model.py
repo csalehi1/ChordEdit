@@ -54,6 +54,35 @@ def deltas_from_preds(
     raise ValueError(f"Unknown {PREDICTION_SPACE=}")
 
 
+# The true Delta at the default cell is identically 0 by construction, so the
+# heads' predicted surface is re-baselined there rather than left to learn it.
+# That only holds where the targets are deltas: under "raws" the metric value at
+# the default cell is not 0 and subtracting it would corrupt the target space.
+PIN_DEFAULT_CELL = PREDICTION_SPACE in ("deltas", "residuals")
+
+
+def default_cell_index(
+    cell_t_pairs: np.ndarray,  # (n_cells, 2)
+    t_start_values: np.ndarray,
+    t_end_values: np.ndarray,
+    default_t_start: float = DEFAULT_T_START,
+    default_t_end: float = DEFAULT_T_END,
+) -> int:
+    """Position of the default cell in the model's output cell order."""
+    cell_t_pairs = np.asarray(cell_t_pairs, dtype=np.float64)
+    cell_i = nearest_indices(t_start_values, cell_t_pairs[:, 0])
+    cell_j = nearest_indices(t_end_values, cell_t_pairs[:, 1])
+    default_i = _nearest_index(t_start_values, default_t_start)
+    default_j = _nearest_index(t_end_values, default_t_end)
+    found = np.flatnonzero((cell_i == default_i) & (cell_j == default_j))
+    if found.size != 1:
+        raise ValueError(
+            f"Expected exactly one cell at the default "
+            f"({default_t_start}, {default_t_end}), got {found.size}"
+        )
+    return int(found[0])
+
+
 def combine_edit_features(f_src: torch.Tensor, f_tar: torch.Tensor) -> torch.Tensor:
     """Create difference-aware edit representation, z_edit."""
     return torch.cat([f_src, f_tar, f_tar - f_src, f_src * f_tar], dim=-1)
@@ -68,27 +97,26 @@ VisionFeaturizer: spatial flattening + VisionProjector (P_v) -> F_v.
 """
 
 class VisionProjector(nn.Module):
-    """Project flattened visual tokens to attn_dim, P_v."""
+    """Project flattened visual tokens to attn_dim, P_v.
+
+    No positional embedding: the paper's F_v has none, and a learned one was
+    net-negative at every patch size both before and after the residual fix
+    (docs/RESULTS_CLAUDE.md section 13).
+    """
 
     def __init__(
         self,
         token_dim: int,
         attn_dim: int,
-        n_tokens: int,
-        use_pos_emb: bool = USE_POS_EMB,
     ):
         super().__init__()
         self.proj = nn.Linear(token_dim, attn_dim)
-        self.pos_emb = nn.Parameter(torch.zeros(n_tokens, attn_dim)) if use_pos_emb else None
 
     def forward(
         self,
         tokens: torch.Tensor,  # (N, N_v, token_dim)
     ) -> torch.Tensor:         # (N, N_v, d)
-        tokens = self.proj(tokens)
-        if self.pos_emb is not None:
-            tokens = tokens + self.pos_emb
-        return tokens
+        return self.proj(tokens)
 
 
 class VisionFeaturizer(nn.Module):
@@ -106,7 +134,6 @@ class VisionFeaturizer(nn.Module):
         img_shape: tuple[int, int, int],
         attn_dim: int = ATTN_DIM,
         patch_size: int = PATCH_SIZE,
-        use_pos_emb: bool = USE_POS_EMB,
         img_emb_source: str = IMG_EMB_SOURCE,
         clip_dim: int | None = None,
     ):
@@ -126,9 +153,7 @@ class VisionFeaturizer(nn.Module):
         self.token_dim = channels * patch_size ** 2
         self.img_emb_source = str(img_emb_source)
         self.use_latent = self.img_emb_source in ("vae", "vae+clip")
-        self.projector = VisionProjector(
-            self.token_dim, attn_dim, self.n_tokens, use_pos_emb=use_pos_emb,
-        ) if self.use_latent else None
+        self.projector = VisionProjector(self.token_dim, attn_dim) if self.use_latent else None
 
         self.clip_projector = None
         if self.img_emb_source != "vae":
@@ -258,6 +283,21 @@ def diff_saliency(
     return (torch.stack([w_src, w_tar], dim=1) * masks).clamp(min=0.0).detach()
 
 
+def append_null_token(
+    tokens: torch.Tensor,      # (N, N_v, d)
+    null_token: torch.Tensor,  # (1, 1, d)
+) -> torch.Tensor:             # (N, N_v + 1, d)
+    """Append the learned null key/value token to the visual tokens.
+
+    Unconditional. A query naming content that is not in the source image would
+    otherwise have to spend its whole softmax mass on patches that do not match
+    it, and under IMG_EMB_SOURCE "clip" the visual sequence is a single token, so
+    without the null key the softmax is over one element -- weight identically 1
+    -- and cross-attention degenerates into a query-independent linear map.
+    """
+    return torch.cat([tokens, null_token.expand(tokens.shape[0], -1, -1)], dim=-2)
+
+
 class TokenGrounder(nn.Module):
     """Ground every prompt token in the visual tokens, then pool over real tokens.
 
@@ -275,22 +315,21 @@ class TokenGrounder(nn.Module):
         n_layers: int = ATTN_LAYERS,
         ffn_mult: float = FFN_MULT,
         layerscale_init: float | None = LAYERSCALE_INIT,
-        use_null_token: bool = USE_NULL_TOKEN,
     ):
         super().__init__()
         self.kv_norm = nn.LayerNorm(attn_dim)  # once: the visual tokens are static
         self.layers = nn.ModuleList([
             CrossAttentionBlock(
                 attn_dim, n_heads, dropout_rate,
-                residual=True, ffn_mult=ffn_mult, layerscale_init=layerscale_init,
+                ffn_mult=ffn_mult, layerscale_init=layerscale_init,
                 kv_prenorm=False,
             )
             for _ in range(max(1, int(n_layers)))
         ])
         self.out_norm = nn.LayerNorm(attn_dim)
-        # A query naming content that is not in the image can rest here instead
-        # of spending its whole softmax on patches that do not match it.
-        self.null_token = nn.Parameter(torch.zeros(1, 1, attn_dim)) if use_null_token else None
+        # A query naming content that is not in the image rests here instead of
+        # spending its whole softmax on patches that do not match it.
+        self.null_token = nn.Parameter(torch.zeros(1, 1, attn_dim))
 
     @staticmethod
     def _pool(
@@ -308,10 +347,7 @@ class TokenGrounder(nn.Module):
         saliency: torch.Tensor | None = None,  # (N, 2, T)
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         n, two, t, d = queries.shape
-        kv = tokens
-        if self.null_token is not None:
-            kv = torch.cat([kv, self.null_token.expand(n, -1, -1)], dim=-2)
-        kv = self.kv_norm(kv).repeat_interleave(two, dim=0)
+        kv = self.kv_norm(append_null_token(tokens, self.null_token)).repeat_interleave(two, dim=0)
 
         q = queries.reshape(n * two, t, d)
         for layer in self.layers:
@@ -328,12 +364,15 @@ CrossAttentionPooler: CrossAttn(Q=F_t, K=F_v, V=F_v).
 """
 
 class CrossAttentionBlock(nn.Module):
-    """One grounding step, CrossAttn(Q=F_t, K=F_v, V=F_v).
+    """One grounding step, CrossAttn(Q=F_t, K=F_v, V=F_v), as a pre-LN block.
 
-    With residual off this is the paper's bare nn.MultiheadAttention: the
-    attention output replaces the queries outright, with no norm and no FFN. With
-    it on the block becomes the usual pre-LN transformer decoder layer, which is
-    what makes stacking more than one layer meaningful.
+    The residual add is unconditional. Without it the block returns the
+    attention output alone, `sum_i a_i W_v W_p x_i`, a convex combination of
+    value vectors that are functions of the image only; the prompts are queries,
+    so they could influence the output solely by tilting a softmax. That severed
+    the text path and collapsed the predictor to one surface for every input --
+    regret 0.3045 and a single distinct cell over 999 test images, i.e. the
+    best-constant-cell baseline. See docs/RESULTS_CLAUDE.md section 5.
     """
 
     def __init__(
@@ -341,28 +380,26 @@ class CrossAttentionBlock(nn.Module):
         attn_dim: int = ATTN_DIM,
         n_heads: int = N_HEADS,
         dropout_rate: float = ATTN_DROPOUT,
-        residual: bool = USE_ATTN_RESIDUAL,
         ffn_mult: float = FFN_MULT,
         layerscale_init: float | None = LAYERSCALE_INIT,
         kv_prenorm: bool = True,
     ):
         super().__init__()
         self.attn = nn.MultiheadAttention(attn_dim, n_heads, dropout=dropout_rate, batch_first=True)
-        self.residual = bool(residual)
-        self.q_norm = nn.LayerNorm(attn_dim) if self.residual else None
+        self.q_norm = nn.LayerNorm(attn_dim)
         # Hoisted out by TokenGrounder: the keys/values are the same tensor at
         # every layer, so one norm shared across the stack is the same map.
-        self.kv_norm = nn.LayerNorm(attn_dim) if (self.residual and kv_prenorm) else None
+        self.kv_norm = nn.LayerNorm(attn_dim) if kv_prenorm else None
         # LayerScale: at a small init the block is near-identity, so the queries
         # reach the readout unchanged at step 0 and grounding is learned rather
         # than assumed.
         self.gamma_attn = (
             nn.Parameter(float(layerscale_init) * torch.ones(attn_dim))
-            if (self.residual and layerscale_init is not None) else None
+            if layerscale_init is not None else None
         )
         self.gamma_ffn = None
         self.ffn_norm, self.ffn = None, None
-        if self.residual and ffn_mult > 0:
+        if ffn_mult > 0:
             n_hidden = max(1, int(round(ffn_mult * attn_dim)))
             self.ffn_norm = nn.LayerNorm(attn_dim)
             self.ffn = nn.Sequential(
@@ -380,9 +417,6 @@ class CrossAttentionBlock(nn.Module):
         tokens: torch.Tensor,   # (N, N_v, d)
         kv_is_normed: bool = False,
     ) -> torch.Tensor:          # (N, 2, d)
-        if not self.residual:
-            grounded, _ = self.attn(queries, tokens, tokens, need_weights=False)
-            return grounded
         kv = tokens if (kv_is_normed or self.kv_norm is None) else self.kv_norm(tokens)
         grounded, _ = self.attn(self.q_norm(queries), kv, kv, need_weights=False)
         queries = queries + (grounded if self.gamma_attn is None else self.gamma_attn * grounded)
@@ -401,14 +435,14 @@ class CrossAttentionPooler(nn.Module):
         n_heads: int = N_HEADS,
         dropout_rate: float = ATTN_DROPOUT,
         n_layers: int = ATTN_LAYERS,
-        residual: bool = USE_ATTN_RESIDUAL,
         ffn_mult: float = FFN_MULT,
     ):
         super().__init__()
         self.layers = nn.ModuleList([
-            CrossAttentionBlock(attn_dim, n_heads, dropout_rate, residual=residual, ffn_mult=ffn_mult)
+            CrossAttentionBlock(attn_dim, n_heads, dropout_rate, ffn_mult=ffn_mult)
             for _ in range(max(1, int(n_layers)))
         ])
+        self.null_token = nn.Parameter(torch.zeros(1, 1, attn_dim))
 
     def forward(
         self,
@@ -416,6 +450,7 @@ class CrossAttentionPooler(nn.Module):
         tokens: torch.Tensor,   # (N, N_v, d)
     ) -> torch.Tensor:          # (N, 2, d)
         """Return the image-grounded prompt features [f_src; f_tar]."""
+        tokens = append_null_token(tokens, self.null_token)
         for layer in self.layers:
             queries = layer(queries, tokens)
         return queries
@@ -434,22 +469,18 @@ class TextCombiner(nn.Module):
         n_hidden: int = COMBINER_HIDDEN,
         dropout_rate: float = COMBINER_DROPOUT,
         n_segments: int = 4,
-        segment_norm: bool = USE_SEGMENT_NORM,
     ):
         super().__init__()
         self.attn_dim = attn_dim
         self.n_segments = int(n_segments)
         width = self.n_segments * attn_dim
-        # One LayerNorm over the whole concatenation rescales the segments
-        # jointly, so a difference segment that is small because the prompts are
-        # near-duplicates stays small next to the two large concat segments.
-        # Per-segment norms give each term unit scale on its own.
-        self.seg_norms = (
-            nn.ModuleList(nn.LayerNorm(attn_dim) for _ in range(self.n_segments))
-            if segment_norm else None
-        )
+        # Per-segment, not one LayerNorm over the whole concatenation: a single
+        # norm rescales the segments jointly, so a difference segment that is
+        # small because the prompts are near-duplicates -- which they always are
+        # -- stays small next to the two large concat segments. One norm per
+        # segment gives each term unit scale on its own.
+        self.seg_norms = nn.ModuleList(nn.LayerNorm(attn_dim) for _ in range(self.n_segments))
         self.body = nn.Sequential(
-            *([] if segment_norm else [nn.LayerNorm(width)]),
             nn.Linear(width, n_hidden),
             nn.GELU(),
             nn.Dropout(dropout_rate),
@@ -460,9 +491,8 @@ class TextCombiner(nn.Module):
         self,
         z_edit: torch.Tensor,  # (N, n_segments * d)
     ) -> torch.Tensor:         # (N, d)
-        if self.seg_norms is not None:
-            parts = z_edit.split(self.attn_dim, dim=-1)
-            z_edit = torch.cat([nrm(part) for nrm, part in zip(self.seg_norms, parts)], dim=-1)
+        parts = z_edit.split(self.attn_dim, dim=-1)
+        z_edit = torch.cat([nrm(part) for nrm, part in zip(self.seg_norms, parts)], dim=-1)
         return self.body(z_edit)
 
 
@@ -522,9 +552,10 @@ class AttentionRegressor(nn.Module):
         self.use_saliency = bool(USE_DIFF_SALIENCY)
         # True Delta at the default cell is identically 0 by construction, so
         # predicting it is a degree of freedom the heads would otherwise spend
-        # learning a constant.
+        # learning a constant. Off only under "raws", where the constraint is
+        # false; see PIN_DEFAULT_CELL above.
         if PIN_DEFAULT_CELL and default_cell is None:
-            raise ValueError("PIN_DEFAULT_CELL needs the default cell index")
+            raise ValueError(f"{PREDICTION_SPACE=} needs the default cell index")
         self.default_cell = int(default_cell) if PIN_DEFAULT_CELL else None
 
         self.vision_featurizer = VisionFeaturizer(img_shape, attn_dim=attn_dim, clip_dim=clip_dim)
@@ -703,13 +734,9 @@ class TimestepSelector:
 
         # Index of the default cell within that same cell order, so predictions
         # can be re-baselined before they are scattered into the grid.
-        default_cells = np.flatnonzero((self._cell_i == self._default_i) & (self._cell_j == self._default_j))
-        if default_cells.size != 1:
-            raise ValueError(
-                f"Expected exactly one cell at the default "
-                f"({default_t_start}, {default_t_end}), got {default_cells.size}"
-            )
-        self._default_k = int(default_cells[0])
+        self._default_k = default_cell_index(
+            cell_t_pairs, self.t_start_values, self.t_end_values, default_t_start, default_t_end,
+        )
 
         # The mean surface is only an offset for "residuals"; hold it in cell
         # order to match what the model emits.
@@ -846,9 +873,15 @@ def load_timestep_selector(
     img_shape = tuple(int(v) for v in ckpt["img_shape"])
     text_dim = int(tuple(ckpt["text_shape"])[-1])
     clip_shape = ckpt.get("clip_shape")
+    # map_location put these on the model's device; numpy needs them back on host.
+    t_start_values = np.asarray(ckpt["t_start_values"].cpu(), dtype=np.float64)
+    t_end_values = np.asarray(ckpt["t_end_values"].cpu(), dtype=np.float64)
     model = AttentionModel(
         img_shape, text_dim, int(cell_t_pairs.shape[0]), device=device,
         clip_dim=None if clip_shape is None else int(tuple(clip_shape)[-1]),
+        # The regressor re-baselines its surface here, so the index has to be
+        # rebuilt from the checkpoint's own grid axes rather than left None.
+        default_cell=default_cell_index(cell_t_pairs, t_start_values, t_end_values),
     )
     model.regressor.load_state_dict(ckpt["regressor_state_dict"])
     model.regressor.set_target_standardization(ckpt["target_mean"], ckpt["target_std"])
@@ -856,10 +889,6 @@ def load_timestep_selector(
 
     # The checkpoint carries the training grid's axes, so the selector's grid is
     # the data's by construction.
-    # map_location put these on the model's device; numpy needs them back on host.
-    t_start_values = np.asarray(ckpt["t_start_values"].cpu(), dtype=np.float64)
-    t_end_values = np.asarray(ckpt["t_end_values"].cpu(), dtype=np.float64)
-
     mean_surface = None
     if PREDICTION_SPACE == "residuals":
         surface = load_mean_surface(weights_path.parent)

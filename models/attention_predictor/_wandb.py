@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 from _helpers import current_commit_id
 from settings import *
 
-
+ 
 USE_WANDB = True
 WANDB_ENTITY = "dfmirick-harvard-university"
 WANDB_PROJECT = "attention-predictor"

@@ -1,4 +1,5 @@
 {
+  "_1_fidelity": "The paper's architecture minus the bare cross-attention block: the residual add, the per-segment z_edit norm, the null key/value token and the default-cell pinning are unconditional in model.py, and USE_POS_EMB is gone (the paper has none anyway). This file no longer reproduces docs/RESULTS.md's collapsed numbers.",
   "CHORD_EDIT_MODEL": "sd_turbo",
   "DIR_NAME": "UltraEdit_Region_10000",
   "TARGET_T_DELTA": 0.0,
@@ -13,7 +14,6 @@
   "ATTN_DIM": 512,
   "N_HEADS": 8,
   "PATCH_SIZE": 1,
-  "USE_POS_EMB": false,
   "ATTN_DROPOUT": 0.0,
   "COMBINER_HIDDEN": 512,
   "COMBINER_DROPOUT": 0.0,
