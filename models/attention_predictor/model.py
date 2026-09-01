@@ -88,182 +88,99 @@ def combine_edit_features(f_src: torch.Tensor, f_tar: torch.Tensor) -> torch.Ten
     return torch.cat([f_src, f_tar, f_tar - f_src, f_src * f_tar], dim=-1)
 
 
-"""
-Predictor.
-"""
 
 """
-VisionFeaturizer: spatial flattening + VisionProjector (P_v) -> F_v.
+Text and Vision Projectors/Featurizers.
 """
 
 class VisionProjector(nn.Module):
-    """Project flattened visual tokens to attn_dim, P_v.
+    """Project flattened visual tokens to attn_dim, P_v."""
 
-    No positional embedding: the paper's F_v has none, and a learned one was
-    net-negative at every patch size both before and after the residual fix
-    (docs/RESULTS_CLAUDE.md section 13).
-    """
-
-    def __init__(
-        self,
-        token_dim: int,
-        attn_dim: int,
-    ):
+    def __init__(self, img_dim: int, attn_dim: int = ATTN_DIM):
         super().__init__()
-        self.proj = nn.Linear(token_dim, attn_dim)
+        self.proj = nn.Linear(img_dim, attn_dim)
 
-    def forward(
-        self,
-        tokens: torch.Tensor,  # (N, N_v, token_dim)
-    ) -> torch.Tensor:         # (N, N_v, d)
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        # Project from (N, N_tok, img_dim) to (N, N_tok, attn_dim).
         return self.proj(tokens)
 
 
-class VisionFeaturizer(nn.Module):
-    """Project the visual tokens to attn_dim -> F_v.
+class TextProjector(nn.Module):
+    """Project each prompt token with a shared linear projector, P_t."""
 
-    image_shape (C, S, S) is the VAE latent grid, spatially flattened into
-    patch tokens before projection. image_shape (N_tok, D) is an
-    already-tokenized sequence -- the pooled CLIP token under IMG_EMB_SOURCE
-    "clip", or the padded VAE+CLIP concatenation under "vae+clip" -- projected
-    as one stream. CLIP-Edited is scored with CLIP-L/14, so that encoder's
-    space is the one the label is expressible in, which the VAE latent's is not.
-    """
-
-    def __init__(
-        self,
-        image_shape: tuple[int, ...],
-        attn_dim: int = ATTN_DIM,
-        patch_size: int = PATCH_SIZE,
-    ):
+    def __init__(self, text_dim: int, attn_dim: int = ATTN_DIM):
         super().__init__()
-        if len(image_shape) == 3:
-            channels, height, width = image_shape
-            if height != width:
-                raise ValueError(f"Expected {image_shape} to be a square")
-            if patch_size < 1 or height % patch_size != 0:
-                raise ValueError(f"Expected {patch_size} to divide {height}")
+        self.attn_dim = attn_dim
+        self.proj = nn.Linear(text_dim, attn_dim)
+
+    def forward(self, pair: torch.Tensor) -> torch.Tensor:
+        # Project the last dim from text_dim to attn_dim.
+        return self.proj(pair)
+
+
+class VisionFeaturizer(nn.Module):
+    """Project the visual tokens to attn_dim, F_v."""
+
+    def __init__(self, img_shape: tuple[int, ...], attn_dim: int = ATTN_DIM, patch_size: int = PATCH_SIZE):
+        super().__init__()
+        
+        if IMG_EMB_TYPE == "vae":
+            # Image shape is (C, S, S).
+            channels, height, width = img_shape
             self.channels = channels
             self.side = height
             self.patch_size = patch_size
             self.n_grid = height // patch_size
             self.n_tokens = self.n_grid ** 2
-            self.token_dim = channels * patch_size ** 2
-        elif len(image_shape) == 2:
-            self.token_dim = int(image_shape[-1])
-        else:
-            raise ValueError(f"Expected (C, S, S) latents or (N_tok, D) tokens, got {image_shape}")
-        self.image_shape = tuple(int(v) for v in image_shape)
-        self.projector = VisionProjector(self.token_dim, attn_dim)
+            self.img_dim = channels * patch_size ** 2
+        
+        elif IMG_EMB_TYPE in ("clip", "vae_clip"):
+            # Image shape is (1, D) or (N_v+1, D).
+            self.img_dim = int(img_shape[-1])
 
-    def spatial_flatten(
-        self,
-        image_tokens: torch.Tensor,  # (N, C, S, S)
-    ) -> torch.Tensor:               # (N, N_v, token_dim)
-        """Split the latent into patch tokens; patch_size 1 is one token per position."""
+        self.projector = VisionProjector(self.img_dim, attn_dim)
+
+    def spatial_flatten(self, image_tokens: torch.Tensor) -> torch.Tensor:
+        """Split the visual latent into patch tokens."""
         n = image_tokens.shape[0]
-        if tuple(image_tokens.shape[1:]) != (self.channels, self.side, self.side):
-            raise ValueError(f"Expected {image_tokens.shape} == (N, {self.channels}, {self.side}, {self.side})")
         g, p = self.n_grid, self.patch_size
         tokens = image_tokens.reshape(n, self.channels, g, p, g, p)
-        return tokens.permute(0, 2, 4, 1, 3, 5).reshape(n, self.n_tokens, self.token_dim)
+        return tokens.permute(0, 2, 4, 1, 3, 5).reshape(n, self.n_tokens, self.img_dim)
 
-    def forward(
-        self,
-        image_tokens: torch.Tensor,  # (N, C, S, S) latents or (N, N_tok, D) tokens
-    ) -> torch.Tensor:               # (N, N_v, d)
+    def forward(self, image_tokens: torch.Tensor) -> torch.Tensor:
         """Return the projected visual tokens F_v serving as keys and values."""
-        if image_tokens.dim() == 4:
+        if IMG_EMB_TYPE == "vae":
+            # Flatten from (N, C, S, S) to (N, N_v, C).
             image_tokens = self.spatial_flatten(image_tokens)
+        # Project from (N, N_tok, img_dim) to (N, N_tok, attn_dim).
         return self.projector(image_tokens)
 
 
-"""
-TextFeaturizer: token-dim concatenation + TextProjector (P_t) -> F_t.
-"""
-
-class TextProjector(nn.Module):
-    """Project each prompt token, P_t: R^{D} -> R^{d}, shared across the pair."""
-
-    def __init__(
-        self,
-        text_dim: int,
-        attn_dim: int = ATTN_DIM,
-    ):
-        super().__init__()
-        self.attn_dim = attn_dim
-        self.proj = nn.Linear(text_dim, attn_dim)
-
-    def forward(
-        self,
-        pair: torch.Tensor,  # (N, 2, D_txt)
-    ) -> torch.Tensor:       # (N, 2, d)
-        return self.proj(pair)
-
-
 class TextFeaturizer(nn.Module):
-    """Concatenate pooled prompt tokens along the token dim, TextProjector -> F_t."""
-
-    def __init__(
-        self,
-        text_dim: int,
-        attn_dim: int = ATTN_DIM,
-    ):
-        super().__init__()
-        self.attn_dim = attn_dim
-        self.projector = TextProjector(text_dim, attn_dim=attn_dim)
-
-    def forward(
-        self,
-        src_emb: torch.Tensor,  # (N, 1, D_txt)
-        tar_emb: torch.Tensor,  # (N, 1, D_txt)
-    ) -> torch.Tensor:          # (N, 2, d)
-        """Return the prompt queries F_t, source first then target."""
-        if src_emb.shape != tar_emb.shape:
-            raise ValueError(f"Expected {src_emb.shape} == {tar_emb.shape}")
-        if src_emb.dim() != 3:
-            raise ValueError(f"Expected {tuple(src_emb.shape)} == (N, 1, D_txt)")
-        pair = torch.cat([src_emb, tar_emb], dim=-2)
-        return self.projector(pair)
-
-
-"""
-TokenTextFeaturizer / TokenGrounder: the (77, D) prompt sequences as queries.
-"""
-
-class TokenTextFeaturizer(nn.Module):
-    """Project every prompt token, P_t applied per token of both sequences."""
+    """Project the prompt pair to attn_dim, F_t."""
 
     def __init__(self, text_dim: int, attn_dim: int = ATTN_DIM):
         super().__init__()
-        self.proj = nn.Linear(text_dim, attn_dim)
+        self.projector = TextProjector(text_dim, attn_dim=attn_dim)
 
-    def forward(
-        self,
-        src_tokens: torch.Tensor,  # (N, T, D_txt)
-        tar_tokens: torch.Tensor,  # (N, T, D_txt)
-    ) -> torch.Tensor:             # (N, 2, T, d)
-        if src_tokens.shape != tar_tokens.shape:
-            raise ValueError(f"Expected {src_tokens.shape} == {tar_tokens.shape}")
-        return self.proj(torch.stack([src_tokens, tar_tokens], dim=1))
+    def forward(self, src: torch.Tensor, tar: torch.Tensor) -> torch.Tensor:
+        """Return the prompt queries F_t, source first then target."""
+        # Stack and project from (N, N_t, D_txt)^2 to (N, 2, N_t, d).
+        return self.projector(torch.stack([src, tar], dim=1))
 
 
-def diff_saliency(
-    q: torch.Tensor,     # (N, 2, T, d), projected but not yet grounded
-    masks: torch.Tensor, # (N, 2, T) bool
-) -> torch.Tensor:       # (N, 2, T)
-    """Per-token novelty of each prompt against the other, 1 - max cosine.
+"""
+Text grounder and pooler: CrossAttn(Q=F_t, K=F_v, V=F_v)
+"""
 
-    Source and target prompts are near-duplicates differing in a few words, so a
-    masked mean is mostly shared scaffold. Matching is soft rather than
-    positional because a changed word can retokenize to a different length, and
-    the text encoder is causal, so every state after the first edit differs even
-    where the word does not. Computed on the pre-grounding states, so it
-    measures prompt difference and not agreement with the image, and detached,
-    so pooling stays a fixed data-dependent operator.
-    """
+
+def text_token_diff_saliency(
+    q: torch.Tensor,     # (N, 2, N_t, d), projected but not yet grounded
+    masks: torch.Tensor, # (N, 2, N_t) bool
+) -> torch.Tensor:       # (N, 2, N_t)
+    """Per-token novelty of each prompt against the other, 1 - max cosine."""
     x = torch.nn.functional.normalize(q.float(), dim=-1)
-    sim = torch.einsum("nid,njd->nij", x[:, 0], x[:, 1])  # (N, T_src, T_tar)
+    sim = torch.einsum("nid,njd->nij", x[:, 0], x[:, 1])  # (N, N_t, N_t)
     neg = torch.finfo(sim.dtype).min
     m_src, m_tar = masks[:, 0], masks[:, 1]
     # Each direction ignores the other prompt's padding as a possible match.
@@ -272,29 +189,68 @@ def diff_saliency(
     return (torch.stack([w_src, w_tar], dim=1) * masks).clamp(min=0.0).detach()
 
 
-def append_null_token(
-    tokens: torch.Tensor,      # (N, N_v, d)
-    null_token: torch.Tensor,  # (1, 1, d)
-) -> torch.Tensor:             # (N, N_v + 1, d)
-    """Append the learned null key/value token to the visual tokens.
+class CrossAttentionBlock(nn.Module):
+    """One grounding step, CrossAttn(Q=F_t, K=F_v, V=F_v), as a pre-LN block."""
 
-    Unconditional. A query naming content that is not in the source image would
-    otherwise have to spend its whole softmax mass on patches that do not match
-    it, and under IMG_EMB_SOURCE "clip" the visual sequence is a single token, so
-    without the null key the softmax is over one element -- weight identically 1
-    -- and cross-attention degenerates into a query-independent linear map.
-    """
-    return torch.cat([tokens, null_token.expand(tokens.shape[0], -1, -1)], dim=-2)
+    def __init__(
+        self,
+        attn_dim: int = ATTN_DIM,
+        n_heads: int = N_HEADS,
+        dropout_rate: float = ATTN_DROPOUT,
+        ffn_mult: float = FFN_MULT,
+        layerscale_init: float | None = LAYERSCALE_INIT,
+    ):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(attn_dim, n_heads, dropout=dropout_rate, batch_first=True)
+        self.q_norm = nn.LayerNorm(attn_dim)
+
+        # Setup the layer-scale.
+        if layerscale_init is not None:
+            self.gamma_attn = nn.Parameter(float(layerscale_init) * torch.ones(attn_dim))
+            self.gamma_ffn = nn.Parameter(float(layerscale_init) * torch.ones(attn_dim))
+        else:
+            self.gamma_attn, self.gamma_ffn = None, None
+
+        # Setup the feed-forward network.
+        if ffn_mult > 0:
+            n_hidden = max(1, int(round(ffn_mult * attn_dim)))
+            self.ffn = nn.Sequential(
+                nn.LayerNorm(attn_dim),
+                nn.Linear(attn_dim, n_hidden),
+                nn.GELU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(n_hidden, attn_dim),
+            )
+        else:
+            self.ffn = None
 
 
-class TokenGrounder(nn.Module):
-    """Ground every prompt token in the visual tokens, then pool over real tokens.
+    def forward(
+        self,
+        queries: torch.Tensor,  # (N, 2, d)
+        kv: torch.Tensor,       # (N, N_v, d), already prenormed
+    ) -> torch.Tensor:          # (N, 2, d)
+        
+        # Apply the cross-attention.
+        grounded, _ = self.attn(self.q_norm(queries), kv, kv, need_weights=False)
+        
+        # Apply the layer-scale to the grounded queries.
+        grounded = self.gamma_attn * grounded if self.gamma_attn is not None else grounded
+        queries = queries + grounded
+        
+        # Apply the feed-forward network.
+        if self.ffn is not None:
+            update = self.ffn(queries)
+            # Apply the layer-scale to the update.
+            update = self.gamma_ffn * update if self.gamma_ffn is not None else update
+            # Add the update to the queries.
+            queries = queries + update
+        
+        return queries
 
-    Queries never interact in cross-attention, so the two prompts are folded
-    into the batch (shared weights, no cross-prompt leakage) and padding queries
-    are left to attend freely; the padding mask is applied at the pool, which is
-    the only place it changes an answer.
-    """
+
+class TextGrounder(nn.Module):
+    """Ground every prompt token in the visual tokens."""
 
     def __init__(
         self,
@@ -308,129 +264,57 @@ class TokenGrounder(nn.Module):
         super().__init__()
         self.kv_norm = nn.LayerNorm(attn_dim)  # once: the visual tokens are static
         self.layers = nn.ModuleList([
-            CrossAttentionBlock(
-                attn_dim, n_heads, dropout_rate,
-                ffn_mult=ffn_mult, layerscale_init=layerscale_init,
-                kv_prenorm=False,
-            )
+            CrossAttentionBlock(attn_dim, n_heads, dropout_rate, ffn_mult, layerscale_init)
             for _ in range(max(1, int(n_layers)))
         ])
         self.out_norm = nn.LayerNorm(attn_dim)
-        # A query naming content that is not in the image rests here instead of
-        # spending its whole softmax on patches that do not match it.
         self.null_token = nn.Parameter(torch.zeros(1, 1, attn_dim))
 
+    def forward(
+        self,
+        queries: torch.Tensor,  # (N, 2, N_t, d)
+        tokens: torch.Tensor,   # (N, N_v, d)
+    ) -> torch.Tensor:          # (N, 2, N_t, d)
+        n, _, n_t, d = queries.shape
+
+        # Append the null token to the visual tokens.
+        tokens = torch.cat([tokens, self.null_token.expand(n, -1, -1)], dim=-2)
+        
+        # Repeat the visual tokens for each prompt.
+        kv = self.kv_norm(tokens).repeat_interleave(2, dim=0)
+
+        # Reshape the queries to (N * 2, N_t, d) for the cross-attention blocks.
+        q = queries.reshape(n * 2, n_t, d)
+
+        # Apply the cross-attention blocks.
+        for layer in self.layers:
+            q = layer(q, kv)
+        return self.out_norm(q).reshape(n, 2, n_t, d)
+
+
+class TextPooler(nn.Module):
+    """Pool grounded prompt tokens over N_t."""
+
     @staticmethod
-    def _pool(
-        x: torch.Tensor,  # (N, 2, T, d)
-        w: torch.Tensor,  # (N, 2, T)
-    ) -> torch.Tensor:    # (N, 2, d)
+    def _pool(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor: 
+        """Pool the grounded queries over N_t with weights w."""
+        # (N, 2, N_t, d), (N, 2, N_t) to (N, 2, d)
         w = w.to(x.dtype).unsqueeze(-1)
         return (x * w).sum(dim=2) / w.sum(dim=2).clamp(min=1e-6)
 
     def forward(
         self,
-        queries: torch.Tensor,  # (N, 2, T, d)
-        tokens: torch.Tensor,   # (N, N_v, d)
-        masks: torch.Tensor,    # (N, 2, T) bool
-        saliency: torch.Tensor | None = None,  # (N, 2, T)
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        n, two, t, d = queries.shape
-        kv = self.kv_norm(append_null_token(tokens, self.null_token)).repeat_interleave(two, dim=0)
-
-        q = queries.reshape(n * two, t, d)
-        for layer in self.layers:
-            q = layer(q, kv, kv_is_normed=True)
-        grounded = self.out_norm(q).reshape(n, two, t, d)
-
-        f_mean = self._pool(grounded, masks)
-        f_diff = None if saliency is None else self._pool(grounded, saliency)
-        return f_mean, f_diff
-
-
-"""
-CrossAttentionPooler: CrossAttn(Q=F_t, K=F_v, V=F_v).
-"""
-
-class CrossAttentionBlock(nn.Module):
-    """One grounding step, CrossAttn(Q=F_t, K=F_v, V=F_v), as a pre-LN block."""
-
-    def __init__(
-        self,
-        attn_dim: int = ATTN_DIM,
-        n_heads: int = N_HEADS,
-        dropout_rate: float = ATTN_DROPOUT,
-        ffn_mult: float = FFN_MULT,
-        layerscale_init: float | None = LAYERSCALE_INIT,
-        kv_prenorm: bool = True,
-    ):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(attn_dim, n_heads, dropout=dropout_rate, batch_first=True)
-        self.q_norm = nn.LayerNorm(attn_dim)
-        # Hoisted out by TokenGrounder: the keys/values are the same tensor at
-        # every layer, so one norm shared across the stack is the same map.
-        self.kv_norm = nn.LayerNorm(attn_dim) if kv_prenorm else None
-        # LayerScale: at a small init the block is near-identity, so the queries
-        # reach the readout unchanged at step 0 and grounding is learned rather
-        # than assumed.
-        self.gamma_attn = nn.Parameter(float(layerscale_init) * torch.ones(attn_dim)) if layerscale_init is not None else None
-        self.gamma_ffn = None
-        self.ffn_norm, self.ffn = None, None
-        if ffn_mult > 0:
-            n_hidden = max(1, int(round(ffn_mult * attn_dim)))
-            self.ffn_norm = nn.LayerNorm(attn_dim)
-            self.ffn = nn.Sequential(
-                nn.Linear(attn_dim, n_hidden),
-                nn.GELU(),
-                nn.Dropout(dropout_rate),
-                nn.Linear(n_hidden, attn_dim),
-            )
-            if layerscale_init is not None:
-                self.gamma_ffn = nn.Parameter(float(layerscale_init) * torch.ones(attn_dim))
-
-    def forward(
-        self,
-        queries: torch.Tensor,  # (N, 2, d)
-        tokens: torch.Tensor,   # (N, N_v, d)
-        kv_is_normed: bool = False,
-    ) -> torch.Tensor:          # (N, 2, d)
-        kv = tokens if (kv_is_normed or self.kv_norm is None) else self.kv_norm(tokens)
-        grounded, _ = self.attn(self.q_norm(queries), kv, kv, need_weights=False)
-        queries = queries + (grounded if self.gamma_attn is None else self.gamma_attn * grounded)
-        if self.ffn is not None:
-            update = self.ffn(self.ffn_norm(queries))
-            queries = queries + (update if self.gamma_ffn is None else self.gamma_ffn * update)
-        return queries
-
-
-class CrossAttentionPooler(nn.Module):
-    """Ground the prompt queries in the visual tokens over ATTN_LAYERS blocks."""
-
-    def __init__(
-        self,
-        attn_dim: int = ATTN_DIM,
-        n_heads: int = N_HEADS,
-        dropout_rate: float = ATTN_DROPOUT,
-        n_layers: int = ATTN_LAYERS,
-        ffn_mult: float = FFN_MULT,
-    ):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            CrossAttentionBlock(attn_dim, n_heads, dropout_rate, ffn_mult=ffn_mult)
-            for _ in range(max(1, int(n_layers)))
-        ])
-        self.null_token = nn.Parameter(torch.zeros(1, 1, attn_dim))
-
-    def forward(
-        self,
-        queries: torch.Tensor,  # (N, 2, d)
-        tokens: torch.Tensor,   # (N, N_v, d)
-    ) -> torch.Tensor:          # (N, 2, d)
-        """Return the image-grounded prompt features [f_src; f_tar]."""
-        tokens = append_null_token(tokens, self.null_token)
-        for layer in self.layers:
-            queries = layer(queries, tokens)
-        return queries
+        groundeds: torch.Tensor,                      # (N, 2, N_t, d)
+        masks: torch.Tensor,                          # (N, 2, N_t)
+        saliencies: torch.Tensor | None = None,       # (N, 2, N_t)
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:    # (N, 2, d)
+        
+        # Pool with masks to address text token padding.
+        f_means = self._pool(groundeds, masks)
+        # Pool with saliencies to address text token novelty.
+        f_diffs = None if saliencies is None else self._pool(groundeds, saliencies)
+        
+        return f_means, f_diffs
 
 
 """
@@ -449,13 +333,9 @@ class TextCombiner(nn.Module):
     ):
         super().__init__()
         self.attn_dim = attn_dim
-        self.n_segments = int(n_segments)
+        self.n_segments = n_segments
         width = self.n_segments * attn_dim
-        # Per-segment, not one LayerNorm over the whole concatenation: a single
-        # norm rescales the segments jointly, so a difference segment that is
-        # small because the prompts are near-duplicates -- which they always are
-        # -- stays small next to the two large concat segments. One norm per
-        # segment gives each term unit scale on its own.
+        # One LayerNorm per segment so concat/difference terms keep their own scale.
         self.seg_norms = nn.ModuleList(nn.LayerNorm(attn_dim) for _ in range(self.n_segments))
         self.body = nn.Sequential(
             nn.Linear(width, n_hidden),
@@ -479,11 +359,7 @@ def make_metric_head(
     n_hidden: int = HEAD_HIDDEN,
     dropout_rate: float = COMBINER_DROPOUT,
 ) -> nn.Module:
-    """Readout G from the edit descriptor h to one scalar per grid cell.
-
-    n_hidden 0 is the paper's bare Linear(d, n_cells), which forces every cell of
-    the surface to be a linear functional of the same h.
-    """
+    """Readout G from the edit descriptor h to one scalar per grid cell."""
     if n_hidden <= 0:
         return nn.Linear(attn_dim, n_cells)
     return nn.Sequential(
@@ -506,55 +382,40 @@ class AttentionRegressor(nn.Module):
 
     def __init__(
         self,
-        image_shape: tuple[int, ...],
+        img_shape: tuple[int, ...],
         text_dim: int,
         n_cells: int,
+        default_cell: int,
         n_targets: int = len(TARGET_COLS),
         attn_dim: int = ATTN_DIM,
-        default_cell: int | None = None,
     ):
         super().__init__()
-        if n_targets != 2:
-            raise ValueError(f"Expected 2 targets (PSNR, CLIP), got {n_targets=}")
 
-        self.n_cells = int(n_cells)
+        self.n_cells = n_cells
         self.n_targets = n_targets
-        # Bounded outputs are only meaningful where the targets are bounded.
-        self.bounded = PREDICTION_SPACE == "deltas"
+        self.default_cell = default_cell
 
-        self.text_source = str(TEXT_EMB_SOURCE)
-        if USE_DIFF_SALIENCY and self.text_source != "tokens":
-            raise ValueError("USE_DIFF_SALIENCY needs TEXT_EMB_SOURCE='tokens'")
+        # Focus on the difference-aware saliencies between prompt tokens.
         self.use_saliency = bool(USE_DIFF_SALIENCY)
-        # True Delta at the default cell is identically 0 by construction, so
-        # predicting it is a degree of freedom the heads would otherwise spend
-        # learning a constant. Off only under "raws", where the constraint is
-        # false; see PIN_DEFAULT_CELL above.
-        if PIN_DEFAULT_CELL and default_cell is None:
-            raise ValueError(f"{PREDICTION_SPACE=} needs the default cell index")
-        self.default_cell = int(default_cell) if PIN_DEFAULT_CELL else None
+        
+        if USE_DIFF_SALIENCY and TEXT_EMB_TYPE != "tokens":
+            raise ValueError("USE_DIFF_SALIENCY needs TEXT_EMB_TYPE='tokens'")
 
-        self.vision_featurizer = VisionFeaturizer(image_shape, attn_dim=attn_dim)
-        if self.text_source == "tokens":
-            self.text_featurizer = TokenTextFeaturizer(text_dim, attn_dim=attn_dim)
-            self.cross_attn = TokenGrounder(attn_dim=attn_dim)
-        else:
-            self.text_featurizer = TextFeaturizer(text_dim, attn_dim=attn_dim)
-            self.cross_attn = CrossAttentionPooler(attn_dim=attn_dim)
-        # [f_src; f_tar; f_tar - f_src; f_src * f_tar], plus the two
-        # difference-saliency pools when they are on.
+        self.vision_featurizer = VisionFeaturizer(img_shape, attn_dim=attn_dim)
+        self.text_featurizer = TextFeaturizer(text_dim, attn_dim=attn_dim)
+        self.text_grounder = TextGrounder(attn_dim=attn_dim)
+        self.text_pooler = TextPooler()
+
+        # Number of segments in the edit descriptor z_edit.
         n_seg = 6 if self.use_saliency else 4
-        # A shared h lets the PSNR-dominated gradient set the representation both
-        # heads read. SPLIT_COMBINER gives each metric its own C_theta over the
-        # same z_edit so the two surfaces can be described differently.
+
+        # Each metric may have its own combiner C_theta to describe it differently.
         if SPLIT_COMBINER:
             self.psnr_combiner = TextCombiner(attn_dim=attn_dim, n_segments=n_seg)
             self.clip_combiner = TextCombiner(attn_dim=attn_dim, n_segments=n_seg)
         else:
             self.combiner = TextCombiner(attn_dim=attn_dim, n_segments=n_seg)
 
-        # G_PSNR and G_CLIP are independently parameterized readouts of the
-        # edit descriptor, one scalar per timestep-grid cell.
         self.psnr_head = make_metric_head(attn_dim, n_cells)
         self.clip_head = make_metric_head(attn_dim, n_cells)
 
@@ -562,16 +423,11 @@ class AttentionRegressor(nn.Module):
         self.register_buffer("target_std", torch.ones(n_targets))
 
     def destandardize(self, standardized: torch.Tensor) -> torch.Tensor:
-        """Undo the target z-scoring; identity unless the space standardizes."""
+        """Undo the target z-scoring, which is identity unless the space standardizes."""
         return standardized * self.target_std + self.target_mean
 
     def set_target_standardization(self, mean: torch.Tensor, std: torch.Tensor) -> None:
-        """
-        Store the train target mean/std that forward() predicts in.
-
-        Only PREDICTION_SPACE "raws" needs this because PSNR-Unedited and CLIP-Edited
-        live on unrelated scales, so the heads regress z-scored targets.
-        """
+        """Store the train target mean/std that forward() preds in for PREDICTION_SPACE "raws"."""
         mean = torch.as_tensor(mean, dtype=self.target_mean.dtype, device=self.target_mean.device).reshape(-1)
         std = torch.as_tensor(std, dtype=self.target_std.dtype, device=self.target_std.device).reshape(-1)
         if mean.numel() != self.n_targets or std.numel() != self.n_targets:
@@ -582,44 +438,62 @@ class AttentionRegressor(nn.Module):
 
     def forward(
         self,
-        image_tokens: torch.Tensor,               # (N, C, S, S) or (N, N_tok, D)
-        source_tokens: torch.Tensor,              # (N, 1, D_txt) or (N, T, D_txt)
-        target_tokens: torch.Tensor,              # (N, 1, D_txt) or (N, T, D_txt)
-        source_mask: torch.Tensor | None = None,  # (N, T) bool, "tokens" only
-        target_mask: torch.Tensor | None = None,  # (N, T) bool, "tokens" only
-    ) -> torch.Tensor:                            # (N, n_cells, 2)
+        image_tokens: torch.Tensor,     # (N, C, S, S) or (N, N_tok, D)
+        source_tokens: torch.Tensor,    # (N, N_t, D_txt)
+        target_tokens: torch.Tensor,    # (N, N_t, D_txt)
+        source_mask: torch.Tensor,      # (N, N_t)
+        target_mask: torch.Tensor,      # (N, N_t)
+    ) -> torch.Tensor:                  # (N, n_cells, 2)
         """Return per-cell (psnr, clip) predictions, standardized where active."""
-        # Ground both prompts in the source image with one cross-attention pass.
-        tokens = self.vision_featurizer(image_tokens)
-        f_diff = None
-        if self.text_source == "tokens":
-            if source_mask is None or target_mask is None:
-                raise ValueError("TEXT_EMB_SOURCE='tokens' needs source_mask and target_mask")
-            text_masks = torch.stack([source_mask, target_mask], dim=1)
-            queries = self.text_featurizer(source_tokens, target_tokens)
-            saliency = diff_saliency(queries, text_masks) if self.use_saliency else None
-            grounded, f_diff = self.cross_attn(queries, tokens, text_masks, saliency)
-        else:
-            queries = self.text_featurizer(source_tokens, target_tokens)
-            grounded = self.cross_attn(queries, tokens)
-        f_src, f_tar = grounded[:, 0], grounded[:, 1]
+        
+        # Featurize the image and text tokens.
+        fv_tokens = self.vision_featurizer(image_tokens)
+        ft_tokens = self.text_featurizer(source_tokens, target_tokens)
+        ft_masks = torch.stack([source_mask, target_mask], dim=1)
 
-        # Difference-aware edit descriptor, read out by the two metric heads.
-        z_edit = combine_edit_features(f_src, f_tar)
-        if f_diff is not None:
-            z_edit = torch.cat([z_edit, f_diff[:, 0], f_diff[:, 1]], dim=-1)
+        # Compute the text token saliency, if enabled.
+        # Measures the novelty of each text token against the other.
+        ft_saliencies = text_token_diff_saliency(ft_tokens, ft_masks) if self.use_saliency else None
+        
+        # Ground the text tokens in the image tokens.
+        groundeds = self.text_grounder(ft_tokens, fv_tokens)
+
+        # Pool the grounded text tokens with masks and saliencies seperately.
+        f_means, f_diffs = self.text_pooler(groundeds, ft_masks, ft_saliencies)
+        # Resplit the mean pooled text tokens into source and target.
+        f_src, f_tar = f_means[:, 0], f_means[:, 1]
+
+        # Combine the source and target text tokens into a single edit descriptor.
+        z_edit = combine_edit_features(f_src, f_tar)    # (N, 4d)
+        # If difference-aware saliencies are enabled, add them to the edit descriptor.
+        if f_diffs is not None:
+            z_edit = torch.cat([z_edit, f_diffs[:, 0], f_diffs[:, 1]], dim=-1)    # (N, 6d)
+        
         if SPLIT_COMBINER:
-            h_psnr = self.psnr_combiner(z_edit)
-            h_clip = self.clip_combiner(z_edit)
+            # Map the difference-aware edit representation with two separate combiners for the heads.
+            h_psnr = self.psnr_combiner(z_edit)    # (N, d)
+            h_clip = self.clip_combiner(z_edit)    # (N, d)
         else:
+            # Map the difference-aware edit representation with a single combiner for the heads.
             h_psnr = h_clip = self.combiner(z_edit)
-        out = torch.stack([self.psnr_head(h_psnr), self.clip_head(h_clip)], dim=-1)
-        if self.bounded:
-            out = 2.0 * torch.sigmoid(out) - 1.0
-        if self.default_cell is not None:
-            # Pin the default cell to the 0 the true delta takes there.
-            out = out - out[:, self.default_cell : self.default_cell + 1, :]
-        return out
+
+        # Send the compact edit descriptor(s) into the PSNR and CLIP heads.
+        z_psnr = self.psnr_head(h_psnr)    # (N, n_cells)
+        z_clip = self.clip_head(h_clip)    # (N, n_cells)
+
+        # Stack the PSNR and CLIP predictions into a single tensor.
+        z = torch.stack([z_psnr, z_clip], dim=-1)    # (N, n_cells, 2)
+       
+        # If the pred space is bounded, apply the sigmoid function to the preds.
+        if PREDICTION_SPACE == "deltas":
+            z = 2.0 * torch.sigmoid(z) - 1.0
+            # Would be delta_hat to match the paper's notation.
+
+        if PIN_DEFAULT_CELL:
+            # Pin the default cell to Delta=0.
+            z = z - z[:, self.default_cell : self.default_cell + 1, :]
+
+        return z
 
 
 class AttentionModel(nn.Module):
@@ -630,24 +504,22 @@ class AttentionModel(nn.Module):
         image_shape: tuple[int, ...],
         text_dim: int,
         n_cells: int,
+        default_cell: int,
         device: torch.device | str | None = None,
-        default_cell: int | None = None,
     ):
         super().__init__()
-        self.regressor = AttentionRegressor(
-            image_shape, text_dim, n_cells, default_cell=default_cell,
-        )
+        self.regressor = AttentionRegressor(image_shape, text_dim, n_cells, default_cell)
         if device is not None:
             self.regressor.to(device)
 
     def pred_cells(
         self,
-        image_tokens: torch.Tensor,               # (N, C, S, S) or (N, N_tok, D)
-        source_tokens: torch.Tensor,              # (N, 1, D_txt) or (N, T, D_txt)
-        target_tokens: torch.Tensor,              # like source_tokens
-        source_mask: torch.Tensor | None = None,  # (N, T) bool
-        target_mask: torch.Tensor | None = None,  # (N, T) bool
-    ) -> torch.Tensor:                            # (N, n_cells, 2)
+        image_tokens: torch.Tensor,     # (N, C, S, S) or (N, N_tok, D)
+        source_tokens: torch.Tensor,    # (N, N_t, D_txt)
+        target_tokens: torch.Tensor,    # (N, N_t, D_txt)
+        source_mask: torch.Tensor,      # (N, N_t)
+        target_mask: torch.Tensor,      # (N, N_t)
+    ) -> torch.Tensor:                  # (N, n_cells, 2)
         """Predict per-cell (psnr, clip) in PREDICTION_SPACE units."""
         standardized = self.regressor(image_tokens, source_tokens, target_tokens, source_mask, target_mask)
         return self.regressor.destandardize(standardized)
@@ -735,10 +607,10 @@ class TimestepSelector:
     def pred_grid(
         self,
         image_tokens: torch.Tensor,               # (C, S, S) or (N_tok, D), one sample
-        source_tokens: torch.Tensor,              # (1, D_txt) or (T, D_txt)
+        source_tokens: torch.Tensor,              # (1, D_txt) or (N_t, D_txt)
         target_tokens: torch.Tensor,              # like source_tokens
-        source_mask: torch.Tensor | None = None,  # (T,) bool
-        target_mask: torch.Tensor | None = None,  # (T,) bool
+        source_mask: torch.Tensor,                # (N_t,) bool
+        target_mask: torch.Tensor,                # (N_t,) bool
     ) -> TimestepGridResult:
         """
         Single predictor forward covering every labeled (t_start, t_end) cell.
@@ -751,7 +623,7 @@ class TimestepSelector:
         needs no retraining.
         """
         device = self.model.regressor.target_mean.device
-        batched = lambda t: None if t is None else t.unsqueeze(0).to(device)
+        batched = lambda t: t.unsqueeze(0).to(device)
         preds = self.model.pred_cells(
             batched(image_tokens),
             batched(source_tokens),
@@ -852,8 +724,7 @@ def load_timestep_selector(
     t_end_values = np.asarray(ckpt["t_end_values"].cpu(), dtype=np.float64)
     model = AttentionModel(
         image_shape, text_dim, int(cell_t_pairs.shape[0]), device=device,
-        # The regressor re-baselines its surface here, so the index has to be
-        # rebuilt from the checkpoint's own grid axes rather than left None.
+        # The pin uses this index, so rebuild it from the checkpoint's grid axes.
         default_cell=default_cell_index(cell_t_pairs, t_start_values, t_end_values),
     )
     model.regressor.load_state_dict(ckpt["regressor_state_dict"])

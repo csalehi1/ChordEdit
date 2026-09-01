@@ -209,17 +209,17 @@ def _pack_scattered_cache(
 
 
 def _apply_img_emb_source(samples: pd.DataFrame, img_emb: torch.Tensor) -> torch.Tensor:
-    """The image table the regressor sees, per IMG_EMB_SOURCE, (n, C, S, S).
+    """The image table the regressor sees, per IMG_EMB_TYPE, (n, C, S, S).
 
     The packed table holds the latent tokens attention_predictor's featurizer
     consumes, and VisionFeaturizer needs that grid, so the table is passed
     through unchanged. The CLIP image sources have no latent grid to featurize
     and are rejected here rather than deeper in the model.
     """
-    if IMG_EMB_SOURCE == "vae":
+    if IMG_EMB_TYPE == "vae":
         return img_emb
     raise ValueError(
-        f"{IMG_EMB_SOURCE=} is not compatible with the visual featurizer, "
+        f"{IMG_EMB_TYPE=} is not compatible with the visual featurizer, "
         f"which needs the (C, S, S) VAE latent; expected 'vae'"
     )
 
@@ -229,12 +229,12 @@ def _apply_text_emb_source(
     src_emb: torch.Tensor,
     tar_emb: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The (source, target) prompt tables the regressor sees, per TEXT_EMB_SOURCE.
+    """The (source, target) prompt tables the regressor sees, per TEXT_EMB_TYPE.
 
     Both branches keep the single-token (n, 1, D) layout the packed table uses,
     so the regressor takes token 0 whichever encoder produced the vector.
     """
-    if TEXT_EMB_SOURCE == "sd":
+    if TEXT_EMB_TYPE == "sd":
         return src_emb, tar_emb
 
     from clip_image import CLIP_TXT_DIM, get_clip_text_embeddings

@@ -77,9 +77,9 @@ Every run saves the config it used to `<run_dir>/settings.json`, and `selector.p
 `.cache/packed_embeddings/` with layout `img_tokens_src_tar_pooled_v2`. Both
 tables reach the featurizers in that shape, unflattened.
 
-`TEXT_EMB_SOURCE="clip"` still swaps in CLIP-L/14 prompt vectors, reshaped to
-the same `(n, 1, D)` layout. `IMG_EMB_SOURCE` must be `"vae"`: `"clip"` and
-`"vae+clip"` carry no latent grid for `VisionFeaturizer` to patch, so
+`TEXT_EMB_TYPE="clip"` still swaps in CLIP-L/14 prompt vectors, reshaped to
+the same `(n, 1, D)` layout. `IMG_EMB_TYPE` must be `"vae"`: `"clip"` and
+`"vae_clip"` carry no latent grid for `VisionFeaturizer` to patch, so
 `_apply_img_emb_source` rejects them instead of failing deeper in the model.
 
 The values are identical to the older `image.pt` / `source.pt` layout -

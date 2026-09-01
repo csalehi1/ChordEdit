@@ -84,7 +84,7 @@ def selected_cells(
 def calc_loss(
     pred: torch.Tensor,                        # (G, n_cells, 2)
     true: torch.Tensor,                        # (G, n_cells, 2)
-    default_cell: int | torch.Tensor,          # shared index, or (G,)
+    default_cell: int,                         # shared index
     mean_surface: torch.Tensor | None = None,  # (n_cells, 2)
 ) -> torch.Tensor:
     """Weighted phi MSE, pairwise ranking, and per-column MSE.
@@ -129,19 +129,17 @@ def calc_loss(
         pred_deltas: torch.Tensor,
         true_deltas: torch.Tensor,
     ) -> torch.Tensor:
-        """Per-column MSE on the delta surfaces, one weight per metric.
-
-        Weights scale each column independently rather than being renormalized,
-        so PSNR_LOSS_WEIGHT and CLIP_LOSS_WEIGHT also set this term's size
-        relative to the phi-space terms. (1, 1) is a plain unweighted MSE.
-        """
+        """Per-column MSE on the delta surfaces, one weight per metric."""
         weights = pred_deltas.new_tensor([PSNR_LOSS_WEIGHT, CLIP_LOSS_WEIGHT])
         return (((pred_deltas - true_deltas) ** 2) * weights).mean()
 
+    # Calculate the pred and true deltas from the pred and true surfaces.
     pred_deltas = deltas_from_preds(pred, default_cell, mean_surface)
     true_deltas = deltas_from_preds(true, default_cell, mean_surface)
     pred_phi = calc_train_phi(pred_deltas)
     true_phi = calc_train_phi(true_deltas)
+
+    # Calculate the loss.
     loss = pred_phi.new_zeros(())
     if MSE_LOSS_WEIGHT > 0:
         loss = loss + MSE_LOSS_WEIGHT * mse_loss(pred_phi, true_phi, top_k=MSE_LOSS_TOP_K)
@@ -149,6 +147,7 @@ def calc_loss(
         loss = loss + RANKING_LOSS_WEIGHT * ranking_loss(pred_phi, true_phi, top_k=RANKING_LOSS_TOP_K)
     if PSNR_LOSS_WEIGHT > 0 or CLIP_LOSS_WEIGHT > 0:
         loss = loss + column_loss(pred_deltas, true_deltas)
+    
     return loss
 
 
@@ -244,15 +243,8 @@ def eval_selection(
 Training.
 """
 
-def train(device: torch.device) -> Path:
-    """
-    Train the grid surface predictor and save run artifacts.
-
-    Saves regressor_weights.pt {regressor_state_dict, target_mean, target_std,
-    target_cols, prediction_space, image_shape, source_shape, cell_t_pairs,
-    t_start_values, t_end_values}, and regression_metrics.json.
-    id_to_split.csv and mean_surface.pt are written by get_dataset.
-    """
+def train(device: torch.device) -> None:
+    """Train the grid surface predictor and save run artifacts."""
 
     # Create run directory to save information to.
     run_name = RUN_NAME or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -261,31 +253,32 @@ def train(device: torch.device) -> Path:
     save_run_settings(run_dir)
     print(f"Saved settings")
 
-    # Build the device-resident datasets; get_dataset writes id_to_split.csv
-    # (or replays an existing one) and the mean surface into run_dir.
+    # Build the device-resident datasets.
     bundle = get_dataset(device, run_dir)
-    train_ds, val_ds, test_ds = bundle.train, bundle.val, bundle.test
+    train, val, test = bundle.train, bundle.val, bundle.test
     meta = bundle.meta
     train_X = bundle.splits_df["train"][0]
     test_note = f" (from {PIE_BENCH_DIR_NAME})" if PIE_BENCH else ""
     print(
         f"Dataset splits:\n"
-        f"  train: {train_ds.n_samples * meta.n_cells} cells ({train_ds.n_samples} samples)\n"
-        f"  val: {val_ds.n_samples * meta.n_cells} cells ({val_ds.n_samples} samples)\n"
-        f"  test: {test_ds.n_samples * test_ds.y.shape[1]} cells ({test_ds.n_samples} samples){test_note}"
+        f"  train: {train.n_samples * meta.n_cells} cells ({train.n_samples} samples)\n"
+        f"  val: {val.n_samples * meta.n_cells} cells ({val.n_samples} samples)\n"
+        f"  test: {test.n_samples * test.y.shape[1]} cells ({test.n_samples} samples){test_note}"
     )
 
-    # Size the predictor from the bundle's metadata. meta.t maps output cell k
-    # to its canonical sorted (t_start, t_end).
+    # Size the predictor from the bundle's metadata
     model = AttentionModel(
-        meta.image_shape, meta.source_shape[-1], meta.n_cells, device=device,
-        default_cell=meta.default_cell,
+        meta.img_shape, 
+        meta.src_shape[-1],
+        meta.n_cells, 
+        device=device,
+        default_cell=meta.default_cell
     )
     n_params = sum(p.numel() for p in model.regressor.parameters())
     print(
         f"Predictor: {n_params / 1e6:.2f}M params, "
-        f"image {meta.image_shape}, text {meta.source_shape}, "
-        f"{meta.n_cells} cells, space {PREDICTION_SPACE!r}, visual {IMG_EMB_SOURCE!r}"
+        f"image {meta.img_shape}, text {meta.src_shape}, "
+        f"{meta.n_cells} cells, space {PREDICTION_SPACE!r}, visual {IMG_EMB_TYPE!r}"
     )
 
     t_start_values = torch.as_tensor(np.sort(np.unique(meta.t[:, 0].numpy())), dtype=torch.float64)
@@ -294,19 +287,18 @@ def train(device: torch.device) -> Path:
 
     run = init_run(run_dir, {
         "n_params": n_params,
-        "image_shape": list(meta.image_shape),
-        "source_shape": list(meta.source_shape),
+        "image_shape": list(meta.img_shape),
+        "source_shape": list(meta.src_shape),
         "n_cells": int(meta.n_cells),
         "grid": f"{grid_shape[0]}x{grid_shape[1]}",
-        "n_train_samples": int(train_ds.n_samples),
-        "n_val_samples": int(val_ds.n_samples),
-        "n_test_samples": int(test_ds.n_samples),
+        "n_train_samples": int(train.n_samples),
+        "n_val_samples": int(val.n_samples),
+        "n_test_samples": int(test.n_samples),
     })
 
-    # Only "raws" needs standardization; the delta spaces are already
-    # commensurate and keep the buffers at identity.
+    # Only "raws" needs standardization as the delta spaces are already standardized.
     if PREDICTION_SPACE == "raws":
-        y_train = train_ds.y.detach().float().reshape(-1, train_ds.y.shape[-1]).cpu()
+        y_train = train.y.detach().float().reshape(-1, train.y.shape[-1]).cpu()
         model.regressor.set_target_standardization(y_train.mean(0), y_train.std(0))
     print(
         "Target columns (train):\n"
@@ -324,7 +316,7 @@ def train(device: torch.device) -> Path:
     scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, EPOCHS)) if LR_SCHEDULER == "cosine" else None)
 
     y_mean, y_std = model.regressor.target_mean, model.regressor.target_std
-    loader = get_dataloader(train_ds, shuffle=True)
+    loader = get_dataloader(train, shuffle=True)
 
     try:
         # Train the model.
@@ -333,7 +325,7 @@ def train(device: torch.device) -> Path:
         best_epoch, since_improved = 0, 0
         best_val_loss = float("inf")
         history: list[dict] = []
-        n_cells, n_samples = len(train_X), train_ds.n_samples
+        n_cells, n_samples = len(train_X), train.n_samples
         ema_state = {k: v.detach().clone() for k, v in model.regressor.state_dict().items()} if EMA_DECAY > 0 else None
 
         # Iterate over the epochs.
@@ -346,10 +338,13 @@ def train(device: torch.device) -> Path:
 
                 # Forward pass. Targets are z-scored to match the head outputs.
                 out = model.regressor(
-                    batch.image_tokens, batch.source_tokens, batch.target_tokens,
-                    batch.source_mask, batch.target_mask,
+                    batch.image_tokens, 
+                    batch.source_tokens, 
+                    batch.target_tokens,
+                    batch.source_mask, 
+                    batch.target_mask,
                 )
-                loss = calc_loss(out, (batch.y - y_mean) / y_std, batch.default_cell, train_ds.mean_surface)
+                loss = calc_loss(out, (batch.y - y_mean) / y_std, train.default_cell, train.mean_surface)
 
                 # Backpropagate the loss.
                 optimizer.zero_grad()
@@ -375,10 +370,10 @@ def train(device: torch.device) -> Path:
                 model.regressor.load_state_dict(ema_state)
 
             # Evaluate regression and selection on train and val.
-            train_regression = eval_regression(model, train_ds)
-            train_selection = eval_selection(model, train_ds)
-            val_regression = eval_regression(model, val_ds)
-            val_selection = eval_selection(model, val_ds)
+            train_regression = eval_regression(model, train)
+            train_selection = eval_selection(model, train)
+            val_regression = eval_regression(model, val)
+            val_selection = eval_selection(model, val)
 
             log_epoch(
                 run, epoch, train_regression, train_selection, val_regression, val_selection,
@@ -414,8 +409,8 @@ def train(device: torch.device) -> Path:
                     "target_std": model.regressor.target_std.cpu(),
                     "target_cols": list(TARGET_COLS),
                     "prediction_space": str(PREDICTION_SPACE),
-                    "image_shape": meta.image_shape,
-                    "source_shape": meta.source_shape,
+                    "image_shape": meta.img_shape,
+                    "source_shape": meta.src_shape,
                     "cell_t_pairs": meta.t,
                     "t_start_values": t_start_values,
                     "t_end_values": t_end_values,
@@ -452,8 +447,8 @@ def train(device: torch.device) -> Path:
         checkpoint = torch.load(weights_out, map_location=device, weights_only=False)
         model.regressor.load_state_dict(checkpoint["regressor_state_dict"])
 
-        results = eval_regression(model, test_ds)
-        test_sel = eval_selection(model, test_ds)
+        results = eval_regression(model, test)
+        test_sel = eval_selection(model, test)
         print("\n" + format_metric_table([("test", results, test_sel)]))
 
         # Summary rather than log, so the runs table ranks on final quality
@@ -479,11 +474,10 @@ def train(device: torch.device) -> Path:
                 "history": history,
             }, f, indent=4)
 
-        return run_dir
+        print(f"\nSaved to {run_dir.resolve()}")
 
     finally:
-        # Always close the run: a crash mid-training should still leave a
-        # finished (and correctly marked) run rather than a dangling one.
+        # Always close the run.
         finish_run(run)
 
 
@@ -496,11 +490,10 @@ def main() -> None:
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
-    # Splits are built inside train() so get_dataset can write id_to_split.csv
-    # and the mean surface into the run directory.
+    # Splits are built inside train().
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    run_dir = train(device)
-    print(f"\nSaved to {run_dir.resolve()}")
+    train(device)
+    
 
 
 if __name__ == "__main__":

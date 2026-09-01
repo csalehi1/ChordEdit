@@ -168,19 +168,19 @@ USE_POS_EMB = bool(_cfg("USE_POS_EMB"))
 # Which image representation the regressor sees. "vae" is the flattened SD VAE
 # latent the model has always used. "clip" replaces it with a mean-pooled
 # CLIP-L/14 embedding, the encoder CLIP-Edited is scored with, pooled the way
-# the cached text embeddings were. "vae+clip" keeps the latent and projects the
+# the cached text embeddings were. "vae_clip" keeps the latent and projects the
 # CLIP embedding as a second image arm.
-IMG_EMB_SOURCE = str(_cfg("IMG_EMB_SOURCE", "vae"))
-if IMG_EMB_SOURCE not in ("vae", "clip", "vae+clip"):
-    raise ValueError(f"Unknown {IMG_EMB_SOURCE=}; expected 'vae', 'clip' or 'vae+clip'")
+IMG_EMB_TYPE = str(_cfg("IMG_EMB_TYPE", "vae"))
+if IMG_EMB_TYPE not in ("vae", "clip", "vae_clip"):
+    raise ValueError(f"Unknown {IMG_EMB_TYPE=}; expected 'vae', 'clip' or 'vae_clip'")
 
 # Which prompt representation the regressor sees. "sd" is the sd_turbo text
 # encoder's mean-pooled hidden states, the cached source.pt / target.pt. "clip"
 # replaces them with CLIP-L/14 text embeddings, so that image and text share one
 # space and the CLIP-Edited cosine becomes expressible from the inputs.
-TEXT_EMB_SOURCE = str(_cfg("TEXT_EMB_SOURCE", "sd"))
-if TEXT_EMB_SOURCE not in ("sd", "clip"):
-    raise ValueError(f"Unknown {TEXT_EMB_SOURCE=}; expected 'sd' or 'clip'")
+TEXT_EMB_TYPE = str(_cfg("TEXT_EMB_TYPE", "sd"))
+if TEXT_EMB_TYPE not in ("sd", "clip"):
+    raise ValueError(f"Unknown {TEXT_EMB_TYPE=}; expected 'sd' or 'clip'")
 
 # Regressor MLP architecture.
 IMG_PROJ_DIM = int(_cfg("IMG_PROJ_DIM"))

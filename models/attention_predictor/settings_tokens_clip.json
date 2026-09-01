@@ -9,7 +9,7 @@
   "USE_CENTER_CROP": true,
   "MAX_SAMPLES": null,
   "PREDICTION_SPACE": "deltas",
-  "IMG_EMB_SOURCE": "clip",
+  "IMG_EMB_TYPE": "clip",
   "PATCH_SIZE": 8,
   "ATTN_DIM": 512,
   "N_HEADS": 8,
@@ -45,7 +45,7 @@
   "SELECT_PHI_WEIGHTS": null,
   "RUN_NAME": "",
   "PIE_BENCH": false,
-  "TEXT_EMB_SOURCE": "tokens",
+  "TEXT_EMB_TYPE": "tokens",
   "USE_DIFF_SALIENCY": true,
   "LAYERSCALE_INIT": 0.001
 }

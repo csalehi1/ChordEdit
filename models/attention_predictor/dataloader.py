@@ -26,8 +26,8 @@ class SampleBatch:
     image_tokens: torch.Tensor          # (N, C, S, S), (N, 1, D_clip), (N, N_v+1, D)
     source_tokens: torch.Tensor         # (N, T, D), (N, 1, D)
     target_tokens: torch.Tensor         # (N, T, D), (N, 1, D)
-    source_mask: torch.Tensor | None    # (N, T) None when TEXT_EMB_SOURCE != "tokens"
-    target_mask: torch.Tensor | None    # (N, T) None when TEXT_EMB_SOURCE != "tokens"
+    source_mask: torch.Tensor           # (N, N_t) bool; ones when pooled
+    target_mask: torch.Tensor           # (N, N_t) bool; ones when pooled
 
     y: torch.Tensor                     # (N, n_cells, C)
     default_cell: torch.Tensor          # (N,)

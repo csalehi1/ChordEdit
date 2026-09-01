@@ -272,10 +272,10 @@ class SurrogateRegressor(nn.Module):
 
         # The visual path is the attention model's VisionFeaturizer, so it needs
         # the (C, S, S) latent grid rather than a flat embedding.
-        self.img_emb_source = str(IMG_EMB_SOURCE)
+        self.img_emb_source = str(IMG_EMB_TYPE)
         if self.img_emb_source != "vae":
             raise ValueError(
-                f"{IMG_EMB_SOURCE=} has no latent grid for VisionFeaturizer; expected 'vae'"
+                f"{IMG_EMB_TYPE=} has no latent grid for VisionFeaturizer; expected 'vae'"
             )
 
         # F_v mean-pooled to (1, d_v) and F_t as (2, d_t), both from the

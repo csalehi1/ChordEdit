@@ -192,19 +192,19 @@ FFN_MULT = float(_cfg("FFN_MULT", 0.0))
 
 # Visual key/value source. "vae" is the SD VAE latent grid the paper uses.
 # "clip" swaps in the pooled CLIP-L/14 image embedding as a single token, and
-# "vae+clip" appends it to the latent tokens. CLIP-Edited is scored with
+# "vae_clip" appends it to the latent tokens. CLIP-Edited is scored with
 # CLIP-L/14, so that encoder's space is the one the label is expressible in.
-IMG_EMB_SOURCE = str(_cfg("IMG_EMB_SOURCE", "vae"))
-if IMG_EMB_SOURCE not in ("vae", "clip", "vae+clip"):
-    raise ValueError(f"Unknown {IMG_EMB_SOURCE=}")
+IMG_EMB_TYPE = str(_cfg("IMG_EMB_TYPE", "vae"))
+if IMG_EMB_TYPE not in ("vae", "clip", "vae_clip"):
+    raise ValueError(f"Unknown {IMG_EMB_TYPE=}")
 
 # Text key/value source. "pooled" is the pipeline's masked-mean prompt vector,
 # one query per prompt. "tokens" reads the full (77, D) sequences and their
 # padding masks, so every prompt token is its own query and pooling happens
 # after grounding rather than before it.
-TEXT_EMB_SOURCE = str(_cfg("TEXT_EMB_SOURCE", "pooled"))
-if TEXT_EMB_SOURCE not in ("pooled", "tokens"):
-    raise ValueError(f"Unknown {TEXT_EMB_SOURCE=}")
+TEXT_EMB_TYPE = str(_cfg("TEXT_EMB_TYPE", "pooled"))
+if TEXT_EMB_TYPE not in ("pooled", "tokens"):
+    raise ValueError(f"Unknown {TEXT_EMB_TYPE=}")
 
 # Second pooled vector per prompt, weighted by each token's novelty against the
 # other prompt (1 - max cosine similarity). Source and target prompts differ in

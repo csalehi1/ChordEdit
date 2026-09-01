@@ -39,9 +39,9 @@ class SampleData:
 class SampleMeta:
     """Model-sizing and checkpoint contract, derived once from the train split."""
 
-    image_shape: tuple[int, ...]     # per-sample image_tokens shape
-    source_shape: tuple[int, ...]    # per-sample source_tokens shape
-    target_shape: tuple[int, ...]    # per-sample target_tokens shape
+    img_shape: tuple[int, ...]     # per-sample image_tokens shape
+    src_shape: tuple[int, ...]    # per-sample source_tokens shape
+    tgt_shape: tuple[int, ...]    # per-sample target_tokens shape
     n_cells: int                     # cells per grid
     t: torch.Tensor                  # (n_cells, 2) being (t_start, t_end), float64 CPU
     default_cell: int                # shared default-cell index; raises if not unique
@@ -53,7 +53,7 @@ class SplitDataset:
 
     split_name: str                  # "train" / "val" / "test"
     sample_ids: tuple[str, ...]      # (N,) one sample_id per grid
-    x: EmbeddingsTable               # shared across splits; index via sample_ids
+    embs: EmbeddingsTable            # shared across splits; index via sample_ids
     y: torch.Tensor                  # (N, n_cells, C) PREDICTION_SPACE targets
     y_raw: torch.Tensor              # (N, n_cells, C) "raw" targets
     default_cell: int                # position of the default cell within each grid
@@ -64,7 +64,7 @@ class SplitDataset:
     def __post_init__(self):
         # Translate sample ids to table rows once, so gather is pure tensor
         # indexing, and cache the id -> grid position map __getitem__ uses.
-        object.__setattr__(self, "_table_idx", self.x.sample_idx(list(self.sample_ids)))
+        object.__setattr__(self, "_table_idx", self.embs.sample_idx(list(self.sample_ids)))
         object.__setattr__(self, "_sid_to_i", {sid: i for i, sid in enumerate(self.sample_ids)})
 
     @property
@@ -77,26 +77,21 @@ class SplitDataset:
         i = self._sid_to_i[sample_id]
         return SampleData(
             sample_id=sample_id,
-            x=self.x.get_sample_embeddings(sample_id),
+            x=self.embs.get_sample_embeddings(sample_id),
             y=self.y[i],
             y_raw=self.y_raw[i],
         )
 
     def gather(self, sel: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """Tensors for a batch of grids at integer indices sel.
-
-        Returns (image_tokens, source_tokens, target_tokens, source_mask,
-        target_mask, y); consumed only by dataloader.SplitDataloader._batch and
-        eval chunking.
-        """
+        """Tensors for a batch of grids at integer indices sel."""
         idx = self._table_idx[sel]
-        table = self.x
+        table = self.embs
         return (
             table.image_tokens[idx],
             table.source_tokens[idx],
             table.target_tokens[idx],
-            None if table.source_mask is None else table.source_mask[idx],
-            None if table.target_mask is None else table.target_mask[idx],
+            table.source_mask[idx],
+            table.target_mask[idx],
             self.y[sel],
         )
 
@@ -351,9 +346,9 @@ def get_dataset(
         mean_surface = _calc_mean_surface()
         _, t_pairs, _, _ = arranged["train"]
         return SampleMeta(
-            image_shape=table.image_shape,
-            source_shape=table.source_shape,
-            target_shape=table.target_shape,
+            img_shape=table.image_shape,
+            src_shape=table.source_shape,
+            tgt_shape=table.target_shape,
             n_cells=int(t_pairs.shape[0]),
             t=t_pairs,
             default_cell=_default_cell(t_pairs),
@@ -374,7 +369,7 @@ def get_dataset(
             out[name] = SplitDataset(
                 split_name=name,
                 sample_ids=tuple(sample_ids),
-                x=table,
+                embs=table,
                 y=y.to(device),
                 y_raw=y_raw.to(device),
                 default_cell=_default_cell(t_pairs),
