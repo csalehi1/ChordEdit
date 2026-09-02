@@ -30,6 +30,8 @@ from _wandb import finish_run, init_run, log_epoch, log_summary
 from dataloader import get_dataloader
 from dataset import SplitDataset, get_dataset
 from metrics import *
+# Underscore-prefixed, so the star import above does not carry it.
+from metrics import _selection_metrics_at
 from model import AttentionModel, preds_to_deltas
 from settings import *
 
@@ -248,7 +250,10 @@ def eval_selection(
             mse_top_k=MSE_LOSS_TOP_K,
             ranking_top_k=RANKING_LOSS_TOP_K,
         ),
-        **selection_metrics(true_phi, pred_phi, default_cell),
+        # Score the cells selected_cells actually picked. A fresh argmax here
+        # would ignore the SELECTOR_* levers, so regret/gain/top-k would be
+        # measured at a different cell than the delta_* columns below.
+        **_selection_metrics_at(true_phi, chosen, default_cell),
         **per_component_metrics(true_deltas, pred_deltas, ("psnr", "clip"), chosen, default_cell),
         **comparison_metrics(true_phi, dataset.y_raw.double(), ("psnr", "clip"), chosen, default_cell),
     }
@@ -287,7 +292,7 @@ def train(device: torch.device) -> None:
         meta.src_shape[-1],
         meta.n_cells, 
         device=device,
-        default_cell=meta.default_cell
+        default_cell=meta.default_cell,
     )
     n_params = sum(p.numel() for p in model.regressor.parameters())
     print(
@@ -426,6 +431,7 @@ def train(device: torch.device) -> None:
                     "prediction_space": str(PREDICTION_SPACE),
                     "image_shape": meta.img_shape,
                     "source_shape": meta.src_shape,
+                    "img_emb_pool": bool(IMG_EMB_POOL),
                     "cell_t_pairs": meta.t,
                     "t_start_values": t_start_values,
                     "t_end_values": t_end_values,

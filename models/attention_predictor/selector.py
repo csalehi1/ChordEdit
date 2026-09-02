@@ -45,18 +45,65 @@ from model import AttentionModel, preds_to_deltas
 from settings import *
 
 
+def get_neighbor_map(t_pairs: np.ndarray) -> torch.Tensor:
+    """Map each cell to itself and its 8 neighbors."""
+    t_start_values = np.unique(t_pairs[:, 0])
+    t_end_values = np.unique(t_pairs[:, 1])
+    n_start, n_end = len(t_start_values), len(t_end_values)
+
+    # Grid position of every cell, and the inverse map back to cell ids.
+    i = np.searchsorted(t_start_values, t_pairs[:, 0])
+    j = np.searchsorted(t_end_values, t_pairs[:, 1])
+    cell_of = np.empty((n_start, n_end), dtype=np.int64)
+    cell_of[i, j] = np.arange(len(t_pairs))
+
+    # Clipping replicates at the edges, so border cells keep 9 neighbors.
+    neighbors = []
+    for di in (-1, 0, 1):
+        for dj in (-1, 0, 1):
+            ii = np.clip(i + di, 0, n_start - 1)
+            jj = np.clip(j + dj, 0, n_end - 1)
+            neighbors.append(cell_of[ii, jj])
+    return torch.as_tensor(np.stack(neighbors, axis=-1))
+
+
 class SelectorModel:
     """Select (t_start, t_end) from predicted cells; no trainable weights."""
 
     def __init__(
         self,
-        model: AttentionModel,
-        cell_t_pairs: np.ndarray,
+        model: AttentionModel | list[AttentionModel],
+        t_pairs: np.ndarray,
         mean_surface: torch.Tensor,
     ):
-        self.model = model
-        self.cell_t_pairs = np.asarray(cell_t_pairs, dtype=np.float64)
+        # A single model is the length-1 case, so select_batch has one path.
+        self.models = list(model) if isinstance(model, (list, tuple)) else [model]
+        self.model = self.models[0]
+        self.t_pairs = np.asarray(t_pairs, dtype=np.float64)
         self.mean_surface = mean_surface
+
+        # Calculate the neighbor map here and reuse it for every batch, if requested.
+        if SELECTOR_TEMPERATURE is not None:
+            self.neighbor_map = get_neighbor_map(self.t_pairs)
+
+    @staticmethod
+    def _build(ckpt: dict, device: torch.device | str) -> AttentionModel:
+        """Rebuild one predictor from its checkpoint's own sizing contract."""
+        cell_t_pairs = ckpt["cell_t_pairs"].cpu().numpy()
+        t_start_values = np.asarray(ckpt["t_start_values"].cpu(), dtype=np.float64)
+        t_end_values = np.asarray(ckpt["t_end_values"].cpu(), dtype=np.float64)
+
+        model = AttentionModel(
+            tuple(int(v) for v in ckpt["image_shape"]),
+            int(tuple(ckpt["source_shape"])[-1]),
+            int(cell_t_pairs.shape[0]),
+            device=device,
+            default_cell=get_default_cell(cell_t_pairs, t_start_values, t_end_values),
+        )
+        model.regressor.load_state_dict(ckpt["regressor_state_dict"])
+        model.regressor.set_target_standardization(ckpt["target_mean"], ckpt["target_std"])
+        model.regressor.to(device).eval()
+        return model
 
     @classmethod
     def load(
@@ -65,37 +112,30 @@ class SelectorModel:
         mean_surface: torch.Tensor,
         device: torch.device | str | None = None,
         gpu: int | str | None = None,
+        run_dirs: list[str] | None = SELECTOR_RUN_DIRS,
     ) -> SelectorModel:
-        """Build AttentionModel from regressor_weights.pt and wrap it."""
+        """Build AttentionModel(s) from regressor_weights.pt and wrap them."""
         weights_path = Path(weights_path)
         if device is None:
             device = resolve_device(gpu)
         
         # Load the save checkpoint.
         ckpt = torch.load(weights_path, map_location=device, weights_only=False)
+        t_pairs = ckpt["cell_t_pairs"].cpu().numpy()
+        models = [cls._build(ckpt, device)]
 
-        # Load metadata from the checkpoint.
-        cell_t_pairs = ckpt["cell_t_pairs"].cpu().numpy()
-        image_shape = tuple(int(v) for v in ckpt["image_shape"])
-        text_dim = int(tuple(ckpt["source_shape"])[-1])
-        t_start_values = np.asarray(ckpt["t_start_values"].cpu(), dtype=np.float64)
-        t_end_values = np.asarray(ckpt["t_end_values"].cpu(), dtype=np.float64)
-        default_cell = get_default_cell(cell_t_pairs, t_start_values, t_end_values)
+        # Model members must share the grid, or their surfaces are not commensurable.
+        for run_dir in run_dirs or []:
+            other_path = Path(run_dir) / weights_path.name
+            other = torch.load(other_path, map_location=device, weights_only=False)
+            models.append(cls._build(other, device))
 
-        # Build the model.
-        model = AttentionModel(
-            image_shape, 
-            text_dim, 
-            int(cell_t_pairs.shape[0]),
-            device=device,
-            default_cell=default_cell,
-        )
-        model.regressor.load_state_dict(ckpt["regressor_state_dict"])
-        model.regressor.set_target_standardization(ckpt["target_mean"], ckpt["target_std"])
-        model.regressor.to(device).eval()
-
-        print(f"Selector predicts in {PREDICTION_SPACE!r} space over {cell_t_pairs.shape[0]} cells.")
-        return cls(model, cell_t_pairs, mean_surface)
+        if len(models) > 1:
+            print(f"Ensembled {len(models)} models.")
+        else:
+            print(f"Loaded model.")
+        
+        return cls(models, t_pairs, mean_surface)
 
     @torch.no_grad()
     def select_batch(
@@ -108,42 +148,46 @@ class SelectorModel:
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return (t_start, t_end) arrays of shape (N,)."""
         
-        # Predict the cells.
-        preds = self.model.pred_cells(
-            image_tokens, 
-            source_tokens, 
-            target_tokens, 
-            source_mask, 
-            target_mask,
-        )
+        # Predict the cells with every model member, and average in delta space.
+        default_cell = self.model.regressor.default_cell
+        pred_args = (image_tokens, source_tokens, target_tokens, source_mask, target_mask)
+        preds = [model.pred_cells(*pred_args) for model in self.models]
+        deltas = [preds_to_deltas(pred, default_cell, self.mean_surface) for pred in preds]
+        deltas = torch.stack(deltas).mean(dim=0)
 
         # Calculate the raw phi scores.
-        default_cell = self.model.regressor.default_cell
-        deltas = preds_to_deltas(preds, default_cell, self.mean_surface)
         phi = calc_phi(deltas)
+        rank = phi
 
-        # Reweight the phi scores per-column if requested.
+        # Reweight the phi scores per-column, if requested.
         if SELECTOR_DELTA_WEIGHTS is not None:
-            phi = calc_phi(deltas, weights=deltas.new_tensor(SELECTOR_DELTA_WEIGHTS))
+            rank = calc_phi(deltas, weights=deltas.new_tensor(SELECTOR_DELTA_WEIGHTS))
         
-        # Restrict the argmax to cells clearing per-column floors if requested.
+        # Restrict the argmax to cells clearing per-column floors, if requested.
         if SELECTOR_DELTA_FLOORS is not None:
-            floors = deltas.new_tensor([float("-inf") if f is None else f for f in SELECTOR_DELTA_FLOORS])
-            eligible = (deltas >= floors).all(dim=-1)
+            delta_floors = deltas.new_tensor([float("-inf") if f is None else f for f in SELECTOR_DELTA_FLOORS])
+            eligible = (deltas >= delta_floors).all(dim=-1)
             keep = eligible | ~eligible.any(dim=-1, keepdim=True)
-            phi = phi.masked_fill(~keep, -float("inf"))
+            rank = rank.masked_fill(~keep, -float("inf"))
+
+        # Sort each cell by the phi  mass over its neighborhood, if requested.
+        if SELECTOR_TEMPERATURE is not None:
+            probs = torch.softmax(rank / SELECTOR_TEMPERATURE, dim=-1)
+            rank = probs[..., self.neighbor_map.to(probs.device)].sum(dim=-1)
+            # Floored-out cells have no mass, so re-exclude them here too.
+            rank = rank.masked_fill(torch.isinf(rank), -float("inf"))
 
         # Select the best cell for each sample.
-        chosen = phi.argmax(dim=-1)
+        chosen = rank.argmax(dim=-1)
 
-        # Stay on the default cell unless the chosen cell clears a phi floor if requested.
+        # Stay on the default cell unless the chosen cell clears a phi floor, if requested.
         if SELECTOR_PHI_FLOOR is not None:
             n = chosen.shape[0]
             rows = torch.arange(n, device=chosen.device)
-            gain = phi[rows, chosen] - phi[:, default_cell]
+            gain = rank[rows, chosen] - rank[:, default_cell]
             chosen = torch.where(gain > SELECTOR_PHI_FLOOR, chosen, chosen.new_full((n,), default_cell))
 
-        pairs = self.cell_t_pairs[chosen.detach().cpu().numpy()]
+        pairs = self.t_pairs[chosen.detach().cpu().numpy()]
         return pairs[:, 0], pairs[:, 1]
 
 

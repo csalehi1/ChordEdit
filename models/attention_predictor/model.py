@@ -103,6 +103,10 @@ class VisionFeaturizer(nn.Module):
         if IMG_EMB_TYPE == "vae":
             # Flatten from (N, C, S, S) to (N, N_v, C).
             image_tokens = self.spatial_flatten(image_tokens)
+            # Pooling here rather than in the loader: the latent is stored as a
+            # grid, so its tokens only exist once spatial_flatten has made them.
+            if IMG_EMB_POOL:
+                image_tokens = image_tokens.mean(dim=-2, keepdim=True)
         # Project from (N, N_tok, img_dim) to (N, N_tok, attn_dim).
         return self.projector(image_tokens)
 
@@ -419,7 +423,7 @@ class AttentionRegressor(nn.Module):
         # If difference-aware saliencies are enabled, add them to the edit descriptor.
         if f_diffs is not None:
             z_edit = torch.cat([z_edit, f_diffs[:, 0], f_diffs[:, 1]], dim=-1)    # (N, 6d)
-        
+
         if SPLIT_COMBINER:
             # Map the difference-aware edit representation with two separate combiners for the heads.
             h_psnr = self.psnr_combiner(z_edit)    # (N, d)

@@ -203,6 +203,18 @@ IMG_EMB_TYPE = str(_cfg("IMG_EMB_TYPE", "vae"))
 if IMG_EMB_TYPE not in ("vae", "clip", "vae_clip"):
     raise ValueError(f"Unknown {IMG_EMB_TYPE=}")
 
+# Whether the visual embedding is pooled to a single key/value token. False
+# keeps the token sequence, giving the prompt queries a spatial layout to attend
+# over: the CLIP patch tokens for "clip", or the latent patches for "vae".
+IMG_EMB_POOL = bool(_cfg("IMG_EMB_POOL", True))
+
+# Reserved for the masked-image feature block, which is not implemented on
+# this branch. The keys are declared so a config carrying them still loads.
+USE_IMG_MASK = bool(_cfg("USE_IMG_MASK", False))
+USE_ZEDIT_MASK = bool(_cfg("USE_ZEDIT_MASK", False))
+if USE_IMG_MASK or USE_ZEDIT_MASK:
+    raise NotImplementedError(f"{USE_IMG_MASK=} / {USE_ZEDIT_MASK=} are not implemented here")
+
 # Text key/value source. "pooled" is the pipeline's masked-mean prompt vector,
 # one query per prompt. "tokens" reads the full (77, D) sequences and their
 # padding masks, so every prompt token is its own query and pooling happens
@@ -334,3 +346,17 @@ else:
         SELECTOR_DELTA_FLOORS = None
 _SELECT_PHI_FLOOR = _cfg("SELECTOR_PHI_FLOOR", None)
 SELECTOR_PHI_FLOOR = None if _SELECT_PHI_FLOOR is None else float(_SELECT_PHI_FLOOR)
+
+# Softmax the predicted phi into a distribution over cells and rank each cell
+# by the probability mass over its neighbors, rather than by its own value.
+# Adjacent cells carry correlated true phi, so a broad ridge is a safer pick
+# than an isolated spike. Null is a plain argmax.
+_SELECTOR_TEMPERATURE = _cfg("SELECTOR_TEMPERATURE", None)
+SELECTOR_TEMPERATURE = None if _SELECTOR_TEMPERATURE is None else float(_SELECTOR_TEMPERATURE)
+
+# Extra run directories whose predictors are averaged with this one at
+# selection time. Averaging is on the delta surfaces, before phi scalarizes
+# them, because phi is concave. Every run listed must share this run's split
+# and grid.
+_SELECTOR_RUN_DIRS = _cfg("SELECTOR_RUN_DIRS", None)
+SELECTOR_RUN_DIRS = None if not _SELECTOR_RUN_DIRS else [str(p) for p in _SELECTOR_RUN_DIRS]

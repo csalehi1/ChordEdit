@@ -26,20 +26,19 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from settings import *
 
 _PACKED_EMBEDDINGS_DIR = Path(__file__).resolve().parent / ".cache" / "packed_embeddings"
+
+# The image and its masked counterpart, each encoded both ways. The CLIP files
+# are read separately by get_clip_tokens, which pools them on load rather than
+# packing 257 tokens per sample into the cached tables.
+_CLIP_TOKENS_FILE = "image_clip_tokens.pt"
 _EMB_FILES = {
-    "img": "image_tokens.pt",
-    "src": "source.pt",
-    "tar": "target.pt",
+    "img": "image_vae_tokens.pt",
     "src_tokens": "source_tokens.pt",
     "tar_tokens": "target_tokens.pt",
     "src_mask": "source_mask.pt",
     "tar_mask": "target_mask.pt",
 }
 
-# mlp_predictor already builds and caches the pooled CLIP-L/14 image table, and
-# its cache is keyed by DIR_NAME alone, so importing the module rather than
-# forking it means both packages read and write the same file.
-_MLP_DIR = Path(__file__).resolve().parents[1] / "mlp_predictor"
 
 
 """
@@ -70,6 +69,7 @@ class EmbeddingsTable:
     target_tokens: torch.Tensor         # like source_tokens
     source_mask: torch.Tensor           # (N, N_t) bool; ones when pooled
     target_mask: torch.Tensor           # like source_mask
+
 
     @property
     def image_shape(self) -> tuple[int, ...]:
@@ -121,67 +121,29 @@ def _concat_vae_clip_tokens(vae: torch.Tensor, clip: torch.Tensor) -> torch.Tens
     return torch.cat([tokens, clip], dim=-2)
 
 
-def _get_clip_image_tokens(samples: pd.DataFrame, device: torch.device | str) -> torch.Tensor:
-    """(n, 1, D_clip) pooled CLIP-L/14 image embeddings, one row per sample."""
-    if str(_MLP_DIR) not in sys.path:
-        sys.path.append(str(_MLP_DIR))
-    import clip_image
+def get_clip_tokens(
+    samples: pd.DataFrame,
+    *,
+    scattered_dir: Path | None = None,
+    tokens_file: str = _CLIP_TOKENS_FILE,
+    pool: bool | None = None,
+) -> torch.Tensor:
+    """(n, N_v, D_clip) CLIP-L/14 vision tokens, pooled to one token per sample when pooling."""
+    root = (scattered_dir if scattered_dir is not None else SCATTERED_DIR) / "annotation_embeddings"
+    sample_ids = samples[SAMPLE_ID_COL].astype(str).tolist()
+    pool = IMG_EMB_POOL if pool is None else pool
 
-    # clip_image puts its own package dir at sys.path[0] on import. Drop it
-    # once the module is bound, so nothing imported later resolves to
-    # mlp_predictor's copy of a module this package also has.
-    while str(_MLP_DIR) in sys.path:
-        sys.path.remove(str(_MLP_DIR))
+    def _load_clip_tokens(sample_id: str) -> torch.Tensor:
+        """Load one sample's tokens, pooling them here so the table stays small."""
+        tokens = torch.load(root / sample_id / tokens_file, map_location="cpu", weights_only=True)
+        return tokens.mean(dim=0, keepdim=True) if pool else tokens
 
-    def _get_pie_clip_image_embeddings(pie_ids: list[str]) -> torch.Tensor:
-        """(n, D_clip) pooled CLIP embeddings for pie_*-prefixed sample ids."""
-        path = _PACKED_EMBEDDINGS_DIR / "clipL14-pooled-piebenchv1.pt"
-        meta = {
-            "clip_model": clip_image.CLIP_MODEL_NAME,
-            "layout": "vision_hidden_meanpool_v1",
-            "dir_name": PIE_BENCH_DIR_NAME,
-            "dim": clip_image.CLIP_IMG_DIM,
-        }
-
-        if path.exists():
-            try:
-                data = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
-                cached_meta = data.get("meta")
-                ok = isinstance(cached_meta, dict) and all(cached_meta.get(k) == v for k, v in meta.items())
-                id_to_i = {sid: i for i, sid in enumerate(data["sids"])} if ok else {}
-                if ok and not any(sid not in id_to_i for sid in pie_ids):
-                    print("Loaded PIE CLIP image embeddings from cache.")
-                    return data["emb"][[id_to_i[sid] for sid in pie_ids]].contiguous()
-                print(f"{path} unusable for this request. Recomputing...")
-            except Exception as e:
-                print(f"Failed to load {path} ({e}). Recomputing...")
-
-        raw_ids = [sid.removeprefix(PIE_SAMPLE_ID_PREFIX) for sid in pie_ids]
-        inputs_df = pd.read_csv(PIE_INPUTS_CSV, dtype={SAMPLE_ID_COL: str})
-        inputs_df[SAMPLE_ID_COL] = inputs_df[SAMPLE_ID_COL].str.zfill(8)
-        inputs_df = inputs_df.drop_duplicates(SAMPLE_ID_COL).set_index(SAMPLE_ID_COL, drop=False)
-        missing = [sid for sid in raw_ids if sid not in inputs_df.index]
-        if missing:
-            preview = ", ".join(missing[:5])
-            raise ValueError(f"{PIE_INPUTS_CSV} missing {len(missing)} sample_id(s): {preview}")
-        emb = clip_image._compute(inputs_df.loc[raw_ids].reset_index(drop=True), device)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = Path(str(path) + ".tmp")
-        torch.save({"sids": list(pie_ids), "emb": emb.contiguous().clone(), "meta": meta}, tmp)
-        tmp.replace(path)
-        print(f"Saved PIE CLIP image embeddings: {path}")
-        return emb
-
-    sids = samples[SAMPLE_ID_COL].astype(str)
-    is_pie = sids.str.startswith(PIE_SAMPLE_ID_PREFIX)
-    parts = []
-    ue_samples = samples.loc[~is_pie]
-    if len(ue_samples):
-        parts.append(clip_image.get_clip_image_embeddings(ue_samples, device=device))
-    if is_pie.any():
-        parts.append(_get_pie_clip_image_embeddings(sids.loc[is_pie].tolist()))
-    emb = torch.cat(parts, dim=0)
-    return emb.unsqueeze(-2).contiguous().float().cpu()
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        rows = list(tqdm(
+            pool.map(_load_clip_tokens, sample_ids),
+            total=len(sample_ids), desc=f"Loading {tokens_file}", unit="sample",
+        ))
+    return torch.stack(rows).float().contiguous()
 
 
 def get_scattered_embeddings(
@@ -204,8 +166,9 @@ def get_scattered_embeddings(
     if not sample_ids:
         raise ValueError("Expected samples to load")
     n = len(sample_ids)
-    use_tokens = TEXT_EMB_TYPE == "tokens"
-    kinds = ["img", "src", "tar"] + (["src_tokens", "tar_tokens", "src_mask", "tar_mask"] if use_tokens else [])
+    # The prompt tokens are always read: the pooled vectors are their masked
+    # mean, so nothing else supplies the "pooled" text path.
+    kinds = ["img", "src_tokens", "tar_tokens", "src_mask", "tar_mask"]
 
     # Probe shapes from the first sample, then preallocate the tables so peak
     # memory stays ~1x table size (no row lists + torch.stack copy).
@@ -213,45 +176,42 @@ def get_scattered_embeddings(
     if img_probe.ndim != 3 or img_probe.shape[-1] != img_probe.shape[-2]:
         raise ValueError(f"Expected (C, S, S) latent tokens, got {tuple(img_probe.shape)}")
     img_shape = tuple(img_probe.shape)
-    src_probe = _load_scattered_cache(sample_ids[0], "src")
-    if src_probe.numel() != src_probe.shape[-1]:
-        raise ValueError(f"Expected a pooled text vector (D,) or (1, D), got {tuple(src_probe.shape)}")
-    text_shape = (1, int(src_probe.shape[-1]))
+    tok_probe = _load_scattered_cache(sample_ids[0], "src_tokens")
+    if tok_probe.ndim != 2:
+        raise ValueError(f"Expected (T, D) prompt tokens, got {tuple(tok_probe.shape)}")
+    t_len, t_dim = tok_probe.shape
+
     tables: dict[str, torch.Tensor] = {
         "img": torch.empty((n, *img_shape), dtype=torch.float32),
-        "src": torch.empty((n, *text_shape), dtype=torch.float32),
-        "tar": torch.empty((n, *text_shape), dtype=torch.float32),
+        "src": torch.empty((n, 1, t_dim), dtype=torch.float32),
+        "tar": torch.empty((n, 1, t_dim), dtype=torch.float32),
+        "src_tokens": torch.empty((n, t_len, t_dim), dtype=torch.float16),
+        "tar_tokens": torch.empty((n, t_len, t_dim), dtype=torch.float16),
+        "src_mask": torch.empty((n, t_len), dtype=torch.bool),
+        "tar_mask": torch.empty((n, t_len), dtype=torch.bool),
     }
-    if use_tokens:
-        tok_probe = _load_scattered_cache(sample_ids[0], "src_tokens")
-        if tok_probe.ndim != 2:
-            raise ValueError(f"Expected (T, D) prompt tokens, got {tuple(tok_probe.shape)}")
-        t_len, t_dim = tok_probe.shape
-        tables |= {
-            "src_tokens": torch.empty((n, t_len, t_dim), dtype=torch.float16),
-            "tar_tokens": torch.empty((n, t_len, t_dim), dtype=torch.float16),
-            "src_mask": torch.empty((n, t_len), dtype=torch.bool),
-            "tar_mask": torch.empty((n, t_len), dtype=torch.bool),
-        }
 
     def _load_row(i: int) -> tuple[int, dict[str, torch.Tensor]]:
         return i, {kind: _load_scattered_cache(sample_ids[i], kind) for kind in kinds}
+
+    def _pool_prompt(tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Masked mean over the prompt's real tokens, which is what source.pt held."""
+        keep = mask.bool().reshape(-1, 1)
+        return (tokens.float() * keep).sum(dim=0) / keep.sum().clamp(min=1)
 
     with ThreadPoolExecutor(max_workers=32) as pool:
         for i, row in tqdm(pool.map(_load_row, range(n)), total=n, desc="Loading scattered embeddings", unit="sample"):
             if tuple(row["img"].shape) != img_shape:
                 raise ValueError(f"Expected {img_shape} image tokens for sample {sample_ids[i]}, got {tuple(row['img'].shape)}")
             tables["img"][i] = row["img"].float()
-            # Text rows may be saved as (D,) or (1, D) but must be loaded as (1, D).
-            tables["src"][i] = row["src"].float().reshape(1, -1)
-            tables["tar"][i] = row["tar"].float().reshape(1, -1)
-            if use_tokens:
-                for kind in ("src_tokens", "tar_tokens"):
-                    if tuple(row[kind].shape) != (t_len, t_dim):
-                        raise ValueError(f"Expected {(t_len, t_dim)} for {kind} of {sample_ids[i]}, got {tuple(row[kind].shape)}")
-                    tables[kind][i] = row[kind].half()
-                tables["src_mask"][i] = row["src_mask"].bool().reshape(-1)
-                tables["tar_mask"][i] = row["tar_mask"].bool().reshape(-1)
+            for kind in ("src_tokens", "tar_tokens"):
+                if tuple(row[kind].shape) != (t_len, t_dim):
+                    raise ValueError(f"Expected {(t_len, t_dim)} for {kind} of {sample_ids[i]}, got {tuple(row[kind].shape)}")
+                tables[kind][i] = row[kind].half()
+            tables["src_mask"][i] = row["src_mask"].bool().reshape(-1)
+            tables["tar_mask"][i] = row["tar_mask"].bool().reshape(-1)
+            tables["src"][i] = _pool_prompt(row["src_tokens"], row["src_mask"])
+            tables["tar"][i] = _pool_prompt(row["tar_tokens"], row["tar_mask"])
 
     return tables
 
@@ -276,7 +236,7 @@ def get_packed_embeddings(
     main_meta = {
         "model": CHORD_EDIT_MODEL,
         "pipeline_type": CHORD_EDIT_PIPELINE_TYPE,
-        "layout": "img_tokens_src_tar_pooled_v2",
+        "layout": "vae_tokens_src_tar_pooled_v3",
         "image_size": int(CHORD_EDIT_IMAGE_SIZE),
         "dir_name": dir_name if dir_name is not None else DIR_NAME,
         "target_t_delta": TARGET_T_DELTA,
@@ -317,11 +277,12 @@ def get_packed_embeddings(
         print(f"Saved packed embeddings: {path}")
 
     use_tokens = TEXT_EMB_TYPE == "tokens"
-    main = _load_packed_cache(main_path, main_meta, ("img", "src", "tar"))
+    main_keys = ("img", "src", "tar")
+    main = _load_packed_cache(main_path, main_meta, main_keys)
     token = _load_packed_cache(token_path, token_meta, ("src_tokens", "tar_tokens", "src_mask", "tar_mask")) if use_tokens else {}
     if main is None or token is None:
         scattered = get_scattered_embeddings(samples, scattered_dir=scattered_dir)
-        main = {k: scattered[k] for k in ("img", "src", "tar")}
+        main = {k: scattered[k] for k in main_keys}
         _save_packed_cache(main_path, main_meta | {
             "source": "scattered",
             "img_shape": tuple(main["img"].shape[1:]),
@@ -373,10 +334,14 @@ def get_embeddings(
     source_tokens = tables["src_tokens"].float() if use_tokens else tables["src"]
     target_tokens = tables["tar_tokens"].float() if use_tokens else tables["tar"]
 
-    image_tokens = tables["img"]
-    if IMG_EMB_TYPE != "vae":
-        clip = _get_clip_image_tokens(samples, device)
-        image_tokens = clip if IMG_EMB_TYPE == "clip" else _concat_vae_clip_tokens(image_tokens, clip)
+    # Get the image tokens.
+    if IMG_EMB_TYPE == "vae":
+        image_tokens = tables["img"]
+    elif IMG_EMB_TYPE == "clip":
+        image_tokens = get_clip_tokens(samples)
+    elif IMG_EMB_TYPE == "vae_clip":
+        clip = get_clip_tokens(samples)
+        image_tokens = _concat_vae_clip_tokens(tables["img"], clip)
 
     if use_tokens:
         source_mask = tables["src_mask"].to(device)
