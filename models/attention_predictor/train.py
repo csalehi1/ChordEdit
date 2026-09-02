@@ -30,7 +30,7 @@ from _wandb import finish_run, init_run, log_epoch, log_summary
 from dataloader import get_dataloader
 from dataset import SplitDataset, get_dataset
 from metrics import *
-from model import AttentionModel, deltas_from_preds
+from model import AttentionModel, preds_to_deltas
 from settings import *
 
 
@@ -63,29 +63,44 @@ def calc_train_phi(deltas: torch.Tensor) -> torch.Tensor:
 def selected_cells(
     pred_deltas: torch.Tensor,  # (N, n_cells, 2)
     pred_phi: torch.Tensor,     # (N, n_cells)
+    default_cell: int,
 ) -> torch.Tensor:              # (N,)
     """Cell each sample would be sent to, under the selection-time levers.
 
-    Plain argmax of the predicted phi unless SELECT_PHI_WEIGHTS reweights the
-    ranking or SELECT_CLIP_FLOOR restricts it to cells clearing a CLIP delta.
-    Rows where the floor admits nothing keep the unrestricted argmax, matching
-    model.TimestepSelector.select_grid.
+    Plain argmax of the predicted phi unless SELECTOR_DELTA_WEIGHTS reweights the
+    ranking or SELECTOR_DELTA_FLOORS restricts it to cells clearing per-column
+    delta floors. SELECTOR_PHI_FLOOR then keeps the default cell unless the
+    chosen cell's phi gain clears that threshold, matching
+    selector.SelectorModel.select_batch.
     """
     rank_phi = pred_phi
-    if SELECT_PHI_WEIGHTS is not None:
-        rank_phi = calc_phi(pred_deltas, weights=pred_deltas.new_tensor(SELECT_PHI_WEIGHTS))
-    if SELECT_CLIP_FLOOR is not None:
-        eligible = pred_deltas[..., 1] >= SELECT_CLIP_FLOOR
+    if SELECTOR_DELTA_WEIGHTS is not None:
+        rank_phi = calc_phi(pred_deltas, weights=pred_deltas.new_tensor(SELECTOR_DELTA_WEIGHTS))
+    if SELECTOR_DELTA_FLOORS is not None:
+        floors = pred_deltas.new_tensor([
+            float("-inf") if f is None else f for f in SELECTOR_DELTA_FLOORS
+        ])
+        eligible = (pred_deltas >= floors).all(dim=-1)
         keep = eligible | ~eligible.any(dim=-1, keepdim=True)
         rank_phi = rank_phi.masked_fill(~keep, -float("inf"))
-    return rank_phi.argmax(dim=-1)
+    chosen = rank_phi.argmax(dim=-1)
+    if SELECTOR_PHI_FLOOR is not None:
+        n = chosen.shape[0]
+        rows = torch.arange(n, device=chosen.device)
+        gain = rank_phi[rows, chosen] - rank_phi[:, default_cell]
+        chosen = torch.where(
+            gain > SELECTOR_PHI_FLOOR,
+            chosen,
+            chosen.new_full((n,), default_cell),
+        )
+    return chosen
 
 
 def calc_loss(
     pred: torch.Tensor,                        # (G, n_cells, 2)
     true: torch.Tensor,                        # (G, n_cells, 2)
     default_cell: int,                         # shared index
-    mean_surface: torch.Tensor | None = None,  # (n_cells, 2)
+    mean_surface: torch.Tensor,                # (n_cells, 2)
 ) -> torch.Tensor:
     """Weighted phi MSE, pairwise ranking, and per-column MSE.
 
@@ -134,8 +149,8 @@ def calc_loss(
         return (((pred_deltas - true_deltas) ** 2) * weights).mean()
 
     # Calculate the pred and true deltas from the pred and true surfaces.
-    pred_deltas = deltas_from_preds(pred, default_cell, mean_surface)
-    true_deltas = deltas_from_preds(true, default_cell, mean_surface)
+    pred_deltas = preds_to_deltas(pred, default_cell, mean_surface)
+    true_deltas = preds_to_deltas(true, default_cell, mean_surface)
     pred_phi = calc_train_phi(pred_deltas)
     true_phi = calc_train_phi(true_deltas)
 
@@ -208,7 +223,7 @@ def eval_selection(
     """
     model.regressor.eval()
     device = dataset.y.device
-    surface = None if dataset.mean_surface is None else dataset.mean_surface.double()
+    surface = dataset.mean_surface.double()
     default_cell = dataset.default_cell
 
     pred_delta_parts = []
@@ -216,14 +231,14 @@ def eval_selection(
         sel = torch.arange(k, min(k + EVAL_CHUNK, dataset.n_samples), device=device)
         image_tokens, source_tokens, target_tokens, source_mask, target_mask, _ = dataset.gather(sel)
         out = model.pred_cells(image_tokens, source_tokens, target_tokens, source_mask, target_mask).double()
-        pred_delta_parts.append(deltas_from_preds(out, default_cell, surface))
+        pred_delta_parts.append(preds_to_deltas(out, default_cell, surface))
 
     # Both sides leave PREDICTION_SPACE here, so phi sees deltas either way.
     pred_deltas = torch.cat(pred_delta_parts)
-    true_deltas = deltas_from_preds(dataset.y.double(), default_cell, surface)
+    true_deltas = preds_to_deltas(dataset.y.double(), default_cell, surface)
     true_phi = calc_phi(true_deltas)
     pred_phi = calc_phi(pred_deltas)
-    chosen = selected_cells(pred_deltas, pred_phi)
+    chosen = selected_cells(pred_deltas, pred_phi, default_cell)
 
     return {
         **training_metrics(

@@ -13,11 +13,38 @@ import numpy as np
 import pandas as pd
 import torch
 
-from _helpers import MEAN_SURFACE_NAME, gather_at_pairs, prep_sample_id
+from _helpers import get_default_cell, prep_sample_id
 from embeddings import EmbeddingsTable, SampleEmbeddings, get_embeddings
 from settings import *
 
 ID_TO_SPLIT_NAME = "id_to_split.csv"
+
+
+def get_mean_surface(run_dir: Path, y: torch.Tensor) -> torch.Tensor:
+    """Load the saved (n_cells, 2) surface, or calculate it from y and save."""
+
+    def _calc_mean_surface(y: torch.Tensor) -> torch.Tensor:
+        surface = y.double().mean(dim=0)
+        return surface
+
+    def _load_mean_surface(path: Path) -> torch.Tensor:
+        surface = torch.load(path, map_location="cpu", weights_only=True)
+        return surface
+
+    def _save_mean_surface(path: Path, surface: torch.Tensor) -> None:
+        torch.save(surface.detach().cpu().contiguous(), path)
+        print(f"Saved {path.name}.")
+
+    # Load the mean surface if it exists.
+    path = Path(run_dir) / "mean_surface.pt"
+    if path.exists():
+        return _load_mean_surface(path)
+    
+    # Otherwise calculate it and save it.
+    surface = _calc_mean_surface(y)
+    _save_mean_surface(path, surface)
+    
+    return surface
 
 
 """
@@ -57,9 +84,7 @@ class SplitDataset:
     y: torch.Tensor                  # (N, n_cells, C) PREDICTION_SPACE targets
     y_raw: torch.Tensor              # (N, n_cells, C) "raw" targets
     default_cell: int                # position of the default cell within each grid
-
-    # (n_cells, C) used when PREDICTION_SPACE is "residuals"
-    mean_surface: torch.Tensor | None = None
+    mean_surface: torch.Tensor       # (n_cells, 2); unused unless PREDICTION_SPACE is "residuals"
 
     def __post_init__(self):
         # Translate sample ids to table rows once, so gather is pure tensor
@@ -270,7 +295,6 @@ def get_dataset(
 ) -> SplitDatasetBundle:
     """Build the device-resident SplitDatasetBundle."""
     run_dir = Path(run_dir)
-    mean_surface: dict | None = None
 
     def _get_splits_df() -> dict[str, tuple[pd.DataFrame, pd.DataFrame]]:
         """Get the splits_df from get_splits_df()."""
@@ -304,76 +328,34 @@ def get_dataset(
         t_pairs = torch.tensor(t[keep][0], dtype=torch.float64)
         return list(unique_ids[keep]), t_pairs, y[torch.as_tensor(keep)], y_raw[torch.as_tensor(keep)]
 
-    def _default_cell(t_pairs: torch.Tensor) -> int:
-        """Index of the default (t_start, t_end) cell in a canonical grid."""
-        hits = (
-            torch.isclose(t_pairs[:, 0], torch.tensor(DEFAULT_T_START, dtype=t_pairs.dtype))
-            & torch.isclose(t_pairs[:, 1], torch.tensor(DEFAULT_T_END, dtype=t_pairs.dtype))
-        ).nonzero(as_tuple=False).flatten()
-        if hits.numel() != 1:
-            raise ValueError(f"Expected exactly one default cell at ({DEFAULT_T_START}, {DEFAULT_T_END}), got {hits.numel()}")
-        return int(hits[0])
-
-    def _get_metadata() -> SampleMeta:
+    def _get_metadata(t_pairs: torch.Tensor) -> SampleMeta:
         """Get the metadata from the train split."""
-
-        def _calc_mean_surface() -> dict | None:
-            """Mean train target surface over the grid axes, saved to run_dir."""
-            if PREDICTION_SPACE == "raws":
-                return None
-            _, t_pairs, y, _ = arranged["train"]
-            mean_cells = y.double().mean(dim=0)  # (n_cells, C)
-            t_start_values = np.sort(np.unique(t_pairs[:, 0].numpy()))
-            t_end_values = np.sort(np.unique(t_pairs[:, 1].numpy()))
-            i = np.searchsorted(t_start_values, t_pairs[:, 0].numpy())
-            j = np.searchsorted(t_end_values, t_pairs[:, 1].numpy())
-            grid = torch.full((len(t_start_values), len(t_end_values), mean_cells.shape[1]), float("nan"), dtype=torch.float64)
-            grid[i, j] = mean_cells
-            surface = {
-                "t_start_values": torch.as_tensor(t_start_values, dtype=torch.float64),
-                "t_end_values": torch.as_tensor(t_end_values, dtype=torch.float64),
-                "mean_true_delta": grid,
-                "prediction_space": str(PREDICTION_SPACE),
-                "split": "train",
-                "n_samples": int(y.shape[0]),
-                "target_cols": list(TARGET_COLS),
-            }
-            torch.save(surface, run_dir / MEAN_SURFACE_NAME)
-            print(f"Saved {MEAN_SURFACE_NAME}")
-            return surface
-
-        nonlocal mean_surface
-        mean_surface = _calc_mean_surface()
-        _, t_pairs, _, _ = arranged["train"]
         return SampleMeta(
             img_shape=table.image_shape,
             src_shape=table.source_shape,
             tgt_shape=table.target_shape,
             n_cells=int(t_pairs.shape[0]),
             t=t_pairs,
-            default_cell=_default_cell(t_pairs),
+            default_cell=get_default_cell(t_pairs),
         )
 
     def _get_splits() -> dict[str, SplitDataset]:
         """Get the splits from the splits_df."""
         out: dict[str, SplitDataset] = {}
         for name, (sample_ids, t_pairs, y, y_raw) in arranged.items():
-            anchor = None
+            surface = mean_surface.to(dtype=torch.float)
             if PREDICTION_SPACE == "residuals":
                 # Anchor each cell on the train split's mean, so the heads only
                 # have to predict how a sample deviates from the population
-                # surface. Each split anchors at its own labeled pairs.
-                anchor = gather_at_pairs(mean_surface, t_pairs)  # (n_cells, C)
-                y = y - anchor.to(y)
-                anchor = anchor.to(device=device, dtype=torch.float)
+                y = y - surface.to(y)
             out[name] = SplitDataset(
                 split_name=name,
                 sample_ids=tuple(sample_ids),
                 embs=table,
                 y=y.to(device),
                 y_raw=y_raw.to(device),
-                default_cell=_default_cell(t_pairs),
-                mean_surface=anchor,
+                default_cell=get_default_cell(t_pairs),
+                mean_surface=surface.to(device=device),
             )
         return out
 
@@ -384,6 +366,8 @@ def get_dataset(
     splits = _get_splits_df()
     table = _get_embeddings()
     arranged = {name: _grid_arrange(X, y) for name, (X, y) in splits.items()}
-    meta = _get_metadata()
+    _, train_t, train_y, _ = arranged["train"]
+    mean_surface = get_mean_surface(run_dir, train_y)
+    meta = _get_metadata(train_t)
     split_datasets = _get_splits()
     return _get_bundle()

@@ -1,11 +1,10 @@
 # model.py
 
 """
-Difference-aware grid surface predictor and timestep selector.
+Difference-aware grid surface predictor.
 
     Model architecture:
     predictor(img_emb, src_emb, tar_emb) -> (n_cells, 2) grid of (psnr, clip)
-    selector(img, src_prompt, tar_prompt) -> (t_start, t_end)
 """
 
 from __future__ import annotations
@@ -18,75 +17,27 @@ _ROOT = os.path.abspath(os.path.join(_DIR, "..", ".."))
 sys.path.insert(0, _ROOT)
 sys.path.insert(0, _DIR)
 
-from dataclasses import dataclass
-from pathlib import Path
-
-import numpy as np
 import torch
 import torch.nn as nn
 
-from _helpers import (
-    MEAN_SURFACE_NAME,
-    load_mean_surface,
-    mean_surface_from_dict,
-    nearest_indices,
-    phi_from_delta_grids,
-    resolve_device,
-)
 from scores import calc_norm_deltas
 from settings import *
 
 
-def deltas_from_preds(
-    preds: torch.Tensor,                             # (N, n_cells, 2)
-    baseline_idx: int | torch.Tensor,
-    mean_surface: torch.Tensor | None = None,        # (n_cells, 2)
-) -> torch.Tensor:                                   # (N, n_cells, 2)
-    """Map PREDICTION_SPACE to "deltas" space."""
+def preds_to_deltas(preds: torch.Tensor, baseline_idx: int | torch.Tensor, mean_surface: torch.Tensor) -> torch.Tensor:
+    """Map PREDICTION_SPACE to "deltas" space. `mean_surface` is unused outside residuals."""
     if PREDICTION_SPACE == "deltas":
         return preds
     if PREDICTION_SPACE == "residuals":
-        if mean_surface is None:
-            raise ValueError(f"Expected a mean_surface for {PREDICTION_SPACE=}")
         return preds + mean_surface.to(device=preds.device, dtype=preds.dtype)
     if PREDICTION_SPACE == "raws":
         return calc_norm_deltas(preds, baseline_idx)
     raise ValueError(f"Unknown {PREDICTION_SPACE=}")
 
 
-# The true Delta at the default cell is identically 0 by construction, so the
-# heads' predicted surface is re-baselined there rather than left to learn it.
-# That only holds where the targets are deltas: under "raws" the metric value at
-# the default cell is not 0 and subtracting it would corrupt the target space.
-PIN_DEFAULT_CELL = PREDICTION_SPACE in ("deltas", "residuals")
-
-
-def default_cell_index(
-    cell_t_pairs: np.ndarray,  # (n_cells, 2)
-    t_start_values: np.ndarray,
-    t_end_values: np.ndarray,
-    default_t_start: float = DEFAULT_T_START,
-    default_t_end: float = DEFAULT_T_END,
-) -> int:
-    """Position of the default cell in the model's output cell order."""
-    cell_t_pairs = np.asarray(cell_t_pairs, dtype=np.float64)
-    cell_i = nearest_indices(t_start_values, cell_t_pairs[:, 0])
-    cell_j = nearest_indices(t_end_values, cell_t_pairs[:, 1])
-    default_i = _nearest_index(t_start_values, default_t_start)
-    default_j = _nearest_index(t_end_values, default_t_end)
-    found = np.flatnonzero((cell_i == default_i) & (cell_j == default_j))
-    if found.size != 1:
-        raise ValueError(
-            f"Expected exactly one cell at the default "
-            f"({default_t_start}, {default_t_end}), got {found.size}"
-        )
-    return int(found[0])
-
-
 def combine_edit_features(f_src: torch.Tensor, f_tar: torch.Tensor) -> torch.Tensor:
     """Create difference-aware edit representation, z_edit."""
     return torch.cat([f_src, f_tar, f_tar - f_src, f_src * f_tar], dim=-1)
-
 
 
 """
@@ -523,229 +474,3 @@ class AttentionModel(nn.Module):
         """Predict per-cell (psnr, clip) in PREDICTION_SPACE units."""
         standardized = self.regressor(image_tokens, source_tokens, target_tokens, source_mask, target_mask)
         return self.regressor.destandardize(standardized)
-
-
-"""
-Selector.
-"""
-
-@dataclass
-class TimestepGridResult:
-    psnr_grid: np.ndarray
-    clip_grid: np.ndarray
-    phi_grid: np.ndarray
-    t_start_values: np.ndarray
-    t_end_values: np.ndarray
-
-
-@dataclass
-class TimestepSelection:
-    t_start: float
-    t_end: float
-    deviate: bool
-    pred_gain: float
-    phi_grid: np.ndarray
-    psnr_grid: np.ndarray
-    clip_grid: np.ndarray
-
-
-def _nearest_index(values: np.ndarray, target: float) -> int:
-    return int(nearest_indices(values, [target])[0])
-
-
-class TimestepSelector:
-    """Select (t_start, t_end) from the predicted grid; no trainable weights."""
-
-    def __init__(
-        self,
-        model: AttentionModel,
-        cell_t_pairs: np.ndarray,
-        t_start_values: tuple[float, ...] | list[float] | np.ndarray,
-        t_end_values: tuple[float, ...] | list[float] | np.ndarray,
-        default_t_start: float = DEFAULT_T_START,
-        default_t_end: float = DEFAULT_T_END,
-        mean_surface: np.ndarray | None = None,
-    ):
-        self.model = model
-        self.t_start_values = np.asarray(t_start_values, dtype=np.float64)
-        self.t_end_values = np.asarray(t_end_values, dtype=np.float64)
-        self.default_t_start = default_t_start
-        self.default_t_end = default_t_end
-        self._default_i = _nearest_index(self.t_start_values, default_t_start)
-        self._default_j = _nearest_index(self.t_end_values, default_t_end)
-
-        # Grid positions of the model's output cells, in the training cell order.
-        cell_t_pairs = np.asarray(cell_t_pairs, dtype=np.float64)
-        self._cell_i = nearest_indices(self.t_start_values, cell_t_pairs[:, 0])
-        self._cell_j = nearest_indices(self.t_end_values, cell_t_pairs[:, 1])
-
-        # Index of the default cell within that same cell order, so predictions
-        # can be re-baselined before they are scattered into the grid.
-        self._default_k = default_cell_index(
-            cell_t_pairs, self.t_start_values, self.t_end_values, default_t_start, default_t_end,
-        )
-
-        # The mean surface is only an offset for "residuals"; hold it in cell
-        # order to match what the model emits.
-        self.mean_surface = None if mean_surface is None else np.asarray(mean_surface, dtype=np.float64)
-        self._mean_surface_cells = (
-            None if self.mean_surface is None
-            else torch.as_tensor(self.mean_surface[self._cell_i, self._cell_j], dtype=torch.float32)
-        )
-        if PREDICTION_SPACE == "residuals" and self._mean_surface_cells is None:
-            raise ValueError(f"Expected a mean_surface for {PREDICTION_SPACE=}")
-
-    @property
-    def n_start(self) -> int:
-        return len(self.t_start_values)
-
-    @property
-    def n_end(self) -> int:
-        return len(self.t_end_values)
-
-    @torch.no_grad()
-    def pred_grid(
-        self,
-        image_tokens: torch.Tensor,               # (C, S, S) or (N_tok, D), one sample
-        source_tokens: torch.Tensor,              # (1, D_txt) or (N_t, D_txt)
-        target_tokens: torch.Tensor,              # like source_tokens
-        source_mask: torch.Tensor,                # (N_t,) bool
-        target_mask: torch.Tensor,                # (N_t,) bool
-    ) -> TimestepGridResult:
-        """
-        Single predictor forward covering every labeled (t_start, t_end) cell.
-
-        Takes ONE unbatched sample's embeddings (embeddings.SampleEmbeddings
-        fields). Scatters the predictions into the grid, maps them to deltas
-        (deltas_from_preds), and scores them with phi (settings.SCORE_PHI).
-        Because the predictor estimates the two metric surfaces rather than the
-        scalarized objective, re-scoring a saved run under a different SCORE_FN
-        needs no retraining.
-        """
-        device = self.model.regressor.target_mean.device
-        batched = lambda t: t.unsqueeze(0).to(device)
-        preds = self.model.pred_cells(
-            batched(image_tokens),
-            batched(source_tokens),
-            batched(target_tokens),
-            batched(source_mask),
-            batched(target_mask),
-        )
-
-        # Map out of PREDICTION_SPACE before anything is scored.
-        deltas = deltas_from_preds(preds, self._default_k, self._mean_surface_cells)
-        cells = deltas[0].detach().cpu().numpy()
-
-        # Scatter the per-cell deltas into the grid.
-        grid = np.full((self.n_start, self.n_end, 2), np.nan)
-        grid[self._cell_i, self._cell_j] = cells
-        psnr, clip = grid[..., 0], grid[..., 1]
-        phi = phi_from_delta_grids(grid[None])[0]
-        return TimestepGridResult(psnr, clip, phi, self.t_start_values, self.t_end_values)
-
-    def select_grid(
-        self,
-        grid: TimestepGridResult,
-        noise_floor: float = NOISE_FLOOR_PHI,
-        clip_floor: float | None = None,
-        phi_weights: tuple[float, float] | None = None,
-    ) -> TimestepSelection:
-        """Argmax over labeled cells with a deviate-or-default gate."""
-
-        # Reported phi used for pred_gain and TimestepSelection.phi_grid.
-        phi = grid.phi_grid
-        if not np.isfinite(phi).any():
-            raise ValueError("Expected finite cells in phi_grid")
-
-        rank_phi = phi
-        if phi_weights is not None:
-            # Reweight phi for selection.
-            deltas = np.stack([grid.psnr_grid, grid.clip_grid], axis=-1)[None]
-            rank_phi = phi_from_delta_grids(deltas, weights=phi_weights)[0]
-        ranked_default = rank_phi[self._default_i, self._default_j]
-        if clip_floor is not None:
-            # Restrict argmax to cells whose CLIP delta clears the floor.
-            eligible = np.where(grid.clip_grid >= clip_floor, rank_phi, np.nan)
-            if np.isfinite(eligible).any():
-                rank_phi = eligible
-
-        i, j = np.unravel_index(np.nanargmax(rank_phi), rank_phi.shape)
-        # Gate compares in ranking space and reported gain stays on default phi.
-        gate_gain = float(rank_phi[i, j] - ranked_default)
-        pred_gain = float(phi[i, j] - phi[self._default_i, self._default_j])
-
-        # Return the selected cell if the gate is triggered.
-        if gate_gain > noise_floor:
-            return TimestepSelection(
-                t_start=float(self.t_start_values[i]),
-                t_end=float(self.t_end_values[j]),
-                deviate=True,
-                pred_gain=pred_gain,
-                phi_grid=phi,
-                psnr_grid=grid.psnr_grid,
-                clip_grid=grid.clip_grid,
-            )
-
-        # Fallback to the default cell if the gate is not triggered.
-        return TimestepSelection(
-            t_start=self.default_t_start,
-            t_end=self.default_t_end,
-            deviate=False,
-            pred_gain=pred_gain,
-            phi_grid=phi,
-            psnr_grid=grid.psnr_grid,
-            clip_grid=grid.clip_grid,
-        )
-
-
-def load_timestep_selector(
-    weights_path: Path | str,
-    device: torch.device | str | None = None,
-    gpu: int | str | None = None,
-) -> TimestepSelector:
-    """Load the trained predictor and wrap it in a selector."""
-    weights_path = Path(weights_path)
-    if device is None:
-        device = resolve_device(gpu)
-    ckpt = torch.load(weights_path, map_location=device, weights_only=False)
-
-    # The run must be replayed in the space it was trained in: the heads, the
-    # target stats, and the mean surface all mean different things per space.
-    space = str(ckpt.get("prediction_space", PREDICTION_SPACE))
-    if space != PREDICTION_SPACE:
-        raise ValueError(f"Expected {space=} == {PREDICTION_SPACE=}")
-
-    # cell_t_pairs gives the output cell count and each cell's grid position.
-    cell_t_pairs = ckpt["cell_t_pairs"].cpu().numpy()
-    image_shape = tuple(int(v) for v in ckpt["image_shape"])
-    text_dim = int(tuple(ckpt["source_shape"])[-1])
-    # map_location put these on the model's device; numpy needs them back on host.
-    t_start_values = np.asarray(ckpt["t_start_values"].cpu(), dtype=np.float64)
-    t_end_values = np.asarray(ckpt["t_end_values"].cpu(), dtype=np.float64)
-    model = AttentionModel(
-        image_shape, text_dim, int(cell_t_pairs.shape[0]), device=device,
-        # The pin uses this index, so rebuild it from the checkpoint's grid axes.
-        default_cell=default_cell_index(cell_t_pairs, t_start_values, t_end_values),
-    )
-    model.regressor.load_state_dict(ckpt["regressor_state_dict"])
-    model.regressor.set_target_standardization(ckpt["target_mean"], ckpt["target_std"])
-    model.regressor.to(device).eval()
-
-    # The checkpoint carries the training grid's axes, so the selector's grid is
-    # the data's by construction.
-    mean_surface = None
-    if PREDICTION_SPACE == "residuals":
-        surface = load_mean_surface(weights_path.parent)
-        if surface is None:
-            raise FileNotFoundError(f"Missing mean surface: {weights_path.parent / MEAN_SURFACE_NAME}")
-        mean_surface = mean_surface_from_dict(surface, t_start_values, t_end_values)
-        print(f"Loaded mean_surface ({surface['split']} split, {surface['n_samples']} samples).")
-
-    print(f"Selector predicts in {PREDICTION_SPACE!r} space over {cell_t_pairs.shape[0]} cells.")
-    return TimestepSelector(
-        model,
-        cell_t_pairs,
-        t_start_values=t_start_values,
-        t_end_values=t_end_values,
-        mean_surface=mean_surface,
-    )

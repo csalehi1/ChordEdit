@@ -191,13 +191,6 @@ def format_metric_table(
     return "\n".join(lines)
 
 
-"""
-The mean surface.
-"""
-
-MEAN_SURFACE_NAME = "mean_surface.pt"
-
-
 def nearest_indices(values, targets) -> np.ndarray:
     """Index in `values` nearest each entry of `targets`, vectorized."""
     values = np.asarray(values, dtype=np.float64).reshape(-1)
@@ -205,45 +198,24 @@ def nearest_indices(values, targets) -> np.ndarray:
     return np.abs(values[None, :] - targets[:, None]).argmin(axis=1)
 
 
-def mean_surface_from_dict(
-    surface: dict,
-    t_start_values: np.ndarray,
-    t_end_values: np.ndarray,
-) -> np.ndarray:
-    """mean_surface dict -> (n_start, n_end, 2) mean target grid.
-
-    Raises when the mean surface's grid axes do not match the selector's, so a
-    stale mean surface can never be silently applied to the wrong grid. The
-    dict's "prediction_space" records which space it was averaged in; check it
-    before using the surface as a residual offset (the dict is built and saved
-    by dataset.get_dataset._calc_mean_surface).
-    """
-    cal_start = np.asarray(surface["t_start_values"], dtype=np.float64)
-    cal_end = np.asarray(surface["t_end_values"], dtype=np.float64)
-    if not (
-        len(cal_start) == len(t_start_values)
-        and len(cal_end) == len(t_end_values)
-        and np.allclose(cal_start, np.asarray(t_start_values, dtype=np.float64))
-        and np.allclose(cal_end, np.asarray(t_end_values, dtype=np.float64))
-    ):
-        raise ValueError(
-            f"Expected ({cal_start.tolist()}, {cal_end.tolist()}) == "
-            f"({np.asarray(t_start_values).tolist()}, {np.asarray(t_end_values).tolist()})"
-        )
-    return np.asarray(surface["mean_true_delta"], dtype=np.float64)
-
-
-def gather_at_pairs(surface: dict, t_pairs: torch.Tensor) -> torch.Tensor:
-    """The surface's mean true delta gathered at (N, 2) cell pairs, flat (N, C)."""
-    pairs = t_pairs.detach().cpu().numpy()
-    i = nearest_indices(surface["t_start_values"], pairs[:, 0])
-    j = nearest_indices(surface["t_end_values"], pairs[:, 1])
-    return surface["mean_true_delta"][i, j]
-
-
-def load_mean_surface(run_dir: Path) -> dict | None:
-    """The run's saved mean surface, or None when the run has none."""
-    path = Path(run_dir) / MEAN_SURFACE_NAME
-    if not path.exists():
-        return None
-    return torch.load(path, map_location="cpu", weights_only=True)
+def get_default_cell(
+    cell_t_pairs: np.ndarray,
+    t_start_values: np.ndarray | None = None,
+    t_end_values: np.ndarray | None = None,
+) -> int:
+    """Position of the default cell in the model's output cell order."""
+    if isinstance(cell_t_pairs, torch.Tensor):
+        cell_t_pairs = cell_t_pairs.detach().cpu().numpy()
+    cell_t_pairs = np.asarray(cell_t_pairs, dtype=np.float64)
+    if t_start_values is None:
+        t_start_values = np.sort(np.unique(cell_t_pairs[:, 0]))
+    if t_end_values is None:
+        t_end_values = np.sort(np.unique(cell_t_pairs[:, 1]))
+    cell_i = nearest_indices(t_start_values, cell_t_pairs[:, 0])
+    cell_j = nearest_indices(t_end_values, cell_t_pairs[:, 1])
+    default_i = int(nearest_indices(t_start_values, [_s().DEFAULT_T_START])[0])
+    default_j = int(nearest_indices(t_end_values, [_s().DEFAULT_T_END])[0])
+    found = np.flatnonzero((cell_i == default_i) & (cell_j == default_j))
+    if found.size != 1:
+        raise ValueError(f"Expected {found.size=} == 1")
+    return int(found[0])

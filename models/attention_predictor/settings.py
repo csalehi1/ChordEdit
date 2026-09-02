@@ -155,6 +155,11 @@ PREDICTION_SPACE = str(_cfg("PREDICTION_SPACE"))
 if PREDICTION_SPACE not in ("raws", "deltas", "residuals"):
     raise ValueError(f"Unknown {PREDICTION_SPACE=}")
 
+# Re-baseline the predicted surface so the default cell is 0 rather than
+# leaving the heads to learn that. Independent of PREDICTION_SPACE; turn it
+# off when the default-cell target is not identically 0 (e.g. "raws").
+PIN_DEFAULT_CELL = bool(_cfg("PIN_DEFAULT_CELL", True))
+
 _MAX_SAMPLES = _cfg("MAX_SAMPLES")
 MAX_SAMPLES = None if _MAX_SAMPLES is None else int(_MAX_SAMPLES)
 
@@ -295,9 +300,6 @@ SCORE_COL = f"{SCORE_FN}_score"
 DEFAULT_T_START = float(_cfg("DEFAULT_T_START"))
 DEFAULT_T_END = float(_cfg("DEFAULT_T_END"))
 
-# Deviate-or-default gate. Minimum predicted phi gain to leave baseline timesteps.
-NOISE_FLOOR_PHI = float(_cfg("NOISE_FLOOR_PHI"))
-
 # Training-only phi. SCORE_PHI above stays the canonical scoreboard at PHI_ALPHA
 # with equal weights, so reshaping the objective (sharpening the risk aversion,
 # or paying more attention to CLIP) is a lever whose payoff is still measured on
@@ -312,10 +314,23 @@ _TRAIN_SCORE_KW = {"alpha": TRAIN_PHI_ALPHA} if "alpha" in _signature(_SCORE_FN)
 TRAIN_SCORE_PHI = partial(_SCORE_FN, **_TRAIN_SCORE_KW)  # Torch phi(Delta) for the loss only
 
 # Selection-time levers over the already-predicted grid, so they can be swept
-# without retraining. SELECT_PHI_WEIGHTS reweights phi for ranking only, and
-# SELECT_CLIP_FLOOR restricts the argmax to cells clearing a CLIP delta.
-# Reported metrics stay on the canonical phi either way.
-_SELECT_PHI_WEIGHTS = _cfg("SELECT_PHI_WEIGHTS", None)
-SELECT_PHI_WEIGHTS = None if _SELECT_PHI_WEIGHTS is None else tuple(float(w) for w in _SELECT_PHI_WEIGHTS)
-_SELECT_CLIP_FLOOR = _cfg("SELECT_CLIP_FLOOR", None)
-SELECT_CLIP_FLOOR = None if _SELECT_CLIP_FLOOR is None else float(_SELECT_CLIP_FLOOR)
+# without retraining. SELECTOR_DELTA_WEIGHTS reweights phi for ranking only.
+# SELECTOR_DELTA_FLOORS restricts the argmax to cells clearing per-column
+# floors in TARGET_COLS order (PSNR, CLIP); null disables a column.
+# SELECTOR_PHI_FLOOR is the deviate-or-default gate: minimum predicted phi
+# gain over the default cell. Reported metrics stay on the canonical phi.
+_SELECT_DELTA_WEIGHTS = _cfg("SELECTOR_DELTA_WEIGHTS", None)
+SELECTOR_DELTA_WEIGHTS = None if _SELECT_DELTA_WEIGHTS is None else tuple(float(w) for w in _SELECT_DELTA_WEIGHTS)
+if SELECTOR_DELTA_WEIGHTS is not None and len(SELECTOR_DELTA_WEIGHTS) != len(TARGET_COLS):
+    raise ValueError(f"Expected {len(TARGET_COLS)} weights, got {SELECTOR_DELTA_WEIGHTS=}")
+_SELECT_DELTA_FLOORS = _cfg("SELECTOR_DELTA_FLOORS", None)
+if _SELECT_DELTA_FLOORS is None:
+    SELECTOR_DELTA_FLOORS = None
+else:
+    SELECTOR_DELTA_FLOORS = tuple(None if v is None else float(v) for v in _SELECT_DELTA_FLOORS)
+    if len(SELECTOR_DELTA_FLOORS) != len(TARGET_COLS):
+        raise ValueError(f"Expected {len(TARGET_COLS)} floors, got {SELECTOR_DELTA_FLOORS=}")
+    if all(v is None for v in SELECTOR_DELTA_FLOORS):
+        SELECTOR_DELTA_FLOORS = None
+_SELECT_PHI_FLOOR = _cfg("SELECTOR_PHI_FLOOR", None)
+SELECTOR_PHI_FLOOR = None if _SELECT_PHI_FLOOR is None else float(_SELECT_PHI_FLOOR)
