@@ -34,11 +34,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# Bind the run's settings.json before importing modules that read settings at
-# import time. Live settings are only used to locate the newest run.
-_ARGS = parse_args()
-RUN_DIR = resolve_run_dir(load_live_settings().RUNS_DIR if _ARGS.run_dir is None else None, _ARGS.run_dir)
-load_run_settings(RUN_DIR)
+# When run as a script, pin the run's settings before dataset/model import.
+# When imported from train.py those modules are already loaded, so this must
+# not run: load_run_settings would refuse, and parse_args would reject
+# train.py's flags.
+if __name__ == "__main__":
+    _ARGS = parse_args()
+    RUN_DIR = resolve_run_dir(load_live_settings().RUNS_DIR if _ARGS.run_dir is None else None, _ARGS.run_dir)
+    load_run_settings(RUN_DIR)
 
 from dataset import ID_TO_SPLIT_NAME, get_dataset
 from model import AttentionModel, preds_to_deltas
@@ -99,6 +102,7 @@ class SelectorModel:
             int(cell_t_pairs.shape[0]),
             device=device,
             default_cell=get_default_cell(cell_t_pairs, t_start_values, t_end_values),
+            feat_dim=int(tuple(ckpt.get("feature_shape") or (0,))[-1]),
         )
         model.regressor.load_state_dict(ckpt["regressor_state_dict"])
         model.regressor.set_target_standardization(ckpt["target_mean"], ckpt["target_std"])
@@ -138,31 +142,17 @@ class SelectorModel:
         return cls(models, t_pairs, mean_surface)
 
     @torch.no_grad()
-    def select_batch(
-        self,
-        image_tokens: torch.Tensor,
-        source_tokens: torch.Tensor,
-        target_tokens: torch.Tensor,
-        source_mask: torch.Tensor,
-        target_mask: torch.Tensor,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Return (t_start, t_end) arrays of shape (N,)."""
-        
-        # Predict the cells with every model member, and average in delta space.
+    def select_deltas(self, deltas: torch.Tensor) -> torch.Tensor:
+        """Return selected cell indices of shape (N,) from a delta surface."""
         default_cell = self.model.regressor.default_cell
-        pred_args = (image_tokens, source_tokens, target_tokens, source_mask, target_mask)
-        preds = [model.pred_cells(*pred_args) for model in self.models]
-        deltas = [preds_to_deltas(pred, default_cell, self.mean_surface) for pred in preds]
-        deltas = torch.stack(deltas).mean(dim=0)
 
         # Calculate the raw phi scores.
-        phi = calc_phi(deltas)
-        rank = phi
+        rank = calc_phi(deltas)
 
         # Reweight the phi scores per-column, if requested.
         if SELECTOR_DELTA_WEIGHTS is not None:
             rank = calc_phi(deltas, weights=deltas.new_tensor(SELECTOR_DELTA_WEIGHTS))
-        
+
         # Restrict the argmax to cells clearing per-column floors, if requested.
         if SELECTOR_DELTA_FLOORS is not None:
             delta_floors = deltas.new_tensor([float("-inf") if f is None else f for f in SELECTOR_DELTA_FLOORS])
@@ -170,7 +160,7 @@ class SelectorModel:
             keep = eligible | ~eligible.any(dim=-1, keepdim=True)
             rank = rank.masked_fill(~keep, -float("inf"))
 
-        # Sort each cell by the phi  mass over its neighborhood, if requested.
+        # Sort each cell by the phi mass over its neighborhood, if requested.
         if SELECTOR_TEMPERATURE is not None:
             probs = torch.softmax(rank / SELECTOR_TEMPERATURE, dim=-1)
             rank = probs[..., self.neighbor_map.to(probs.device)].sum(dim=-1)
@@ -178,16 +168,37 @@ class SelectorModel:
             rank = rank.masked_fill(torch.isinf(rank), -float("inf"))
 
         # Select the best cell for each sample.
-        chosen = rank.argmax(dim=-1)
+        selected = rank.argmax(dim=-1)
 
-        # Stay on the default cell unless the chosen cell clears a phi floor, if requested.
+        # Stay on the default cell unless the selected cell clears a phi floor, if requested.
         if SELECTOR_PHI_FLOOR is not None:
-            n = chosen.shape[0]
-            rows = torch.arange(n, device=chosen.device)
-            gain = rank[rows, chosen] - rank[:, default_cell]
-            chosen = torch.where(gain > SELECTOR_PHI_FLOOR, chosen, chosen.new_full((n,), default_cell))
+            n = selected.shape[0]
+            rows = torch.arange(n, device=selected.device)
+            gain = rank[rows, selected] - rank[:, default_cell]
+            selected = torch.where(gain > SELECTOR_PHI_FLOOR, selected, selected.new_full((n,), default_cell))
 
-        pairs = self.t_pairs[chosen.detach().cpu().numpy()]
+        return selected
+
+    @torch.no_grad()
+    def select_batch(
+        self,
+        image_tokens: torch.Tensor,
+        source_tokens: torch.Tensor,
+        target_tokens: torch.Tensor,
+        source_mask: torch.Tensor,
+        target_mask: torch.Tensor,
+        mask_features: torch.Tensor,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return (t_start, t_end) arrays of shape (N,)."""
+
+        # Predict the cells with every model member, and average in delta space.
+        default_cell = self.model.regressor.default_cell
+        pred_args = (image_tokens, source_tokens, target_tokens, source_mask, target_mask, mask_features)
+        preds = [model.pred_cells(*pred_args) for model in self.models]
+        deltas = [preds_to_deltas(pred, default_cell, self.mean_surface) for pred in preds]
+        deltas = torch.stack(deltas).mean(dim=0)
+
+        pairs = self.t_pairs[self.select_deltas(deltas).detach().cpu().numpy()]
         return pairs[:, 0], pairs[:, 1]
 
 
@@ -209,7 +220,7 @@ def eval(run_dir: Path) -> Path:
     bundle = get_dataset(device, run_dir)
     selector = SelectorModel.load(weights_path, device=device, mean_surface=bundle.train.mean_surface)
     sample_ids = sorted(sid for split in bundle.splits.values() for sid in split.sample_ids)
-    embs = bundle.train.embs
+    embs = bundle.train.x
     sample_idxs = embs.sample_idx(sample_ids)
 
     # Select (t_start, t_end) for every sample in the run.
@@ -222,6 +233,7 @@ def eval(run_dir: Path) -> Path:
             embs.target_tokens[sel],
             embs.source_mask[sel],
             embs.target_mask[sel],
+            embs.mask_features[sel],
         )
         t_starts.append(t_start)
         t_ends.append(t_end)

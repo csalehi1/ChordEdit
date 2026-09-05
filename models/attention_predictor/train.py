@@ -27,12 +27,11 @@ import torch
 
 from _helpers import *
 from _wandb import finish_run, init_run, log_epoch, log_summary
-from dataloader import get_dataloader
-from dataset import SplitDataset, get_dataset
+from dataloader import SplitDatasetLoader, get_dataloader
+from dataset import get_dataset
 from metrics import *
-# Underscore-prefixed, so the star import above does not carry it.
-from metrics import _selection_metrics_at
 from model import AttentionModel, preds_to_deltas
+from selector import SelectorModel
 from settings import *
 
 
@@ -50,52 +49,65 @@ def parse_args() -> argparse.Namespace:
 
 
 def calc_train_phi(deltas: torch.Tensor) -> torch.Tensor:
-    """Training-only phi, at TRAIN_PHI_ALPHA / TRAIN_PHI_WEIGHTS.
-
-    Every reported metric keeps calling _helpers.calc_phi at the canonical
-    PHI_ALPHA with equal weights, so reshaping the objective never moves the
-    scoreboard. With both settings left null this is calc_phi exactly.
-    """
+    """Training-only phi, with TRAIN_PHI_ALPHA, _WEIGHTS."""
     if TRAIN_PHI_WEIGHTS is None:
         return TRAIN_SCORE_PHI(deltas)
     weights = deltas.new_tensor(TRAIN_PHI_WEIGHTS)
     return TRAIN_SCORE_PHI(deltas, weights=weights)
 
 
-def selected_cells(
-    pred_deltas: torch.Tensor,  # (N, n_cells, 2)
-    pred_phi: torch.Tensor,     # (N, n_cells)
-    default_cell: int,
-) -> torch.Tensor:              # (N,)
-    """Cell each sample would be sent to, under the selection-time levers.
+def mse_loss(
+    pred_phi: torch.Tensor,
+    true_phi: torch.Tensor,
+    top_k: int | None = None,
+) -> torch.Tensor:
+    """MSE over all cells, or only the true top-k when top_k is set."""
+    if top_k is not None and top_k < true_phi.shape[-1]:
+        idx = true_phi.topk(top_k, dim=-1).indices
+        pred_phi = pred_phi.gather(-1, idx)
+        true_phi = true_phi.gather(-1, idx)
+    return torch.nn.functional.mse_loss(pred_phi, true_phi)
 
-    Plain argmax of the predicted phi unless SELECTOR_DELTA_WEIGHTS reweights the
-    ranking or SELECTOR_DELTA_FLOORS restricts it to cells clearing per-column
-    delta floors. SELECTOR_PHI_FLOOR then keeps the default cell unless the
-    chosen cell's phi gain clears that threshold, matching
-    selector.SelectorModel.select_batch.
-    """
-    rank_phi = pred_phi
-    if SELECTOR_DELTA_WEIGHTS is not None:
-        rank_phi = calc_phi(pred_deltas, weights=pred_deltas.new_tensor(SELECTOR_DELTA_WEIGHTS))
-    if SELECTOR_DELTA_FLOORS is not None:
-        floors = pred_deltas.new_tensor([
-            float("-inf") if f is None else f for f in SELECTOR_DELTA_FLOORS
-        ])
-        eligible = (pred_deltas >= floors).all(dim=-1)
-        keep = eligible | ~eligible.any(dim=-1, keepdim=True)
-        rank_phi = rank_phi.masked_fill(~keep, -float("inf"))
-    chosen = rank_phi.argmax(dim=-1)
-    if SELECTOR_PHI_FLOOR is not None:
-        n = chosen.shape[0]
-        rows = torch.arange(n, device=chosen.device)
-        gain = rank_phi[rows, chosen] - rank_phi[:, default_cell]
-        chosen = torch.where(
-            gain > SELECTOR_PHI_FLOOR,
-            chosen,
-            chosen.new_full((n,), default_cell),
-        )
-    return chosen
+
+def ranking_loss(
+    pred_phi: torch.Tensor,
+    true_phi: torch.Tensor,
+    top_k: int | None = None,
+) -> torch.Tensor:
+    """Mean softplus of inverted pairwise margins over pairs with true_u > true_v."""
+    if pred_phi.shape[-1] < 2:
+        return pred_phi.new_zeros(())
+    diff_true = true_phi.unsqueeze(-1) - true_phi.unsqueeze(-2)
+    diff_pred = pred_phi.unsqueeze(-1) - pred_phi.unsqueeze(-2)
+    mask = diff_true > 0
+    if top_k is not None and top_k < true_phi.shape[-1]:
+        idx = true_phi.topk(top_k, dim=-1).indices
+        is_top = torch.zeros_like(true_phi, dtype=torch.bool).scatter_(-1, idx, True)
+        mask = mask & is_top.unsqueeze(-1)
+    if not mask.any():
+        return pred_phi.new_zeros(())
+    return torch.nn.functional.softplus(-diff_pred[mask]).mean()
+
+
+def col_loss(
+    pred_deltas: torch.Tensor,
+    true_deltas: torch.Tensor,
+) -> torch.Tensor:
+    """Per-column MSE on the delta surfaces, one weight per metric."""
+    weights = pred_deltas.new_tensor([PSNR_LOSS_WEIGHT, CLIP_LOSS_WEIGHT])
+    return (((pred_deltas - true_deltas) ** 2) * weights).mean()
+
+
+def _train_loss_tensors(
+    pred: torch.Tensor,
+    true: torch.Tensor,
+    default_cell: int,
+    mean_surface: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Deltas and train-phi surfaces used by calc_loss and its terms."""
+    pred_deltas = preds_to_deltas(pred, default_cell, mean_surface)
+    true_deltas = preds_to_deltas(true, default_cell, mean_surface)
+    return pred_deltas, true_deltas, calc_train_phi(pred_deltas), calc_train_phi(true_deltas)
 
 
 def calc_loss(
@@ -104,67 +116,17 @@ def calc_loss(
     default_cell: int,                         # shared index
     mean_surface: torch.Tensor,                # (n_cells, 2)
 ) -> torch.Tensor:
-    """Weighted phi MSE, pairwise ranking, and per-column MSE.
-
-    A weight of 0 drops that term. The first two live in phi space, where error
-    trades freely between the two metric columns; column_loss is the only term
-    that holds each head to its own column.
-    """
-
-    def mse_loss(
-        pred_phi: torch.Tensor,
-        true_phi: torch.Tensor,
-        top_k: int | None = None,
-    ) -> torch.Tensor:
-        """MSE over all cells, or only the true top-k when top_k is set."""
-        if top_k is not None and top_k < true_phi.shape[-1]:
-            idx = true_phi.topk(top_k, dim=-1).indices
-            pred_phi = pred_phi.gather(-1, idx)
-            true_phi = true_phi.gather(-1, idx)
-        return torch.nn.functional.mse_loss(pred_phi, true_phi)
-
-    def ranking_loss(
-        pred_phi: torch.Tensor,
-        true_phi: torch.Tensor,
-        top_k: int | None = None,
-    ) -> torch.Tensor:
-        """Mean softplus of inverted pairwise margins over pairs with true_u > true_v."""
-        if pred_phi.shape[-1] < 2:
-            return pred_phi.new_zeros(())
-        diff_true = true_phi.unsqueeze(-1) - true_phi.unsqueeze(-2)
-        diff_pred = pred_phi.unsqueeze(-1) - pred_phi.unsqueeze(-2)
-        mask = diff_true > 0
-        if top_k is not None and top_k < true_phi.shape[-1]:
-            idx = true_phi.topk(top_k, dim=-1).indices
-            is_top = torch.zeros_like(true_phi, dtype=torch.bool).scatter_(-1, idx, True)
-            mask = mask & is_top.unsqueeze(-1)
-        if not mask.any():
-            return pred_phi.new_zeros(())
-        return torch.nn.functional.softplus(-diff_pred[mask]).mean()
-
-    def column_loss(
-        pred_deltas: torch.Tensor,
-        true_deltas: torch.Tensor,
-    ) -> torch.Tensor:
-        """Per-column MSE on the delta surfaces, one weight per metric."""
-        weights = pred_deltas.new_tensor([PSNR_LOSS_WEIGHT, CLIP_LOSS_WEIGHT])
-        return (((pred_deltas - true_deltas) ** 2) * weights).mean()
-
-    # Calculate the pred and true deltas from the pred and true surfaces.
-    pred_deltas = preds_to_deltas(pred, default_cell, mean_surface)
-    true_deltas = preds_to_deltas(true, default_cell, mean_surface)
-    pred_phi = calc_train_phi(pred_deltas)
-    true_phi = calc_train_phi(true_deltas)
-
-    # Calculate the loss.
+    """Weighted phi MSE, pairwise ranking, and per-column MSE."""
+    pred_deltas, true_deltas, pred_phi, true_phi = _train_loss_tensors(
+        pred, true, default_cell, mean_surface,
+    )
     loss = pred_phi.new_zeros(())
     if MSE_LOSS_WEIGHT > 0:
         loss = loss + MSE_LOSS_WEIGHT * mse_loss(pred_phi, true_phi, top_k=MSE_LOSS_TOP_K)
     if RANKING_LOSS_WEIGHT > 0:
         loss = loss + RANKING_LOSS_WEIGHT * ranking_loss(pred_phi, true_phi, top_k=RANKING_LOSS_TOP_K)
     if PSNR_LOSS_WEIGHT > 0 or CLIP_LOSS_WEIGHT > 0:
-        loss = loss + column_loss(pred_deltas, true_deltas)
-    
+        loss = loss + col_loss(pred_deltas, true_deltas)
     return loss
 
 
@@ -172,90 +134,71 @@ def calc_loss(
 Evaluation.
 """
 
-# Grids per forward pass during evaluation; larger than the train batch since
-# no activations are kept.
-EVAL_CHUNK = 256
-
 
 @torch.no_grad()
-def eval_regression(
+def eval(
     model: AttentionModel,
-    dataset: SplitDataset,
+    loader: SplitDatasetLoader,
+    selector: SelectorModel,
 ) -> dict[str, float]:
-    """
-    How well the predictor reproduces the two metric surfaces.
-
-    loss         calc_loss over the split, grid-count weighted
-    per-col      see metrics.per_component_metrics
-    """
+    """Regression and selection metrics for one split, from a single forward pass."""
+    
+    # Set the model to evaluation mode.
     model.regressor.eval()
+    dataset = loader.dataset
     mean, std = model.regressor.target_mean, model.regressor.target_std
-    device = dataset.y.device
-
-    preds = []
-    loss_sum = 0.0
-    for k in range(0, dataset.n_samples, EVAL_CHUNK):
-        sel = torch.arange(k, min(k + EVAL_CHUNK, dataset.n_samples), device=device)
-        image_tokens, source_tokens, target_tokens, source_mask, target_mask, y = dataset.gather(sel)
-        out = model.regressor(image_tokens, source_tokens, target_tokens, source_mask, target_mask)
-        # Weight each chunk by its grid count, since the last chunk is short.
-        loss_sum += calc_loss(out, (y - mean) / std, dataset.default_cell, dataset.mean_surface).item() * len(sel)
-        preds.append(model.regressor.destandardize(out))
-    pred = torch.cat(preds)
-    # No phi here: pick the cell with the best predicted primary column.
-    chosen = pred[..., 0].argmax(dim=-1)
-
-    return {
-        "loss": loss_sum / max(dataset.n_samples, 1),
-        **per_component_metrics(dataset.y, pred, TARGET_COLS, chosen, dataset.default_cell),
-    }
-
-
-@torch.no_grad()
-def eval_selection(
-    model: AttentionModel,
-    dataset: SplitDataset,
-) -> dict[str, float]:
-    """
-    How well the predicted surfaces serve selection, not regression.
-
-    Predicts whole grids, maps both sides into delta space, and hands the phi
-    surfaces to metrics.training_metrics and metrics.selection_metrics; each
-    metric column is then scored by metrics.per_component_metrics.
-    """
-    model.regressor.eval()
-    device = dataset.y.device
-    surface = dataset.mean_surface.double()
     default_cell = dataset.default_cell
+    surface = dataset.mean_surface.double()
 
-    pred_delta_parts = []
-    for k in range(0, dataset.n_samples, EVAL_CHUNK):
-        sel = torch.arange(k, min(k + EVAL_CHUNK, dataset.n_samples), device=device)
-        image_tokens, source_tokens, target_tokens, source_mask, target_mask, _ = dataset.gather(sel)
-        out = model.pred_cells(image_tokens, source_tokens, target_tokens, source_mask, target_mask).double()
-        pred_delta_parts.append(preds_to_deltas(out, default_cell, surface))
+    # Iterate over the batches of the dataset.
+    preds, ys, ys_raw = [], [], []
+    for batch in loader:
+        out = model.regressor(
+            batch.image_tokens,
+            batch.source_tokens,
+            batch.target_tokens,
+            batch.source_mask,
+            batch.target_mask,
+            batch.mask_features,
+        )
+        preds.append(model.regressor.destandardize(out))
+        ys.append(batch.y)
+        ys_raw.append(batch.y_raw)
+    pred = torch.cat(preds)
+    y = torch.cat(ys)
+    y_raw = torch.cat(ys_raw)
 
     # Both sides leave PREDICTION_SPACE here, so phi sees deltas either way.
-    pred_deltas = torch.cat(pred_delta_parts)
-    true_deltas = preds_to_deltas(dataset.y.double(), default_cell, surface)
+    pred_deltas = preds_to_deltas(pred.double(), default_cell, surface)
+    true_deltas = preds_to_deltas(y.double(), default_cell, surface)
     true_phi = calc_phi(true_deltas)
     pred_phi = calc_phi(pred_deltas)
-    chosen = selected_cells(pred_deltas, pred_phi, default_cell)
+    selected = selector.select_deltas(pred_deltas)
+
+    pred_std = (pred - mean) / std
+    y_std = (y - mean) / std
+    loss_pred_deltas, loss_true_deltas, loss_pred_phi, loss_true_phi = _train_loss_tensors(
+        pred_std, y_std, default_cell, dataset.mean_surface,
+    )
 
     return {
+        # How well the predicted phi surface matches the true one.
         **training_metrics(
-            true_phi, pred_phi, default_cell,
-            mse_weight=MSE_LOSS_WEIGHT,
-            ranking_weight=RANKING_LOSS_WEIGHT,
-            mse_top_k=MSE_LOSS_TOP_K,
-            ranking_top_k=RANKING_LOSS_TOP_K,
+            true_phi, pred_phi,
+            lambda: calc_loss(pred_std, y_std, default_cell, dataset.mean_surface),
+            lambda: mse_loss(loss_pred_phi, loss_true_phi, top_k=MSE_LOSS_TOP_K),
+            lambda: ranking_loss(loss_pred_phi, loss_true_phi, top_k=RANKING_LOSS_TOP_K),
+            lambda: col_loss(loss_pred_deltas, loss_true_deltas),
         ),
-        # Score the cells selected_cells actually picked. A fresh argmax here
-        # would ignore the SELECTOR_* levers, so regret/gain/top-k would be
-        # measured at a different cell than the delta_* columns below.
-        **_selection_metrics_at(true_phi, chosen, default_cell),
-        **per_component_metrics(true_deltas, pred_deltas, ("psnr", "clip"), chosen, default_cell),
-        **comparison_metrics(true_phi, dataset.y_raw.double(), ("psnr", "clip"), chosen, default_cell),
+        # How well the selected cell compares to the true best cell.
+        **selection_metrics(
+            true_phi, selected, default_cell
+        ),
+        # Per-column training and selection metrics.
+        **per_col_metrics(
+            true_deltas, y_raw.double(), pred_deltas,
+            selected, default_cell, TARGET_COLS,
+        ),
     }
 
 
@@ -276,41 +219,33 @@ def train(device: torch.device) -> None:
     # Build the device-resident datasets.
     bundle = get_dataset(device, run_dir)
     train, val, test = bundle.train, bundle.val, bundle.test
-    meta = bundle.meta
-    train_X = bundle.splits_df["train"][0]
-    test_note = f" (from {PIE_BENCH_DIR_NAME})" if PIE_BENCH else ""
+    metadata = bundle.metadata
     print(
         f"Dataset splits:\n"
-        f"  train: {train.n_samples * meta.n_cells} cells ({train.n_samples} samples)\n"
-        f"  val: {val.n_samples * meta.n_cells} cells ({val.n_samples} samples)\n"
-        f"  test: {test.n_samples * test.y.shape[1]} cells ({test.n_samples} samples){test_note}"
+        f"  train: {train.n_samples * metadata.n_cells} cells ({train.n_samples} samples)\n"
+        f"  val: {val.n_samples * metadata.n_cells} cells ({val.n_samples} samples)\n"
+        f"  test: {test.n_samples * test.y.shape[1]} cells ({test.n_samples} samples)"
     )
 
     # Size the predictor from the bundle's metadata
     model = AttentionModel(
-        meta.img_shape, 
-        meta.src_shape[-1],
-        meta.n_cells, 
+        metadata.image_shape, 
+        metadata.source_shape[-1],
+        metadata.n_cells, 
         device=device,
-        default_cell=meta.default_cell,
-    )
-    n_params = sum(p.numel() for p in model.regressor.parameters())
-    print(
-        f"Predictor: {n_params / 1e6:.2f}M params, "
-        f"image {meta.img_shape}, text {meta.src_shape}, "
-        f"{meta.n_cells} cells, space {PREDICTION_SPACE!r}, visual {IMG_EMB_TYPE!r}"
+        default_cell=metadata.default_cell,
+        feat_dim=metadata.feature_shape[-1],
     )
 
-    t_start_values = torch.as_tensor(np.sort(np.unique(meta.t[:, 0].numpy())), dtype=torch.float64)
-    t_end_values = torch.as_tensor(np.sort(np.unique(meta.t[:, 1].numpy())), dtype=torch.float64)
-    grid_shape = (len(t_start_values), len(t_end_values))
+    t_start_values = torch.as_tensor(np.sort(np.unique(metadata.cell_labels[:, 0].numpy())), dtype=torch.float64)
+    t_end_values = torch.as_tensor(np.sort(np.unique(metadata.cell_labels[:, 1].numpy())), dtype=torch.float64)
+    selector = SelectorModel(model, metadata.cell_labels.numpy(), train.mean_surface)
 
     run = init_run(run_dir, {
-        "n_params": n_params,
-        "image_shape": list(meta.img_shape),
-        "source_shape": list(meta.src_shape),
-        "n_cells": int(meta.n_cells),
-        "grid": f"{grid_shape[0]}x{grid_shape[1]}",
+        "image_shape": list(metadata.image_shape),
+        "source_shape": list(metadata.source_shape),
+        "target_shape": list(metadata.target_shape),
+        "n_cells": int(metadata.n_cells),
         "n_train_samples": int(train.n_samples),
         "n_val_samples": int(val.n_samples),
         "n_test_samples": int(test.n_samples),
@@ -336,7 +271,9 @@ def train(device: torch.device) -> None:
     scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, EPOCHS)) if LR_SCHEDULER == "cosine" else None)
 
     y_mean, y_std = model.regressor.target_mean, model.regressor.target_std
-    loader = get_dataloader(train, shuffle=True)
+    train_loader = get_dataloader(train, shuffle=True)
+    val_loader = get_dataloader(val, shuffle=False)
+    test_loader = get_dataloader(test, shuffle=False)
 
     try:
         # Train the model.
@@ -345,7 +282,7 @@ def train(device: torch.device) -> None:
         best_epoch, since_improved = 0, 0
         best_val_loss = float("inf")
         history: list[dict] = []
-        n_cells, n_samples = len(train_X), train.n_samples
+        n_cells, n_samples = train.n_samples * metadata.n_cells, train.n_samples
         ema_state = {k: v.detach().clone() for k, v in model.regressor.state_dict().items()} if EMA_DECAY > 0 else None
 
         # Iterate over the epochs.
@@ -354,7 +291,7 @@ def train(device: torch.device) -> None:
             model.regressor.train()
 
             # Iterate over the batches.
-            for batch in loader:
+            for batch in train_loader:
 
                 # Forward pass. Targets are z-scored to match the head outputs.
                 out = model.regressor(
@@ -363,6 +300,7 @@ def train(device: torch.device) -> None:
                     batch.target_tokens,
                     batch.source_mask, 
                     batch.target_mask,
+                    batch.mask_features,
                 )
                 loss = calc_loss(out, (batch.y - y_mean) / y_std, train.default_cell, train.mean_surface)
 
@@ -390,49 +328,49 @@ def train(device: torch.device) -> None:
                 model.regressor.load_state_dict(ema_state)
 
             # Evaluate regression and selection on train and val.
-            train_regression = eval_regression(model, train)
-            train_selection = eval_selection(model, train)
-            val_regression = eval_regression(model, val)
-            val_selection = eval_selection(model, val)
+            train_metrics = eval(model, train_loader, selector)
+            val_metrics = eval(model, val_loader, selector)
 
             log_epoch(
-                run, epoch, train_regression, train_selection, val_regression, val_selection,
+                run, epoch, train_metrics, val_metrics,
                 lr=optimizer.param_groups[0]["lr"],
                 seconds=time.perf_counter() - epoch_start,
             )
 
             # Choose a checkpoint metric to gauge improvement.
             if CKPT_METRIC == "val_phi_spearman":
-                score = val_selection.get("phi_spearman", float("nan"))
+                score = val_metrics.get("phi_spearman", float("nan"))
             elif CKPT_METRIC == "val_regret":
-                score = -val_selection.get("regret_median", float("nan"))
+                score = -val_metrics.get("regret_median", float("nan"))
             elif CKPT_METRIC == "val_gain_mean":
-                score = val_selection.get("gain_mean", float("nan"))
+                score = val_metrics.get("gain_mean", float("nan"))
             elif CKPT_METRIC == "val_top1_accuracy":
-                score = val_selection.get("top1_accuracy", float("nan"))
+                score = val_metrics.get("top1_accuracy", float("nan"))
             elif CKPT_METRIC == "val_top5_accuracy":
-                score = val_selection.get("top5_accuracy", float("nan"))
+                score = val_metrics.get("top5_accuracy", float("nan"))
             elif CKPT_METRIC == "val_rho_phi_image":
-                score = val_selection.get("rho_phi_image", float("nan"))
+                score = val_metrics.get("rho_phi_image", float("nan"))
             else:
                 # Fallback to a regression-based metric.
-                score = -val_regression["loss"]
+                score = -val_metrics["loss"]
 
             # Save the best weights if the checkpoint metric is improved.
             improved = score > best_score
             if improved:
                 best_score, best_epoch, since_improved = score, epoch, 0
-                best_val_loss = val_regression["loss"]
+                best_val_loss = val_metrics["loss"]
                 torch.save({
                     "regressor_state_dict": model.regressor.state_dict(),
                     "target_mean": model.regressor.target_mean.cpu(),
                     "target_std": model.regressor.target_std.cpu(),
                     "target_cols": list(TARGET_COLS),
                     "prediction_space": str(PREDICTION_SPACE),
-                    "image_shape": meta.img_shape,
-                    "source_shape": meta.src_shape,
+                    "image_shape": metadata.image_shape,
+                    "source_shape": metadata.source_shape,
                     "img_emb_pool": bool(IMG_EMB_POOL),
-                    "cell_t_pairs": meta.t,
+                    "feature_shape": metadata.feature_shape,
+                    "use_zedit_mask": bool(USE_ZEDIT_MASK),
+                    "cell_t_pairs": metadata.cell_labels,
                     "t_start_values": t_start_values,
                     "t_end_values": t_end_values,
                 }, weights_out)
@@ -443,10 +381,8 @@ def train(device: torch.device) -> None:
                 model.regressor.load_state_dict(live_state)
             history.append({
                 "epoch": epoch,
-                "train": train_regression,
-                "train_selection": train_selection,
-                "val": val_regression,
-                "val_selection": val_selection,
+                "train": train_metrics,
+                "val": val_metrics,
             })
             elapsed = time.perf_counter() - epoch_start
             print(
@@ -454,8 +390,8 @@ def train(device: torch.device) -> None:
                 + ("  *" if improved else "")
                 + "\n"
                 + format_metric_table([
-                    ("train", train_regression, train_selection),
-                    ("val", val_regression, val_selection),
+                    ("train", train_metrics),
+                    ("val", val_metrics),
                 ])
             )
 
@@ -468,15 +404,14 @@ def train(device: torch.device) -> None:
         checkpoint = torch.load(weights_out, map_location=device, weights_only=False)
         model.regressor.load_state_dict(checkpoint["regressor_state_dict"])
 
-        results = eval_regression(model, test)
-        test_sel = eval_selection(model, test)
-        print("\n" + format_metric_table([("test", results, test_sel)]))
+        test_metrics = eval(model, test_loader, selector)
+        print("\n" + format_metric_table([("test", test_metrics)]))
 
         # Summary rather than log, so the runs table ranks on final quality
         # instead of whatever the last epoch happened to produce.
         log_summary(
-            run, results, test_sel,
-            history[best_epoch - 1]["val_selection"] if history else {},
+            run, test_metrics,
+            history[best_epoch - 1]["val"] if history else {},
             best_epoch, len(history),
         )
 
@@ -489,9 +424,8 @@ def train(device: torch.device) -> None:
                 "ckpt_metric": str(CKPT_METRIC),
                 "prediction_space": str(PREDICTION_SPACE),
                 "val_best_loss": best_val_loss,
-                "val_best_selection": history[best_epoch - 1]["val_selection"] if history else {},
-                "test": results,
-                "test_selection": test_sel,
+                "val_best": history[best_epoch - 1]["val"] if history else {},
+                "test": test_metrics,
                 "history": history,
             }, f, indent=4)
 

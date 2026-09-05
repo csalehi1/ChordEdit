@@ -54,7 +54,7 @@ Sample and split classes.
 
 @dataclass(frozen=True)
 class SampleData:
-    """One sample's embeddings and metric surfaces."""
+    """One sample's data, embeddings and targets."""
 
     sample_id: str
     x: SampleEmbeddings
@@ -63,24 +63,25 @@ class SampleData:
 
 
 @dataclass(frozen=True)
-class SampleMeta:
-    """Model-sizing and checkpoint contract, derived once from the train split."""
+class SampleMetadata:
+    """One sample's metadata."""
 
-    img_shape: tuple[int, ...]     # per-sample image_tokens shape
-    src_shape: tuple[int, ...]    # per-sample source_tokens shape
-    tgt_shape: tuple[int, ...]    # per-sample target_tokens shape
+    image_shape: tuple[int, ...]     # per-sample image_tokens shape
+    source_shape: tuple[int, ...]    # per-sample source_tokens shape
+    target_shape: tuple[int, ...]    # per-sample target_tokens shape
+    feature_shape: tuple[int, ...]   # per-sample mask_features shape
     n_cells: int                     # cells per grid
-    t: torch.Tensor                  # (n_cells, 2) being (t_start, t_end), float64 CPU
+    cell_labels: torch.Tensor        # (n_cells, 2) being (t_start, t_end)
     default_cell: int                # shared default-cell index; raises if not unique
 
 
 @dataclass(frozen=True)
-class SplitDataset:
-    """One split's grids over the shared embedding table, resident on one device."""
+class DatasetSplit:
+    """One split's grids over the shared embedding table."""
 
     split_name: str                  # "train" / "val" / "test"
     sample_ids: tuple[str, ...]      # (N,) one sample_id per grid
-    embs: EmbeddingsTable            # shared across splits; index via sample_ids
+    x: EmbeddingsTable               # shared across splits; index via sample_ids
     y: torch.Tensor                  # (N, n_cells, C) PREDICTION_SPACE targets
     y_raw: torch.Tensor              # (N, n_cells, C) "raw" targets
     default_cell: int                # position of the default cell within each grid
@@ -89,7 +90,7 @@ class SplitDataset:
     def __post_init__(self):
         # Translate sample ids to table rows once, so gather is pure tensor
         # indexing, and cache the id -> grid position map __getitem__ uses.
-        object.__setattr__(self, "_table_idx", self.embs.sample_idx(list(self.sample_ids)))
+        object.__setattr__(self, "_table_idx", self.x.sample_idx(list(self.sample_ids)))
         object.__setattr__(self, "_sid_to_i", {sid: i for i, sid in enumerate(self.sample_ids)})
 
     @property
@@ -102,7 +103,7 @@ class SplitDataset:
         i = self._sid_to_i[sample_id]
         return SampleData(
             sample_id=sample_id,
-            x=self.embs.get_sample_embeddings(sample_id),
+            x=self.x.get_sample_embeddings(sample_id),
             y=self.y[i],
             y_raw=self.y_raw[i],
         )
@@ -110,35 +111,36 @@ class SplitDataset:
     def gather(self, sel: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """Tensors for a batch of grids at integer indices sel."""
         idx = self._table_idx[sel]
-        table = self.embs
+        table = self.x
         return (
             table.image_tokens[idx],
             table.source_tokens[idx],
             table.target_tokens[idx],
             table.source_mask[idx],
             table.target_mask[idx],
+            table.mask_features[idx],
             self.y[sel],
+            self.y_raw[sel],
         )
 
 
 @dataclass(frozen=True)
-class SplitDatasetBundle:
-    """Everything train.py needs from get_dataset."""
+class DatasetSplitBundle:
+    """Separate splits of the dataset, train/val/test."""
 
-    splits: dict[str, SplitDataset]
-    splits_df: dict[str, tuple[pd.DataFrame, pd.DataFrame]]
-    meta: SampleMeta
+    splits: dict[str, DatasetSplit]
+    metadata: SampleMetadata
 
     @property
-    def train(self) -> SplitDataset:
+    def train(self) -> DatasetSplit:
         return self.splits["train"]
 
     @property
-    def val(self) -> SplitDataset:
+    def val(self) -> DatasetSplit:
         return self.splits["val"]
 
     @property
-    def test(self) -> SplitDataset:
+    def test(self) -> DatasetSplit:
         return self.splits["test"]
 
 
@@ -222,7 +224,6 @@ def get_splits_df(splits_df_path: Path) -> dict[str, tuple[pd.DataFrame, pd.Data
     def _prepare_df(data_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Split the loaded table into features X and targets y in PREDICTION_SPACE."""
         from scores import compute_delta_df
-
         X_df = data_df.drop(columns=list(TARGET_COLS)).copy()
         for col in TARGET_COLS:
             X_df[f"{col}__raw"] = data_df[col].to_numpy()
@@ -292,7 +293,7 @@ def get_dataset(
     device: torch.device,
     run_dir: Path,
     splits_df: dict[str, tuple[pd.DataFrame, pd.DataFrame]] | None = None,
-) -> SplitDatasetBundle:
+) -> DatasetSplitBundle:
     """Build the device-resident SplitDatasetBundle."""
     run_dir = Path(run_dir)
 
@@ -328,30 +329,31 @@ def get_dataset(
         t_pairs = torch.tensor(t[keep][0], dtype=torch.float64)
         return list(unique_ids[keep]), t_pairs, y[torch.as_tensor(keep)], y_raw[torch.as_tensor(keep)]
 
-    def _get_metadata(t_pairs: torch.Tensor) -> SampleMeta:
+    def _get_metadata(t_pairs: torch.Tensor) -> SampleMetadata:
         """Get the metadata from the train split."""
-        return SampleMeta(
-            img_shape=table.image_shape,
-            src_shape=table.source_shape,
-            tgt_shape=table.target_shape,
+        return SampleMetadata(
+            image_shape=table.image_shape,
+            source_shape=table.source_shape,
+            target_shape=table.target_shape,
             n_cells=int(t_pairs.shape[0]),
-            t=t_pairs,
+            cell_labels=t_pairs,
             default_cell=get_default_cell(t_pairs),
+            feature_shape=table.feature_shape,
         )
 
-    def _get_splits() -> dict[str, SplitDataset]:
+    def _get_splits() -> dict[str, DatasetSplit]:
         """Get the splits from the splits_df."""
-        out: dict[str, SplitDataset] = {}
+        out: dict[str, DatasetSplit] = {}
         for name, (sample_ids, t_pairs, y, y_raw) in arranged.items():
             surface = mean_surface.to(dtype=torch.float)
             if PREDICTION_SPACE == "residuals":
                 # Anchor each cell on the train split's mean, so the heads only
                 # have to predict how a sample deviates from the population
                 y = y - surface.to(y)
-            out[name] = SplitDataset(
+            out[name] = DatasetSplit(
                 split_name=name,
                 sample_ids=tuple(sample_ids),
-                embs=table,
+                x=table,
                 y=y.to(device),
                 y_raw=y_raw.to(device),
                 default_cell=get_default_cell(t_pairs),
@@ -359,9 +361,9 @@ def get_dataset(
             )
         return out
 
-    def _get_bundle() -> SplitDatasetBundle:
+    def _get_bundle() -> DatasetSplitBundle:
         """Get the bundle from the splits, metadata, and mean surface."""
-        return SplitDatasetBundle(splits=split_datasets, splits_df=splits, meta=meta)
+        return DatasetSplitBundle(splits=split_datasets, metadata=meta)
 
     splits = _get_splits_df()
     table = _get_embeddings()

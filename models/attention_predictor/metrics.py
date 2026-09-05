@@ -3,7 +3,7 @@
 """
 Evaluation metrics over score surfaces.
 
-Every function here takes surfaces of shape (N, |T|): N samples, |T| candidate
+Every function here takes surfaces of shape (N, n_cells): N samples, n_cells candidate
 cells, already flattened and already in the space being scored (phi for the
 selection metrics, one delta column for the per-metric ones). The true surface
 comes first and the predicted surface second, without exception.
@@ -15,6 +15,8 @@ apart.
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
@@ -28,7 +30,7 @@ TOP_K_VALUES = (1, 5, 10)
 """
 Individual metrics.
 
-The *_at variants take an already-made pick instead of a predicted surface, so
+The *_at variants take an already-made selection instead of a predicted surface, so
 model-free baselines are scored by exactly the same code.
 """
 
@@ -72,15 +74,15 @@ def ranking_loss_scores(
     return out
 
 
-def _top_k_accuracy_at(true_phi: torch.Tensor, chosen: torch.Tensor, k: int) -> torch.Tensor:
-    """(N,) whether the chosen cell lies in the true top-k cells by phi."""
+def _top_k_accuracy_at(true_phi: torch.Tensor, selected_cells: torch.Tensor, k: int) -> torch.Tensor:
+    """(N,) whether the selected cell lies in the true top-k cells by phi."""
     k = min(k, true_phi.shape[-1])
     top = true_phi.topk(k, dim=-1).indices
-    return (top == chosen.reshape(-1, 1)).any(dim=-1)
+    return (top == selected_cells.unsqueeze(-1)).any(dim=-1)
 
 
 def top_k_accuracy_scores(true_phi: torch.Tensor, pred_phi: torch.Tensor, k: int) -> torch.Tensor:
-    """(N,) _top_k_accuracy_at for the argmax(pred phi) pick."""
+    """(N,) _top_k_accuracy_at for the argmax(pred phi) selection."""
     return _top_k_accuracy_at(true_phi, pred_phi.argmax(dim=-1), k)
 
 
@@ -103,33 +105,32 @@ def rank_correlation_scores(true_phi: torch.Tensor, pred_phi: torch.Tensor) -> t
     return torch.where(den > 0, (ra * rb).sum(-1) / den, torch.zeros_like(den))
 
 
-def _gain_at(true_phi: torch.Tensor, chosen: torch.Tensor) -> torch.Tensor:
-    """(N,) true phi at the chosen cell."""
-    return true_phi.gather(-1, chosen.reshape(-1, 1)).squeeze(-1)
+def _gain_at(true_phi: torch.Tensor, selected_cells: torch.Tensor) -> torch.Tensor:
+    """(N,) true phi at the selected cell."""
+    return true_phi.gather(-1, selected_cells.unsqueeze(-1)).squeeze(-1)
 
 
 def gain_scores(true_phi: torch.Tensor, pred_phi: torch.Tensor) -> torch.Tensor:
-    """(N,) gain of the argmax(pred phi) pick."""
+    """(N,) gain of the argmax(pred phi) selection."""
     return _gain_at(true_phi, pred_phi.argmax(dim=-1))
 
 
-def _regret_at(true_phi: torch.Tensor, chosen: torch.Tensor) -> torch.Tensor:
-    """(N,) true phi lost by taking the chosen cell over the true best one."""
-    return true_phi.max(dim=-1).values - _gain_at(true_phi, chosen)
+def _regret_at(true_phi: torch.Tensor, selected_cells: torch.Tensor) -> torch.Tensor:
+    """(N,) true phi lost by taking the selected cell over the true best one."""
+    return true_phi.max(dim=-1).values - _gain_at(true_phi, selected_cells)
 
 
 def regret_scores(true_phi: torch.Tensor, pred_phi: torch.Tensor) -> torch.Tensor:
-    """(N,) regret of the argmax(pred phi) pick."""
+    """(N,) regret of the argmax(pred phi) selection."""
     return _regret_at(true_phi, pred_phi.argmax(dim=-1))
 
 
-def deviate_rate(true_phi: torch.Tensor, pred_phi: torch.Tensor, baseline_idx: int | torch.Tensor) -> float:
+def deviate_rate(true_phi: torch.Tensor, pred_phi: torch.Tensor, default_cell: int) -> float:
     """Fraction of samples whose selection differs from the default cell."""
     assert true_phi.shape == pred_phi.shape
-    chosen = pred_phi.argmax(dim=-1)
-    if not isinstance(baseline_idx, torch.Tensor):
-        baseline_idx = torch.full_like(chosen, int(baseline_idx))
-    return float((chosen != baseline_idx.reshape(-1)).double().mean().item())
+    assert isinstance(default_cell, int)
+    selected = pred_phi.argmax(dim=-1)
+    return float((selected != default_cell).double().mean().item())
 
 
 def improvement_rate(true_phi: torch.Tensor, pred_phi: torch.Tensor) -> float:
@@ -161,141 +162,125 @@ Aggregators.
 """
 
 def training_metrics(
-    true_phi: torch.Tensor,                # (N, |T|)
-    pred_phi: torch.Tensor,                # (N, |T|)
-    baseline_idx: int | torch.Tensor,      # unused; kept for a uniform call site
-    *,
-    mse_weight: float = 1.0,
-    ranking_weight: float = 0.0,
-    mse_top_k: int | None = None,
-    ranking_top_k: int | None = None,
+    true_phi: torch.Tensor,          # (N, n_cells)
+    pred_phi: torch.Tensor,          # (N, n_cells)
+    loss_func: Callable[[], torch.Tensor],
+    mse_func: Callable[[], torch.Tensor],
+    ranking_func: Callable[[], torch.Tensor],
+    col_func: Callable[[], torch.Tensor],
 ) -> dict[str, float]:
     """
     How well the predicted phi surface matches the true one.
 
-    loss
-    loss_regression
-    loss_ranking
-    phi_spearman
-    rho_phi_image
-    phi_spread_ratio
+    * loss
+    * loss_mse
+    * loss_ranking
+    * loss_col
+    * phi_spearman
+    * rho_phi_image
+    * phi_spread_ratio
     """
     assert true_phi.shape == pred_phi.shape
-    mse = regression_loss_scores(true_phi, pred_phi, top_k=mse_top_k)
-    rank = ranking_loss_scores(true_phi, pred_phi, top_k=ranking_top_k)
-    rank_finite = rank[~rank.isnan()]
     rho = rank_correlation_scores(true_phi, pred_phi)
-    regression = float(mse.mean().item()) if mse.numel() else float("nan")
-    ranking = float(rank_finite.mean().item()) if rank_finite.numel() else float("nan")
-    loss = 0.0
-    if mse_weight > 0 and mse.numel():
-        loss += mse_weight * regression
-    if ranking_weight > 0 and rank_finite.numel():
-        loss += ranking_weight * ranking
     return {
-        "loss": float(loss),
-        "loss_regression": regression,
-        "loss_ranking": ranking,
+        "loss": float(loss_func().detach().item()),
+        "loss_mse": float(mse_func().detach().item()),
+        "loss_ranking": float(ranking_func().detach().item()),
+        "loss_col": float(col_func().detach().item()),
         "phi_spearman": float(rho.quantile(0.5).item()) if rho.numel() else float("nan"),
         "rho_phi_image": cross_image_rho(true_phi, pred_phi),
         "phi_spread_ratio": spread_ratio(true_phi, pred_phi),
     }
 
 
-def _selection_metrics_at(
-    true_phi: torch.Tensor,                # (N, |T|)
-    chosen: torch.Tensor,                  # (N,) or (N, 1) picked cell index
-    baseline_idx: int | torch.Tensor,      # default cell, shared or per sample
+def selection_metrics(
+    true_phi: torch.Tensor,          # (N, n_cells)
+    selected_cells: torch.Tensor,    # (N,)
+    default_cell: int,
 ) -> dict[str, float]:
     """
-    How well an already-made pick serves selection.
+    How well the selected cell compares to the true best cell.
 
-    top<K>_accuracy
-    regret_median/p90
-    gain_mean
-    improvement_rate
-    deviate_rate
-    modal_cell_frac
-    n_distinct_cells
+    * phi
+    * delta_phi
+    * top<K>_accuracy
+    * regret_median/p90
+    * gain_mean
+    * improvement_rate
+    * deviate_rate
+    * modal_cell_frac
+    * n_distinct_cells
     """
-    chosen = chosen.reshape(-1)
-    if not isinstance(baseline_idx, torch.Tensor):
-        baseline_idx = torch.full_like(chosen, int(baseline_idx))
-    gain = _gain_at(true_phi, chosen)
+    assert selected_cells.shape == (true_phi.shape[0],)
+    assert isinstance(default_cell, int)
+    gain = _gain_at(true_phi, selected_cells)
+    delta_phi = gain - true_phi[:, default_cell]
     reg = true_phi.max(dim=-1).values - gain
-    # How concentrated the picks are. A constant selector puts modal_cell_frac at
+    # How concentrated the selections are. A constant selector puts modal_cell_frac at
     # 1.0 with n_distinct_cells at 1, which no other selection metric reveals.
-    counts = torch.bincount(chosen, minlength=true_phi.shape[-1])
+    counts = torch.bincount(selected_cells, minlength=true_phi.shape[-1])
     return {
+        "phi": float(gain.mean().item()),
+        "delta_phi": float(delta_phi.mean().item()),
         "modal_cell_frac": float((counts.max().double() / counts.sum().double()).item()),
         "n_distinct_cells": float((counts > 0).sum().item()),
         "regret_median": float(reg.quantile(0.5).item()),
         "regret_p90": float(reg.quantile(0.9).item()),
         "gain_mean": float(gain.mean().item()),
         "improvement_rate": float((gain > 0).double().mean().item()),
-        "deviate_rate": float((chosen != baseline_idx.reshape(-1)).double().mean().item()),
-        **{f"top{k}_accuracy": float(_top_k_accuracy_at(true_phi, chosen, k).double().mean().item()) for k in TOP_K_VALUES},
+        "deviate_rate": float((selected_cells != default_cell).double().mean().item()),
+        **{f"top{k}_accuracy": float(_top_k_accuracy_at(true_phi, selected_cells, k).double().mean().item()) for k in TOP_K_VALUES},
     }
 
 
-def selection_metrics(
-    true_phi: torch.Tensor,                # (N, |T|)
-    pred_phi: torch.Tensor,                # (N, |T|)
-    baseline_idx: int | torch.Tensor,
-) -> dict[str, float]:
-    """How well argmax(pred phi) serves as a selector. See _selection_metrics_at."""
-    return _selection_metrics_at(true_phi, pred_phi.argmax(dim=-1), baseline_idx)
-
-
-def per_component_metrics(
-    true: torch.Tensor,                        # (N, |T|, C)
-    pred: torch.Tensor,                        # (N, |T|, C)
+def per_col_metrics(
+    true_cols: torch.Tensor,         # (N, n_cells, C) delta surfaces
+    true_raw: torch.Tensor,          # (N, n_cells, C) measured PSNR/CLIP
+    pred_cols: torch.Tensor,         # (N, n_cells, C)
+    selected_cells: torch.Tensor,    # (N,)
+    default_cell: int,
     cols: tuple[str, ...] | list[str],
-    chosen: torch.Tensor,                      # (N,) or (N, 1)
-    baseline_idx: int | torch.Tensor,          # default cell, shared or per sample
 ) -> dict[str, float]:
     """
-    Per-column surface fit and selection side-effects, keyed by column name.
+    Per-column training and selection metrics.
 
-    Pick is the shared chosen index (e.g. argmax(pred_phi)). Deltas are relative
-    to baseline_idx.
-
-    <col>
-    delta_<col>
-    mae_<col>
-    rmse_<col>
-    r2_<col>
-    rho_<col>
-    rho_<col>_image
-    spread_ratio_<col>
-    gain_<col>
-    regret_<col>
+    * <col>
+    * delta_<col>
+    * mae_<col>
+    * rmse_<col>
+    * r2_<col>
+    * rho_<col>
+    * rho_<col>_image
+    * spread_ratio_<col>
+    * gain_<col>
+    * regret_<col>
     """
-    assert true.shape == pred.shape and true.ndim == 3
-    assert true.shape[-1] == len(cols)
-    n = true.shape[0]
-    pick = chosen.reshape(-1)
-    assert pick.shape == (n,)
-    if not isinstance(baseline_idx, torch.Tensor):
-        baseline_idx = torch.full((n,), int(baseline_idx), device=true.device, dtype=torch.long)
-    baseline_idx = baseline_idx.reshape(-1)
-    assert baseline_idx.shape == (n,)
+    assert true_cols.shape == pred_cols.shape == true_raw.shape and true_cols.ndim == 3
+    assert true_cols.shape[-1] == len(cols)
+    n = true_cols.shape[0]
+    assert selected_cells.shape == (n,)
+    assert isinstance(default_cell, int)
 
+    idx = selected_cells.unsqueeze(-1)
     out: dict[str, float] = {}
     for i, col in enumerate(cols):
-        t, p = true[..., i], pred[..., i]
-        t_pick = t.gather(-1, pick.reshape(-1, 1)).squeeze(-1)
-        t_base = t.gather(-1, baseline_idx.reshape(-1, 1)).squeeze(-1)
+        t, p = true_cols[..., i], pred_cols[..., i]
+        t_selected = t.gather(-1, idx).squeeze(-1)
+        t_base = t[:, default_cell]
         t_best = t.max(dim=-1).values
-        delta = t_pick - t_base
+        delta = t_selected - t_base
+
+        raw = true_raw[..., i]
+        raw_selected = raw.gather(-1, idx).squeeze(-1)
+        raw_base = raw[:, default_cell]
 
         e = (p - t).reshape(-1)
         ss_res = (e ** 2).sum()
         ss_tot = ((t.reshape(-1) - t.mean()) ** 2).sum().clamp(min=1e-12)
         rho = rank_correlation_scores(t, p)
 
-        out[col] = float(t_pick.mean().item())
-        out[f"delta_{col}"] = float(delta.mean().item())
+        out[col] = float(raw_selected.mean().item())
+        out[f"delta_{col}"] = float((raw_selected - raw_base).mean().item())
         out[f"mae_{col}"] = float(e.abs().mean().item())
         out[f"rmse_{col}"] = float((e ** 2).mean().sqrt().item())
         out[f"r2_{col}"] = float((1 - ss_res / ss_tot).item())
@@ -303,50 +288,6 @@ def per_component_metrics(
         out[f"rho_{col}_image"] = cross_image_rho(t, p)
         out[f"spread_ratio_{col}"] = spread_ratio(t, p)
         out[f"gain_{col}"] = float(delta.mean().item())
-        out[f"regret_{col}"] = float((t_best - t_pick).mean().item())
-    
-    return out
+        out[f"regret_{col}"] = float((t_best - t_selected).mean().item())
 
-
-def comparison_metrics(
-    true_phi: torch.Tensor,                    # (N, |T|)
-    true_cols: torch.Tensor,                        # (N, |T|, C) raw PSNR/CLIP
-    cols: tuple[str, ...] | list[str],
-    chosen: torch.Tensor,                      # (N,) or (N, 1)
-    baseline_idx: int | torch.Tensor,          # default cell, shared or per sample
-) -> dict[str, float]:
-    """
-    Selected-vs-default levels and deltas for phi and each raw component column.
-
-    Component surfaces are measured PSNR/CLIP (dB / CLIP points), not
-    per-sample normalized deltas. Means are absolute levels at the pick and
-    selected-default deltas in those units.
-
-    phi
-    delta_phi
-    <col>
-    delta_<col>
-    """
-    assert true_phi.ndim == 2 and true_cols.ndim == 3
-    assert true_cols.shape[:2] == true_phi.shape and true_cols.shape[-1] == len(cols)
-    n = true_phi.shape[0]
-    pick = chosen.reshape(-1)
-    assert pick.shape == (n,)
-    if not isinstance(baseline_idx, torch.Tensor):
-        baseline_idx = torch.full((n,), int(baseline_idx), device=true_phi.device, dtype=torch.long)
-    baseline_idx = baseline_idx.reshape(-1)
-    assert baseline_idx.shape == (n,)
-
-    phi_pick = true_phi.gather(-1, pick.reshape(-1, 1)).squeeze(-1)
-    phi_base = true_phi.gather(-1, baseline_idx.reshape(-1, 1)).squeeze(-1)
-    out: dict[str, float] = {
-        "phi": float(phi_pick.mean().item()),
-        "delta_phi": float((phi_pick - phi_base).mean().item()),
-    }
-    for i, col in enumerate(cols):
-        t = true_cols[..., i]
-        t_pick = t.gather(-1, pick.reshape(-1, 1)).squeeze(-1)
-        t_base = t.gather(-1, baseline_idx.reshape(-1, 1)).squeeze(-1)
-        out[col] = float(t_pick.mean().item())
-        out[f"delta_{col}"] = float((t_pick - t_base).mean().item())
     return out

@@ -39,6 +39,21 @@ _EMB_FILES = {
     "tar_mask": "target_mask.pt",
 }
 
+# CLIP-L/14 embeddings in the joint image/text space, L2-normalized, plus the
+# mask area fraction. Only read when USE_IMG_MASK. Their cosines are what
+# CLIP-Edited is a CLIPScore of, which no other embedding in the tree expresses.
+_MASK_FILES = {
+    "masked_proj": "masked_clip_proj.pt",
+    "img_proj": "image_clip_proj.pt",
+    "src_proj": "source_clip_proj.pt",
+    "tar_proj": "target_clip_proj.pt",
+    "mask_area": "mask_area.pt",
+}
+
+# One projected embedding plus four cosines and the mask area.
+CLIP_PROJ_DIM = 768
+FEATURE_DIM = CLIP_PROJ_DIM + 5
+
 
 
 """
@@ -55,6 +70,7 @@ class SampleEmbeddings:
     target_tokens: torch.Tensor         # like source_tokens
     source_mask: torch.Tensor           # (N_t,) bool; ones when pooled
     target_mask: torch.Tensor           # like source_mask
+    mask_features: torch.Tensor         # (D_feat,); ones when unused
 
 
 @dataclass(frozen=True)
@@ -69,7 +85,12 @@ class EmbeddingsTable:
     target_tokens: torch.Tensor         # like source_tokens
     source_mask: torch.Tensor           # (N, N_t) bool; ones when pooled
     target_mask: torch.Tensor           # like source_mask
+    mask_features: torch.Tensor         # (N, D_feat); ones when unused
 
+    @property
+    def feature_shape(self) -> tuple[int, ...]:
+        """Per-sample mask_features shape."""
+        return tuple(self.mask_features.shape[1:])
 
     @property
     def image_shape(self) -> tuple[int, ...]:
@@ -100,6 +121,7 @@ class EmbeddingsTable:
             target_tokens=self.target_tokens[i],
             source_mask=self.source_mask[i],
             target_mask=self.target_mask[i],
+            mask_features=self.mask_features[i],
         )
 
 
@@ -146,6 +168,29 @@ def get_clip_tokens(
     return torch.stack(rows).float().contiguous()
 
 
+def get_img_mask_features(tables: dict[str, torch.Tensor]) -> torch.Tensor:
+    """(n, FEATURE_DIM) masked-image block: the projected masked embedding and five scalars.
+
+    The cosines are computed here rather than cached. Every vector is already
+    L2-normalized in CLIP's joint space, so each one is a plain dot product.
+    """
+    def _cos(a: str, b: str) -> torch.Tensor:
+        """Row-wise cosine, as a column so the scalars concatenate."""
+        return (tables[a] * tables[b]).sum(dim=-1, keepdim=True)
+
+    return torch.cat([
+        tables["masked_proj"],
+        # Nearly the CLIP label itself at low t_start, where the edit has barely
+        # moved the image, so it anchors one end of every sample's surface.
+        _cos("masked_proj", "tar_proj"),
+        _cos("masked_proj", "src_proj"),
+        _cos("img_proj", "tar_proj"),
+        # How far apart the prompts are, which sets how large an edit is asked for.
+        _cos("src_proj", "tar_proj"),
+        tables["mask_area"],
+    ], dim=-1).contiguous()
+
+
 def get_scattered_embeddings(
     samples: pd.DataFrame,
     *,
@@ -156,7 +201,7 @@ def get_scattered_embeddings(
     def _load_scattered_cache(sample_id: str, kind: str) -> torch.Tensor:
         """Load one scattered file to a CPU tensor."""
         root = (scattered_dir if scattered_dir is not None else SCATTERED_DIR) / "annotation_embeddings"
-        path = root / sample_id / _EMB_FILES[kind]
+        path = root / sample_id / (_EMB_FILES | _MASK_FILES)[kind]
         t = torch.load(path, map_location="cpu", weights_only=True)
         if not isinstance(t, torch.Tensor):
             raise TypeError(f"Expected Tensor in {path}, got {type(t)}")
@@ -169,6 +214,8 @@ def get_scattered_embeddings(
     # The prompt tokens are always read: the pooled vectors are their masked
     # mean, so nothing else supplies the "pooled" text path.
     kinds = ["img", "src_tokens", "tar_tokens", "src_mask", "tar_mask"]
+    if USE_IMG_MASK:
+        kinds += list(_MASK_FILES)
 
     # Probe shapes from the first sample, then preallocate the tables so peak
     # memory stays ~1x table size (no row lists + torch.stack copy).
@@ -191,6 +238,11 @@ def get_scattered_embeddings(
         "tar_mask": torch.empty((n, t_len), dtype=torch.bool),
     }
 
+    if USE_IMG_MASK:
+        for kind in ("masked_proj", "img_proj", "src_proj", "tar_proj"):
+            tables[kind] = torch.empty((n, CLIP_PROJ_DIM), dtype=torch.float32)
+        tables["mask_area"] = torch.empty((n, 1), dtype=torch.float32)
+
     def _load_row(i: int) -> tuple[int, dict[str, torch.Tensor]]:
         return i, {kind: _load_scattered_cache(sample_ids[i], kind) for kind in kinds}
 
@@ -212,6 +264,10 @@ def get_scattered_embeddings(
             tables["tar_mask"][i] = row["tar_mask"].bool().reshape(-1)
             tables["src"][i] = _pool_prompt(row["src_tokens"], row["src_mask"])
             tables["tar"][i] = _pool_prompt(row["tar_tokens"], row["tar_mask"])
+            if USE_IMG_MASK:
+                for kind in ("masked_proj", "img_proj", "src_proj", "tar_proj"):
+                    tables[kind][i] = row[kind].float().reshape(-1)
+                tables["mask_area"][i] = row["mask_area"].float().reshape(1)
 
     return tables
 
@@ -277,7 +333,8 @@ def get_packed_embeddings(
         print(f"Saved packed embeddings: {path}")
 
     use_tokens = TEXT_EMB_TYPE == "tokens"
-    main_keys = ("img", "src", "tar")
+    main_keys = ("img", "src", "tar") + (tuple(_MASK_FILES) if USE_IMG_MASK else ())
+    main_meta |= {"masked": bool(USE_IMG_MASK)}
     main = _load_packed_cache(main_path, main_meta, main_keys)
     token = _load_packed_cache(token_path, token_meta, ("src_tokens", "tar_tokens", "src_mask", "tar_mask")) if use_tokens else {}
     if main is None or token is None:
@@ -351,6 +408,11 @@ def get_embeddings(
         source_mask = torch.ones(n, n_t, dtype=torch.bool, device=device)
         target_mask = torch.ones(n, n_t, dtype=torch.bool, device=device)
 
+    mask_features = (
+        get_img_mask_features(tables).to(device) if USE_IMG_MASK
+        else torch.ones(len(sample_ids), FEATURE_DIM, device=device)
+    )
+
     return EmbeddingsTable(
         _sample_ids=tuple(sample_ids),
         _sid_to_idx={sid: i for i, sid in enumerate(sample_ids)},
@@ -359,4 +421,5 @@ def get_embeddings(
         target_tokens=target_tokens.to(device),
         source_mask=source_mask,
         target_mask=target_mask,
+        mask_features=mask_features,
     )

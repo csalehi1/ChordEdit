@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 import torch
 
-from dataset import SplitDataset
+from dataset import DatasetSplit
 from settings import *
 
 
@@ -28,28 +28,33 @@ class SampleBatch:
     target_tokens: torch.Tensor         # (N, T, D), (N, 1, D)
     source_mask: torch.Tensor           # (N, N_t) bool; ones when pooled
     target_mask: torch.Tensor           # (N, N_t) bool; ones when pooled
+    mask_features: torch.Tensor         # (N, D_feat); ones when unused
+
     y: torch.Tensor                     # (N, n_cells, C)
+    y_raw: torch.Tensor                 # (N, n_cells, C)
     default_cell: torch.Tensor          # (N,)
 
 
 class SplitDatasetLoader:
     """Re-iterable loader yielding SampleBatch objects of whole samples."""
 
-    def __init__(self, dataset: SplitDataset, shuffle: bool = True):
+    def __init__(self, dataset: DatasetSplit, shuffle: bool = True):
         self.dataset = dataset
         self.shuffle = shuffle
         self.samples_per_batch = max(1, int(SAMPLES_PER_BATCH))
 
     def _batch(self, sel: torch.Tensor) -> SampleBatch:
         """Gather one SampleBatch for the sample indices in sel."""
-        image_tokens, source_tokens, target_tokens, source_mask, target_mask, y = self.dataset.gather(sel)
+        image_tokens, source_tokens, target_tokens, source_mask, target_mask, mask_features, y, y_raw = self.dataset.gather(sel)
         return SampleBatch(
             image_tokens=image_tokens,
             source_tokens=source_tokens,
             target_tokens=target_tokens,
             source_mask=source_mask,
             target_mask=target_mask,
+            mask_features=mask_features,
             y=y,
+            y_raw=y_raw,
             default_cell=torch.full((len(sel),), self.dataset.default_cell, dtype=torch.long, device=y.device),
         )
 
@@ -73,7 +78,7 @@ Public entry point.
 
 
 def get_dataloader(
-    dataset: SplitDataset,
+    dataset: DatasetSplit,
     shuffle: bool = True,
 ) -> SplitDatasetLoader:
     """Loader over samples. Batch size is SAMPLES_PER_BATCH from settings."""

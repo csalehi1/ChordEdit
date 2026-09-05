@@ -40,22 +40,22 @@ load_dotenv(Path(_DIR) / ".env")
 # Short names for the long metric columns, so that panel titles stay readable.
 _ALIASES = {PSNR_COL: "psnr", CLIP_COL: "clip"}
 
-# Key sets matching metrics.training_metrics / selection_metrics / per_component_metrics /
-# comparison_metrics.
+# Key sets matching metrics.training_metrics / selection_metrics / per_component_metrics.
 _TRAINING_KEYS = frozenset({
-    "loss", "loss_regression", "loss_ranking", "phi_spearman",
+    "loss", "loss_mse", "loss_ranking", "loss_col", "phi_spearman",
     # Collapse detectors: a model that has only learned the population mean
     # surface sits at ~0 on both while every other metric looks unremarkable.
     "rho_phi_image", "phi_spread_ratio",
 })
 _SELECTION_KEYS = frozenset({
+    "phi", "delta_phi",
     "regret_median", "regret_p90", "gain_mean",
     "improvement_rate", "deviate_rate",
     "top1_accuracy", "top5_accuracy", "top10_accuracy",
     "modal_cell_frac", "n_distinct_cells",
 })
 _COMPARISON_KEYS = frozenset({
-    "phi", "delta_phi", "psnr", "delta_psnr", "clip", "delta_clip",
+    "psnr", "delta_psnr", "clip", "delta_clip",
 })
 
 
@@ -148,10 +148,8 @@ def init_run(run_dir: Path, config_extra: dict):
 def log_epoch(
     run,
     epoch: int,
-    train_regression: dict[str, float],
-    train_selection: dict[str, float],
-    val_regression: dict[str, float],
-    val_selection: dict[str, float],
+    train_metrics: dict[str, float],
+    val_metrics: dict[str, float],
     lr: float,
     seconds: float,
 ) -> None:
@@ -159,10 +157,8 @@ def log_epoch(
     if run is None:
         return
     run.log({
-        **_log_prep("train", train_regression),
-        **_log_prep("train", train_selection),
-        **_log_prep("val", val_regression),
-        **_log_prep("val", val_selection),
+        **_log_prep("train", train_metrics),
+        **_log_prep("val", val_metrics),
         "lr": lr,
         "epoch_seconds": seconds,
     }, step=epoch)
@@ -170,9 +166,8 @@ def log_epoch(
 
 def log_summary(
     run,
-    test_regression: dict[str, float],
-    test_selection: dict[str, float],
-    val_best_selection: dict[str, float],
+    test_metrics: dict[str, float],
+    val_best_metrics: dict[str, float],
     best_epoch: int,
     epochs_ran: int,
 ) -> None:
@@ -180,9 +175,8 @@ def log_summary(
     if run is None:
         return
     run.summary.update({
-        **_log_prep("test", test_regression),
-        **_log_prep("test", test_selection),
-        **_log_prep("val_best", val_best_selection),
+        **_log_prep("test", test_metrics),
+        **_log_prep("val_best", val_best_metrics),
         "best_epoch": best_epoch,
         "epochs_ran": epochs_ran,
     })

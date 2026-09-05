@@ -137,40 +137,34 @@ def phi_from_delta_grids(
 
 
 def format_metric_table(
-    rows: list[tuple[str, dict[str, float], dict[str, float] | None]],
+    rows: list[tuple[str, dict[str, float]]],
 ) -> str:
     """Aligned split table: loss, per-target MAE/R2, and optional phi/regret."""
 
     def _mae_r2(m: dict[str, float], col: str) -> str:
         return f"MAE {m[f'mae_{col}']:.3f} R2 {m[f'r2_{col}']:.3f}"
 
-    def _sel(sel: dict[str, float] | None, key: str, fmt: str) -> str:
-        if not sel or key not in sel:
+    def _sel(m: dict[str, float], key: str, fmt: str) -> str:
+        if key not in m:
             return ""
-        return format(sel[key], fmt)
+        return format(m[key], fmt)
 
     target_cols = list(_s().TARGET_COLS)
-    split_w = max(5, *(len(name) for name, _, _ in rows))
-    # Prefer selection's train-objective loss when present (includes ranking).
-    def _loss(m: dict[str, float], sel: dict[str, float] | None) -> float:
-        if sel and "loss" in sel:
-            return float(sel["loss"])
-        return float(m["loss"])
-
-    loss_w = max(4, *(len(f"{_loss(m, sel):.4f}") for _, m, sel in rows))
+    split_w = max(5, *(len(name) for name, _ in rows))
+    loss_w = max(4, *(len(f"{m['loss']:.4f}") for _, m in rows))
     target_ws = [
-        max(len(col), *(len(_mae_r2(m, col)) for _, m, _ in rows))
+        max(len(col), *(len(_mae_r2(m, col)) for _, m in rows))
         for col in target_cols
     ]
     # Selection columns, appended after the per-target block. A key missing from
-    # the selection dict renders blank rather than raising.
+    # the metrics dict renders blank rather than raising.
     sel_cols = (
         ("phi rho", "phi_spearman"),
         ("regret", "regret_median"),
         ("gain", "gain_mean"),
         ("top1", "top1_accuracy"),
     )
-    sel_vals = [[_sel(sel, key, ".3f") for _, _, sel in rows] for _, key in sel_cols]
+    sel_vals = [[_sel(m, key, ".3f") for _, m in rows] for _, key in sel_cols]
     sel_ws = [max(len(head), *(len(v) for v in vals)) for (head, _), vals in zip(sel_cols, sel_vals)]
 
     header = (
@@ -180,13 +174,13 @@ def format_metric_table(
         + "  ".join(f"{head:<{w}}" for (head, _), w in zip(sel_cols, sel_ws))
     )
     lines = [f"    {header}"]
-    for i, (name, metrics, sel) in enumerate(rows):
+    for i, (name, metrics) in enumerate(rows):
         cells = "  ".join(
             f"{_mae_r2(metrics, col):<{w}}" for col, w in zip(target_cols, target_ws)
         )
         sel_cells = "  ".join(f"{vals[i]:<{w}}" for vals, w in zip(sel_vals, sel_ws))
         lines.append(
-            f"    {name:<{split_w}}  {_loss(metrics, sel):<{loss_w}.4f}  {cells}  {sel_cells}"
+            f"    {name:<{split_w}}  {metrics['loss']:<{loss_w}.4f}  {cells}  {sel_cells}"
         )
     return "\n".join(lines)
 
