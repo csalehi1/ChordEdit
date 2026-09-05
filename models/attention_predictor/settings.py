@@ -10,7 +10,7 @@ from functools import partial
 from inspect import signature as _signature
 from pathlib import Path
 
-from scores import cara_score, linex_score, naive_score, score_df
+from scores import cara_score, linex_score, naive_score
 
 
 _SETTINGS_DIR = Path(__file__).resolve().parent
@@ -72,7 +72,7 @@ _CHORD_EDIT_MODEL_CONFIGS = {
 CHORD_EDIT_MODEL = str(_cfg("CHORD_EDIT_MODEL"))  
 if CHORD_EDIT_MODEL not in _CHORD_EDIT_MODEL_CONFIGS:
     raise ValueError(f"Unknown {CHORD_EDIT_MODEL=}")
-CHORD_EDIT_MODEL_ROOT, CHORD_EDIT_IMAGE_SIZE, CHORD_EDIT_PIPELINE_TYPE = _CHORD_EDIT_MODEL_CONFIGS[CHORD_EDIT_MODEL]
+_, CHORD_EDIT_IMAGE_SIZE, CHORD_EDIT_PIPELINE_TYPE = _CHORD_EDIT_MODEL_CONFIGS[CHORD_EDIT_MODEL]
 
 # NOTE: Choose from "UltraEdit_Region_<N>", "UltraEdit_Background_1000_v2", or "UltraEdit_Style_1000_v2".
 DIR_NAME = str(_cfg("DIR_NAME"))
@@ -121,10 +121,6 @@ T_DELTA_COL = "t_delta"
 PSNR_COL = "psnr_unedit_part"
 CLIP_COL = "clip_similarity_target_image_edit_part"
 
-# Column names in the id_to_predictions_*.csv file written after selection.
-PRED_T_START_COL = "pred_t_start"
-PRED_T_END_COL = "pred_t_end"
-
 
 """
 Shared model settings.
@@ -148,7 +144,6 @@ Predictor settings.
 
 # Regression targets in the loaded dataframe.
 TARGET_COLS = (PSNR_COL, CLIP_COL)
-TARGET_LABELS = {PSNR_COL: "PSNR-Unedited", CLIP_COL: "CLIP-Edited"}
 
 # NOTE: Choose from "raws", "deltas", or "residuals".
 PREDICTION_SPACE = str(_cfg("PREDICTION_SPACE"))
@@ -162,8 +157,6 @@ PIN_DEFAULT_CELL = bool(_cfg("PIN_DEFAULT_CELL", True))
 
 _MAX_SAMPLES = _cfg("MAX_SAMPLES")
 MAX_SAMPLES = None if _MAX_SAMPLES is None else int(_MAX_SAMPLES)
-
-USE_CENTER_CROP = bool(_cfg("USE_CENTER_CROP"))
 
 # Shared dimension d of the visual tokens, the prompt queries, and the edit descriptor h.
 ATTN_DIM = int(_cfg("ATTN_DIM"))
@@ -208,12 +201,25 @@ if IMG_EMB_TYPE not in ("vae", "clip", "vae_clip"):
 # over: the CLIP patch tokens for "clip", or the latent patches for "vae".
 IMG_EMB_POOL = bool(_cfg("IMG_EMB_POOL", True))
 
-# Reserved for the masked-image feature block, which is not implemented on
-# this branch. The keys are declared so a config carrying them still loads.
+# Load the masked-image feature block: the CLIP-L/14 embedding of source * mask
+# in the joint image/text space, the cosines among the masked image, the whole
+# image and both prompts, and the mask area fraction. CLIP-Edited is a CLIPScore
+# in that same space, so the cosines are the label's own ingredients at the
+# un-edited state. This flag only makes the block available; a USE_*_MASK flag
+# routes it. See embeddings.get_img_mask_features.
 USE_IMG_MASK = bool(_cfg("USE_IMG_MASK", False))
+
+# Route the block into the edit descriptor z_edit as one more projected
+# segment, so it reaches the heads rather than the attention values.
 USE_ZEDIT_MASK = bool(_cfg("USE_ZEDIT_MASK", False))
-if USE_IMG_MASK or USE_ZEDIT_MASK:
-    raise NotImplementedError(f"{USE_IMG_MASK=} / {USE_ZEDIT_MASK=} are not implemented here")
+if USE_ZEDIT_MASK and not USE_IMG_MASK:
+    raise ValueError(f"{USE_ZEDIT_MASK=} needs USE_IMG_MASK")
+
+# Loading the block and routing it nowhere leaves the model bit-identical to
+# one without it, which reads as the feature not helping rather than as a
+# misconfiguration.
+if USE_IMG_MASK and not USE_ZEDIT_MASK:
+    raise ValueError(f"{USE_IMG_MASK=} with no consumer; set USE_ZEDIT_MASK")
 
 # Text key/value source. "pooled" is the pipeline's masked-mean prompt vector,
 # one query per prompt. "tokens" reads the full (77, D) sequences and their
@@ -292,20 +298,18 @@ Selector settings.
 # Scalar objective phi. Scores the training loss and ranks cells at selection
 # time, so both stages optimize the same trade-off between the two metrics.
 SCORE_FNS = {
-    "naive": (naive_score, "Naive Score"),
-    "cara": (cara_score, "CARA Score"),
-    "linex": (linex_score, "LINEX Score"),
+    "naive": naive_score,
+    "cara": cara_score,
+    "linex": linex_score,
 }
 SCORE_FN = str(_cfg("SCORE_FN"))
 if SCORE_FN not in SCORE_FNS:
     raise ValueError(f"Unknown {SCORE_FN=}")
-_SCORE_FN, SCORE_LABEL = SCORE_FNS[SCORE_FN]
+_SCORE_FN = SCORE_FNS[SCORE_FN]
 
 PHI_ALPHA = float(_cfg("PHI_ALPHA"))
 _SCORE_KW = {"alpha": PHI_ALPHA} if "alpha" in _signature(_SCORE_FN).parameters else {}
 SCORE_PHI = partial(_SCORE_FN, **_SCORE_KW)  # Torch phi(Delta)
-SCORE_PHI_DF = partial(score_df, score_fn=_SCORE_FN, **_SCORE_KW)  # DataFrame
-SCORE_COL = f"{SCORE_FN}_score"
 
 # Baseline timestep bounds from the ChordEdit paper.
 # NOTE: Must be set to match (0.85+t_delta, 0.3)

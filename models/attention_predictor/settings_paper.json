@@ -6,7 +6,6 @@
   "VAL_FRAC": 0.1,
   "SEED": 42,
   "SPLIT_SEED": 42,
-  "USE_CENTER_CROP": true,
   "MAX_SAMPLES": null,
   "PIE_BENCH": false,
 

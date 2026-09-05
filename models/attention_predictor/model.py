@@ -124,6 +124,26 @@ class TextFeaturizer(nn.Module):
         return self.projector(torch.stack([src, tar], dim=1))
 
 
+class MaskedVisionDescriptorizer(nn.Module):
+    """Project the masked-image block to one edit descriptor segment, F_m."""
+
+    def __init__(self, feat_dim: int, attn_dim: int = ATTN_DIM, dropout_rate: float = COMBINER_DROPOUT):
+        super().__init__()
+        # The block mixes a CLIP embedding with cosine and area scalars, whose
+        # scales differ by orders of magnitude.
+        self.in_norm = nn.LayerNorm(feat_dim)
+        self.proj = nn.Sequential(
+            nn.Linear(feat_dim, attn_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(attn_dim, attn_dim),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """Return F_m, from (N, D_feat) to (N, d)."""
+        return self.proj(self.in_norm(features))
+
+
 """
 Text grounder and pooler: CrossAttn(Q=F_t, K=F_v, V=F_v)
 """
@@ -343,6 +363,7 @@ class AttentionRegressor(nn.Module):
         default_cell: int,
         n_targets: int = len(TARGET_COLS),
         attn_dim: int = ATTN_DIM,
+        feat_dim: int = 0,
     ):
         super().__init__()
 
@@ -361,8 +382,15 @@ class AttentionRegressor(nn.Module):
         self.text_grounder = TextGrounder(attn_dim=attn_dim)
         self.text_pooler = TextPooler()
 
+        # Routed here, the block is one more z_edit segment, so it reaches the
+        # heads without passing through the attention values.
+        if USE_ZEDIT_MASK:
+            self.masked_vision_descriptorizer = MaskedVisionDescriptorizer(feat_dim, attn_dim=attn_dim)
+
         # Number of segments in the edit descriptor z_edit.
         n_seg = 6 if self.use_saliency else 4
+        if USE_ZEDIT_MASK:
+            n_seg += 1
 
         # Each metric may have its own combiner C_theta to describe it differently.
         if SPLIT_COMBINER:
@@ -398,6 +426,7 @@ class AttentionRegressor(nn.Module):
         target_tokens: torch.Tensor,    # (N, N_t, D_txt)
         source_mask: torch.Tensor,      # (N, N_t)
         target_mask: torch.Tensor,      # (N, N_t)
+        mask_features: torch.Tensor,    # (N, D_feat)
     ) -> torch.Tensor:                  # (N, n_cells, 2)
         """Return per-cell (psnr, clip) predictions, standardized where active."""
         
@@ -424,6 +453,11 @@ class AttentionRegressor(nn.Module):
         if f_diffs is not None:
             z_edit = torch.cat([z_edit, f_diffs[:, 0], f_diffs[:, 1]], dim=-1)    # (N, 6d)
 
+        # If the masked-image block is enabled, add it as a final segment.
+        if USE_ZEDIT_MASK:
+            f_m = self.masked_vision_descriptorizer(mask_features)
+            z_edit = torch.cat([z_edit, f_m], dim=-1)    # (N, 5d)
+
         if SPLIT_COMBINER:
             # Map the difference-aware edit representation with two separate combiners for the heads.
             h_psnr = self.psnr_combiner(z_edit)    # (N, d)
@@ -441,6 +475,9 @@ class AttentionRegressor(nn.Module):
        
         # If the pred space is bounded, apply the sigmoid function to the preds.
         if PREDICTION_SPACE == "deltas":
+            # This is only needed for "deltas" because deltas are per-sample
+            # normalized to [-1, 1]. This helps the model keep the deltas in this
+            # range during training, when deltas are used as the target.
             z = 2.0 * torch.sigmoid(z) - 1.0
             # Would be delta_hat to match the paper's notation.
 
@@ -461,9 +498,10 @@ class AttentionModel(nn.Module):
         n_cells: int,
         default_cell: int,
         device: torch.device | str | None = None,
+        feat_dim: int = 0,
     ):
         super().__init__()
-        self.regressor = AttentionRegressor(image_shape, text_dim, n_cells, default_cell)
+        self.regressor = AttentionRegressor(image_shape, text_dim, n_cells, default_cell, feat_dim=feat_dim)
         if device is not None:
             self.regressor.to(device)
 
@@ -474,7 +512,8 @@ class AttentionModel(nn.Module):
         target_tokens: torch.Tensor,    # (N, N_t, D_txt)
         source_mask: torch.Tensor,      # (N, N_t)
         target_mask: torch.Tensor,      # (N, N_t)
+        mask_features: torch.Tensor,    # (N, D_feat)
     ) -> torch.Tensor:                  # (N, n_cells, 2)
         """Predict per-cell (psnr, clip) in PREDICTION_SPACE units."""
-        standardized = self.regressor(image_tokens, source_tokens, target_tokens, source_mask, target_mask)
+        standardized = self.regressor(image_tokens, source_tokens, target_tokens, source_mask, target_mask, mask_features)
         return self.regressor.destandardize(standardized)
