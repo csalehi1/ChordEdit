@@ -20,7 +20,6 @@ sys.path.insert(0, _ROOT)
 sys.path.insert(0, _DIR)
 
 from datetime import datetime
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -28,7 +27,7 @@ import torch
 from _helpers import *
 from _wandb import finish_run, init_run, log_epoch, log_summary
 from dataloader import SplitDatasetLoader, get_dataloader
-from dataset import get_dataset
+from dataset import ID_TO_SPLIT_NAME, get_dataset
 from metrics import *
 from model import AttentionModel, preds_to_deltas
 from selector import SelectorModel
@@ -61,20 +60,35 @@ def ranking_loss(
     pred_phi: torch.Tensor,
     true_phi: torch.Tensor,
     top_k: int | None = None,
+    chunk: int = 64,
 ) -> torch.Tensor:
-    """Mean softplus of inverted pairwise margins over pairs with true_u > true_v."""
-    if pred_phi.shape[-1] < 2:
+    """
+    Mean softplus of inverted pairwise margins over pairs with true_u > true_v.
+
+    The mean is over every qualifying pair pooled across samples. Samples are
+    processed `chunk` at a time so the (n, n_cells, n_cells) pair tensors never
+    cover a whole split at once when eval() scores this on all of it.
+    """
+    n, n_cells = true_phi.shape
+    if n_cells < 2:
         return pred_phi.new_zeros(())
-    diff_true = true_phi.unsqueeze(-1) - true_phi.unsqueeze(-2)
-    diff_pred = pred_phi.unsqueeze(-1) - pred_phi.unsqueeze(-2)
-    mask = diff_true > 0
-    if top_k is not None and top_k < true_phi.shape[-1]:
-        idx = true_phi.topk(top_k, dim=-1).indices
-        is_top = torch.zeros_like(true_phi, dtype=torch.bool).scatter_(-1, idx, True)
-        mask = mask & is_top.unsqueeze(-1)
-    if not mask.any():
+    total = pred_phi.new_zeros(())
+    n_pairs = 0
+    for k in range(0, n, chunk):
+        t, p = true_phi[k : k + chunk], pred_phi[k : k + chunk]
+        diff_true = t.unsqueeze(-1) - t.unsqueeze(-2)
+        diff_pred = p.unsqueeze(-1) - p.unsqueeze(-2)
+        mask = diff_true > 0
+        if top_k is not None and top_k < n_cells:
+            idx = t.topk(top_k, dim=-1).indices
+            is_top = torch.zeros_like(t, dtype=torch.bool).scatter_(-1, idx, True)
+            mask = mask & is_top.unsqueeze(-1)
+        if mask.any():
+            n_pairs += int(mask.sum().item())
+            total = total + torch.nn.functional.softplus(-diff_pred[mask]).sum()
+    if n_pairs == 0:
         return pred_phi.new_zeros(())
-    return torch.nn.functional.softplus(-diff_pred[mask]).mean()
+    return total / n_pairs
 
 
 def col_loss(
@@ -196,9 +210,14 @@ def train(device: torch.device) -> None:
     # Create run directory to save information to.
     run_name = RUN_NAME or datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = RUNS_DIR / run_name
+    if any((run_dir / name).exists() for name in (ID_TO_SPLIT_NAME, "mean_surface.pt", "regressor_weights.pt")):
+        run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = RUNS_DIR / run_name
+        print(f"{run_dir} already exists. Falling back to {run_name}.")
+
     run_dir.mkdir(parents=True, exist_ok=True)
     save_run_settings(run_dir)
-    print(f"Saved settings")
+    print("Saved settings")
 
     # Build the device-resident datasets.
     bundle = get_dataset(device, run_dir)
@@ -422,8 +441,8 @@ def train(device: torch.device) -> None:
 
 def main() -> None:
 
-    # Parse the command line arguments.
-    args = parse_args()
+    # Parse the command line arguments (settings.py already read them off argv).
+    parse_args()
 
     # Set the random seeds.
     torch.manual_seed(SEED)

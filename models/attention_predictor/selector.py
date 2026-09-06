@@ -137,7 +137,7 @@ class SelectorModel:
         if len(models) > 1:
             print(f"Ensembled {len(models)} models.")
         else:
-            print(f"Loaded model.")
+            print("Loaded model.")
         
         return cls(models, t_pairs, mean_surface)
 
@@ -158,14 +158,17 @@ class SelectorModel:
         """Return selected cell indices of shape (N,) from a delta surface."""
         default_cell = self.model.regressor.default_cell
 
-        # Calculate the raw phi scores.
-        rank = self.calc_phi(deltas)
+        # Calculate phi.
+        phi = self.calc_phi(deltas)
 
-        # Reweight the phi scores per-column, if requested.
+        # Rank on a per-column reweighted phi, if requested.
         if SELECTOR_DELTA_WEIGHTS is not None:
             rank = self.calc_phi(deltas, weights=deltas.new_tensor(SELECTOR_DELTA_WEIGHTS))
+        else:
+            rank = phi
 
         # Restrict the argmax to cells clearing per-column floors, if requested.
+        keep = None
         if SELECTOR_DELTA_FLOORS is not None:
             delta_floors = deltas.new_tensor([float("-inf") if f is None else f for f in SELECTOR_DELTA_FLOORS])
             eligible = (deltas >= delta_floors).all(dim=-1)
@@ -176,8 +179,8 @@ class SelectorModel:
         if SELECTOR_TEMPERATURE is not None:
             probs = torch.softmax(rank / SELECTOR_TEMPERATURE, dim=-1)
             rank = probs[..., self.neighbor_map.to(probs.device)].sum(dim=-1)
-            # Floored-out cells have no mass, so re-exclude them here too.
-            rank = rank.masked_fill(torch.isinf(rank), -float("inf"))
+            if keep is not None:
+                rank = rank.masked_fill(~keep, -float("inf"))
 
         # Select the best cell for each sample.
         selected = rank.argmax(dim=-1)
@@ -186,7 +189,7 @@ class SelectorModel:
         if SELECTOR_PHI_FLOOR is not None:
             n = selected.shape[0]
             rows = torch.arange(n, device=selected.device)
-            gain = rank[rows, selected] - rank[:, default_cell]
+            gain = phi[rows, selected] - phi[:, default_cell]
             selected = torch.where(gain > SELECTOR_PHI_FLOOR, selected, selected.new_full((n,), default_cell))
 
         return selected
@@ -264,8 +267,8 @@ def eval(run_dir: Path) -> Path:
 
 def main() -> None:
 
-    # Parse the command line arguments.
-    args = parse_args()
+    # Parse the command line arguments (already read by the module-level guard).
+    parse_args()
 
     # Set the random seeds.
     torch.manual_seed(SEED)

@@ -473,17 +473,16 @@ class AttentionRegressor(nn.Module):
         # Stack the PSNR and CLIP predictions into a single tensor.
         z = torch.stack([z_psnr, z_clip], dim=-1)    # (N, n_cells, 2)
        
-        # If the pred space is bounded, apply the sigmoid function to the preds.
-        if PREDICTION_SPACE == "deltas":
-            # This is only needed for "deltas" because deltas are per-sample
-            # normalized to [-1, 1]. This helps the model keep the deltas in this
-            # range during training, when deltas are used as the target.
-            z = 2.0 * torch.sigmoid(z) - 1.0
-            # Would be delta_hat to match the paper's notation.
-
         if PIN_DEFAULT_CELL:
             # Pin the default cell to Delta=0.
             z = z - z[:, self.default_cell : self.default_cell + 1, :]
+
+        # If the pred space is bounded, squash the preds into it.
+        if PREDICTION_SPACE == "deltas":
+            # Deltas are per-sample normalized to [-1, 1], so the heads are held
+            # to that range during training, tanh(z/2) is 2*sigmoid(z) - 1.
+            z = torch.tanh(z / 2.0)
+            # Would be delta_hat to match the paper's notation.
 
         return z
 

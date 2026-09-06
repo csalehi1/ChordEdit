@@ -25,7 +25,7 @@ from settings import *
 USE_WANDB = True
 WANDB_ENTITY = "dfmirick-harvard-university"
 WANDB_PROJECT = "attention-predictor"
-WANDB_MODE = "online"                              # "online", "offline", or "disabled"
+WANDB_MODE = "offline"                              # "online", "offline", or "disabled"
 WANDB_GROUP = f"{CHORD_EDIT_MODEL}_{DIR_NAME}"    # optional label grouping related runs
 
 # Pinned to the package dir so the key is found whatever the working directory.
@@ -33,11 +33,6 @@ load_dotenv(Path(_DIR) / ".env")
 
 # Short names for the long metric columns, so that panel titles stay readable.
 _ALIASES = {PSNR_COL: "psnr", CLIP_COL: "clip"}
-
-# Per-run history for the overlay Charts panels. Custom line_series plots
-# replace the whole curve, so each epoch resends the points so far.
-_CHART_HISTORY: dict[int, dict[str, list]] = {}
-
 
 def _log_prep(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
     """Prefix one split's metrics for wandb, shortening long column names."""
@@ -127,5 +122,4 @@ def log_summary(
 def finish_run(run) -> None:
     """Finish the run."""
     if run is not None:
-        _CHART_HISTORY.pop(id(run), None)
         run.finish()
