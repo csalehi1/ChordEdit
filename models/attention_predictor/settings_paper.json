@@ -56,5 +56,6 @@
   "SELECTOR_TEMPERATURE": null,
   "SELECTOR_RUN_DIRS": null,
 
-  "RUN_NAME": ""
+  "RUN_NAME": "",
+  "RUN_TAGS": []
 }

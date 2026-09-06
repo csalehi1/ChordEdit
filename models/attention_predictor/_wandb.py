@@ -21,18 +21,12 @@ from dotenv import load_dotenv
 from _helpers import current_commit_id
 from settings import *
 
- 
+
 USE_WANDB = True
 WANDB_ENTITY = "dfmirick-harvard-university"
 WANDB_PROJECT = "attention-predictor"
-WANDB_MODE = "offline"                             # "online", "offline", or "disabled"
+WANDB_MODE = "online"                              # "online", "offline", or "disabled"
 WANDB_GROUP = f"{CHORD_EDIT_MODEL}_{DIR_NAME}"    # optional label grouping related runs
-
-WANDB_TRACK_TRAINING = True
-WANDB_TRACK_SELECTION = True
-WANDB_TRACK_PER_COMPONENT = False
-WANDB_TRACK_COMPARISONS = True
-
 
 # Pinned to the package dir so the key is found whatever the working directory.
 load_dotenv(Path(_DIR) / ".env")
@@ -40,60 +34,15 @@ load_dotenv(Path(_DIR) / ".env")
 # Short names for the long metric columns, so that panel titles stay readable.
 _ALIASES = {PSNR_COL: "psnr", CLIP_COL: "clip"}
 
-# Key sets matching metrics.training_metrics / selection_metrics / per_component_metrics.
-_TRAINING_KEYS = frozenset({
-    "loss", "loss_mse", "loss_ranking", "loss_col", "phi_spearman",
-    # Collapse detectors: a model that has only learned the population mean
-    # surface sits at ~0 on both while every other metric looks unremarkable.
-    "rho_phi_image", "phi_spread_ratio",
-})
-_SELECTION_KEYS = frozenset({
-    "phi", "delta_phi",
-    "regret_median", "regret_p90", "gain_mean",
-    "improvement_rate", "deviate_rate",
-    "top1_accuracy", "top5_accuracy", "top10_accuracy",
-    "modal_cell_frac", "n_distinct_cells",
-})
-_COMPARISON_KEYS = frozenset({
-    "psnr", "delta_psnr", "clip", "delta_clip",
-})
-
-
-def _per_component_keys() -> frozenset[str]:
-    """Bare col names plus the prefixed keys per_component_metrics emits."""
-    cols = (PSNR_COL, CLIP_COL, *{_ALIASES[c] for c in (PSNR_COL, CLIP_COL)})
-    keys: set[str] = set()
-    for col in cols:
-        keys.update({
-            col,
-            f"delta_{col}", f"mae_{col}", f"rmse_{col}", f"r2_{col}",
-            f"rho_{col}", f"gain_{col}", f"regret_{col}",
-            f"rho_{col}_image", f"spread_ratio_{col}",
-        })
-    return frozenset(keys)
-
-
-_PER_COMPONENT_KEYS = _per_component_keys()
-
-
-def _tracked(metrics: dict[str, float]) -> dict[str, float]:
-    """Keep only the metric groups enabled by WANDB_TRACK_*."""
-    keep: set[str] = set()
-    if WANDB_TRACK_TRAINING:
-        keep |= _TRAINING_KEYS
-    if WANDB_TRACK_SELECTION:
-        keep |= _SELECTION_KEYS
-    if WANDB_TRACK_PER_COMPONENT:
-        keep |= _PER_COMPONENT_KEYS
-    if WANDB_TRACK_COMPARISONS:
-        keep |= _COMPARISON_KEYS
-    return {k: v for k, v in metrics.items() if k in keep}
+# Per-run history for the overlay Charts panels. Custom line_series plots
+# replace the whole curve, so each epoch resends the points so far.
+_CHART_HISTORY: dict[int, dict[str, list]] = {}
 
 
 def _log_prep(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
-    """Prefix one split's tracked metrics for wandb, shortening long column names."""
+    """Prefix one split's metrics for wandb, shortening long column names."""
     out = {}
-    for key, value in _tracked(metrics).items():
+    for key, value in metrics.items():
         for col, alias in _ALIASES.items():
             key = key.replace(col, alias)
         out[f"{prefix}/{key}"] = value
@@ -114,14 +63,7 @@ def init_run(run_dir: Path, config_extra: dict):
         return None
 
     # The CONFIG dict is the same as the one save_run_settings writes.
-    config = dict(CONFIG) | config_extra | {
-        "commit": current_commit_id(),
-        "WANDB_TRACK_TRAINING": WANDB_TRACK_TRAINING,
-        "WANDB_TRACK_SELECTION": WANDB_TRACK_SELECTION,
-        "WANDB_TRACK_PER_COMPONENT": WANDB_TRACK_PER_COMPONENT,
-        "WANDB_TRACK_COMPARISONS": WANDB_TRACK_COMPARISONS,
-    }
-    tags = [str(t) for t in (CHORD_EDIT_MODEL, DIR_NAME, run_dir.name)]
+    tags = [str(t) for t in (CHORD_EDIT_MODEL, DIR_NAME, run_dir.name, *RUN_TAGS)]
     if PIE_BENCH:
         tags.append("pie-bench")
     try:
@@ -136,7 +78,7 @@ def init_run(run_dir: Path, config_extra: dict):
             tags=tags,
             mode=WANDB_MODE,
             dir=str(run_dir),
-            config=config,
+            config=dict(CONFIG) | config_extra | {"commit": current_commit_id()},
         )
     except Exception as exc:
         print(f"wandb.init failed ({exc}); continuing without tracking.")
@@ -185,4 +127,5 @@ def log_summary(
 def finish_run(run) -> None:
     """Finish the run."""
     if run is not None:
+        _CHART_HISTORY.pop(id(run), None)
         run.finish()

@@ -289,6 +289,11 @@ EMA_DECAY = float(_cfg("EMA_DECAY"))
 
 # Run directory name under RUNS_DIR. Empty string means use a timestamp.
 RUN_NAME = str(_cfg("RUN_NAME"))
+# Extra wandb tags. Empty list adds nothing beyond the automatic ones.
+_RUN_TAGS = _cfg("RUN_TAGS", []) or []
+if not isinstance(_RUN_TAGS, list):
+    raise ValueError(f"Expected RUN_TAGS to be a list, got {_RUN_TAGS!r}")
+RUN_TAGS = [str(t) for t in _RUN_TAGS]
 
 
 """

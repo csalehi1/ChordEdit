@@ -118,13 +118,6 @@ def resolve_device(gpu: int | str | None = None) -> torch.device:
     return torch.device(f"cuda:{int(gpu)}")
 
 
-def calc_phi(deltas: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
-    """settings.SCORE_PHI on normalized deltas."""
-    if weights is None:
-        return _s().SCORE_PHI(deltas)
-    return _s().SCORE_PHI(deltas, weights=weights)
-
-
 def phi_from_delta_grids(
     delta_grids: np.ndarray,
     weights: np.ndarray | tuple[float, float] | None = None,
@@ -133,7 +126,8 @@ def phi_from_delta_grids(
     b, n1, n2, c = delta_grids.shape
     deltas = torch.as_tensor(delta_grids.reshape(b, n1 * n2, c), dtype=torch.float64)
     w = None if weights is None else torch.as_tensor(weights, dtype=torch.float64)
-    return calc_phi(deltas, weights=w).detach().cpu().numpy().reshape(b, n1, n2)
+    phi = _s().SCORE_PHI(deltas) if w is None else _s().SCORE_PHI(deltas, weights=w)
+    return phi.detach().cpu().numpy().reshape(b, n1, n2)
 
 
 def format_metric_table(

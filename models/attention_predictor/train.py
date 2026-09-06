@@ -40,20 +40,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the grid surface predictor")
     # Read off argv by settings.py at import time, before this parser runs.
     parser.add_argument("--settings-path", default=None)
-    parser.add_argument(
-        "--pie-bench",
-        action="store_true",
-        help="Replace the UltraEdit test split with PIE_Bench_v1 for the current CHORD_EDIT_MODEL",
-    )
+    parser.add_argument("--pie-bench", action="store_true")
     return parser.parse_args()
-
-
-def calc_train_phi(deltas: torch.Tensor) -> torch.Tensor:
-    """Training-only phi, with TRAIN_PHI_ALPHA, _WEIGHTS."""
-    if TRAIN_PHI_WEIGHTS is None:
-        return TRAIN_SCORE_PHI(deltas)
-    weights = deltas.new_tensor(TRAIN_PHI_WEIGHTS)
-    return TRAIN_SCORE_PHI(deltas, weights=weights)
 
 
 def mse_loss(
@@ -98,28 +86,22 @@ def col_loss(
     return (((pred_deltas - true_deltas) ** 2) * weights).mean()
 
 
-def _train_loss_tensors(
-    pred: torch.Tensor,
-    true: torch.Tensor,
-    default_cell: int,
-    mean_surface: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Deltas and train-phi surfaces used by calc_loss and its terms."""
-    pred_deltas = preds_to_deltas(pred, default_cell, mean_surface)
-    true_deltas = preds_to_deltas(true, default_cell, mean_surface)
-    return pred_deltas, true_deltas, calc_train_phi(pred_deltas), calc_train_phi(true_deltas)
-
-
 def calc_loss(
     pred: torch.Tensor,                        # (G, n_cells, 2)
     true: torch.Tensor,                        # (G, n_cells, 2)
     default_cell: int,                         # shared index
     mean_surface: torch.Tensor,                # (n_cells, 2)
+    selector: SelectorModel,
 ) -> torch.Tensor:
     """Weighted phi MSE, pairwise ranking, and per-column MSE."""
-    pred_deltas, true_deltas, pred_phi, true_phi = _train_loss_tensors(
-        pred, true, default_cell, mean_surface,
-    )
+    
+    # Convert the predictions and targets to deltas.
+    pred_deltas = preds_to_deltas(pred, default_cell, mean_surface)
+    true_deltas = preds_to_deltas(true, default_cell, mean_surface)
+    weights = None if TRAIN_PHI_WEIGHTS is None else pred_deltas.new_tensor(TRAIN_PHI_WEIGHTS)
+    pred_phi = selector.calc_phi(pred_deltas, weights=weights, phi_func=TRAIN_SCORE_PHI)
+    true_phi = selector.calc_phi(true_deltas, weights=weights, phi_func=TRAIN_SCORE_PHI)
+    
     loss = pred_phi.new_zeros(())
     if MSE_LOSS_WEIGHT > 0:
         loss = loss + MSE_LOSS_WEIGHT * mse_loss(pred_phi, true_phi, top_k=MSE_LOSS_TOP_K)
@@ -171,21 +153,23 @@ def eval(
     # Both sides leave PREDICTION_SPACE here, so phi sees deltas either way.
     pred_deltas = preds_to_deltas(pred.double(), default_cell, surface)
     true_deltas = preds_to_deltas(y.double(), default_cell, surface)
-    true_phi = calc_phi(true_deltas)
-    pred_phi = calc_phi(pred_deltas)
+    true_phi = selector.calc_phi(true_deltas)
+    pred_phi = selector.calc_phi(pred_deltas)
     selected = selector.select_deltas(pred_deltas)
 
     pred_std = (pred - mean) / std
     y_std = (y - mean) / std
-    loss_pred_deltas, loss_true_deltas, loss_pred_phi, loss_true_phi = _train_loss_tensors(
-        pred_std, y_std, default_cell, dataset.mean_surface,
-    )
+    loss_pred_deltas = preds_to_deltas(pred_std, default_cell, dataset.mean_surface)
+    loss_true_deltas = preds_to_deltas(y_std, default_cell, dataset.mean_surface)
+    weights = None if TRAIN_PHI_WEIGHTS is None else loss_pred_deltas.new_tensor(TRAIN_PHI_WEIGHTS)
+    loss_pred_phi = selector.calc_phi(loss_pred_deltas, weights=weights, phi_func=TRAIN_SCORE_PHI)
+    loss_true_phi = selector.calc_phi(loss_true_deltas, weights=weights, phi_func=TRAIN_SCORE_PHI)
 
     return {
         # How well the predicted phi surface matches the true one.
         **training_metrics(
             true_phi, pred_phi,
-            lambda: calc_loss(pred_std, y_std, default_cell, dataset.mean_surface),
+            lambda: calc_loss(pred_std, y_std, default_cell, dataset.mean_surface, selector),
             lambda: mse_loss(loss_pred_phi, loss_true_phi, top_k=MSE_LOSS_TOP_K),
             lambda: ranking_loss(loss_pred_phi, loss_true_phi, top_k=RANKING_LOSS_TOP_K),
             lambda: col_loss(loss_pred_deltas, loss_true_deltas),
@@ -302,7 +286,7 @@ def train(device: torch.device) -> None:
                     batch.target_mask,
                     batch.mask_features,
                 )
-                loss = calc_loss(out, (batch.y - y_mean) / y_std, train.default_cell, train.mean_surface)
+                loss = calc_loss(out, (batch.y - y_mean) / y_std, train.default_cell, train.mean_surface, selector)
 
                 # Backpropagate the loss.
                 optimizer.zero_grad()

@@ -141,17 +141,29 @@ class SelectorModel:
         
         return cls(models, t_pairs, mean_surface)
 
+    def calc_phi(
+        self,
+        deltas: torch.Tensor,
+        weights: torch.Tensor | None = None,
+        phi_func=None,
+    ) -> torch.Tensor:
+        """Score phi on normalized deltas. Defaults to SCORE_PHI."""
+        phi = SCORE_PHI if phi_func is None else phi_func
+        if weights is None:
+            return phi(deltas)
+        return phi(deltas, weights=weights)
+
     @torch.no_grad()
     def select_deltas(self, deltas: torch.Tensor) -> torch.Tensor:
         """Return selected cell indices of shape (N,) from a delta surface."""
         default_cell = self.model.regressor.default_cell
 
         # Calculate the raw phi scores.
-        rank = calc_phi(deltas)
+        rank = self.calc_phi(deltas)
 
         # Reweight the phi scores per-column, if requested.
         if SELECTOR_DELTA_WEIGHTS is not None:
-            rank = calc_phi(deltas, weights=deltas.new_tensor(SELECTOR_DELTA_WEIGHTS))
+            rank = self.calc_phi(deltas, weights=deltas.new_tensor(SELECTOR_DELTA_WEIGHTS))
 
         # Restrict the argmax to cells clearing per-column floors, if requested.
         if SELECTOR_DELTA_FLOORS is not None:
