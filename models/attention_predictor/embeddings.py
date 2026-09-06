@@ -160,9 +160,12 @@ def get_clip_tokens(
         tokens = torch.load(root / sample_id / tokens_file, map_location="cpu", weights_only=True)
         return tokens.mean(dim=0, keepdim=True) if pool else tokens
 
-    with ThreadPoolExecutor(max_workers=16) as pool:
+    # Named `executor`, not `pool`: the bool above is read inside the closure at
+    # call time, and a `with ... as pool:` here used to rebind it to the
+    # executor (always truthy), so IMG_EMB_POOL false still pooled.
+    with ThreadPoolExecutor(max_workers=16) as executor:
         rows = list(tqdm(
-            pool.map(_load_clip_tokens, sample_ids),
+            executor.map(_load_clip_tokens, sample_ids),
             total=len(sample_ids), desc=f"Loading {tokens_file}", unit="sample",
         ))
     return torch.stack(rows).float().contiguous()
@@ -287,7 +290,10 @@ def get_packed_embeddings(
     sample_ids = samples[SAMPLE_ID_COL].tolist()
     slug = (dir_name if dir_name is not None else DIR_NAME).replace("_", "").lower()
     t_delta = f"{TARGET_T_DELTA}".replace(".", "p")
-    main_path = _PACKED_EMBEDDINGS_DIR / f"{CHORD_EDIT_MODEL}-{t_delta}-{slug}.pt"
+    # The masked block gets its own file: runs with and without USE_IMG_MASK
+    # otherwise repack the same path back and forth and race on the .tmp write.
+    masked_tag = "-masked" if USE_IMG_MASK else ""
+    main_path = _PACKED_EMBEDDINGS_DIR / f"{CHORD_EDIT_MODEL}-{t_delta}{masked_tag}-{slug}.pt"
     token_path = _PACKED_EMBEDDINGS_DIR / f"{CHORD_EDIT_MODEL}-texttokens-{slug}.pt"
     main_meta = {
         "model": CHORD_EDIT_MODEL,

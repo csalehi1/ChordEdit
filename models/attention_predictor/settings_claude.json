@@ -10,9 +10,9 @@
   "PIE_BENCH": false,
 
   "IMG_EMB_TYPE": "clip",
-  "IMG_EMB_POOL": false,
-  "USE_IMG_MASK": false,
-  "USE_ZEDIT_MASK": false,
+  "IMG_EMB_POOL": true,
+  "USE_IMG_MASK": true,
+  "USE_ZEDIT_MASK": true,
 
   "PREDICTION_SPACE": "deltas",
   "PIN_DEFAULT_CELL": true,
