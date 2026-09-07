@@ -27,9 +27,9 @@ import torch
 from _helpers import *
 from _wandb import finish_run, init_run, log_epoch, log_summary
 from dataloader import SplitDatasetLoader, get_dataloader
-from dataset import ID_TO_SPLIT_NAME, get_dataset
+from dataset import ID_TO_SPLIT_NAME, TRAIN_METADATA_NAME, get_dataset
 from metrics import *
-from model import AttentionModel, preds_to_deltas
+from model import AttentionModel
 from selector import SelectorModel
 from settings import *
 
@@ -94,35 +94,38 @@ def ranking_loss(
 def col_loss(
     pred_deltas: torch.Tensor,
     true_deltas: torch.Tensor,
+    top_k: int | None = None,
 ) -> torch.Tensor:
     """Per-column MSE on the delta surfaces, one weight per metric."""
-    weights = pred_deltas.new_tensor([PSNR_LOSS_WEIGHT, CLIP_LOSS_WEIGHT])
+    if top_k is not None and top_k < true_deltas.shape[-2]:
+        idx = true_deltas.topk(top_k, dim=-2).indices
+        pred_deltas = pred_deltas.gather(-2, idx)
+        true_deltas = true_deltas.gather(-2, idx)
+    weights = pred_deltas.new_tensor(COL_LOSS_WEIGHTS)
     return (((pred_deltas - true_deltas) ** 2) * weights).mean()
 
 
 def calc_loss(
-    pred: torch.Tensor,                        # (G, n_cells, 2)
-    true: torch.Tensor,                        # (G, n_cells, 2)
-    default_cell: int,                         # shared index
-    mean_surface: torch.Tensor,                # (n_cells, 2)
+    pred: torch.Tensor,                        # (G, n_cells, 2) TRAINING_* units
+    y_raw: torch.Tensor,                       # (G, n_cells, 2) raw CLIP/PSNR
     selector: SelectorModel,
 ) -> torch.Tensor:
-    """Weighted phi MSE, pairwise ranking, and per-column MSE."""
-    
-    # Convert the predictions and targets to deltas.
-    pred_deltas = preds_to_deltas(pred, default_cell, mean_surface)
-    true_deltas = preds_to_deltas(true, default_cell, mean_surface)
-    weights = None if TRAIN_PHI_WEIGHTS is None else pred_deltas.new_tensor(TRAIN_PHI_WEIGHTS)
-    pred_phi = selector.calc_phi(pred_deltas, weights=weights, phi_func=TRAIN_SCORE_PHI)
-    true_phi = selector.calc_phi(true_deltas, weights=weights, phi_func=TRAIN_SCORE_PHI)
+    """Weighted phi MSE, pairwise ranking, and per-column MSE on selection surfaces."""
+
+    regressor = selector.model.regressor
+    pred_sel = regressor.to_selector(regressor.to_raw(pred))
+    true_sel = regressor.to_selector(y_raw)
+    weights = None if PHI_WEIGHTS is None else pred_sel.new_tensor(PHI_WEIGHTS)
+    pred_phi = selector.calc_phi(pred_sel, weights=weights)
+    true_phi = selector.calc_phi(true_sel, weights=weights)
     
     loss = pred_phi.new_zeros(())
     if MSE_LOSS_WEIGHT > 0:
         loss = loss + MSE_LOSS_WEIGHT * mse_loss(pred_phi, true_phi, top_k=MSE_LOSS_TOP_K)
     if RANKING_LOSS_WEIGHT > 0:
         loss = loss + RANKING_LOSS_WEIGHT * ranking_loss(pred_phi, true_phi, top_k=RANKING_LOSS_TOP_K)
-    if PSNR_LOSS_WEIGHT > 0 or CLIP_LOSS_WEIGHT > 0:
-        loss = loss + col_loss(pred_deltas, true_deltas)
+    if any(w > 0 for w in COL_LOSS_WEIGHTS):
+        loss = loss + col_loss(pred_sel, true_sel, top_k=COL_LOSS_TOP_K)
     return loss
 
 
@@ -142,14 +145,12 @@ def eval(
     # Set the model to evaluation mode.
     model.regressor.eval()
     dataset = loader.dataset
-    mean, std = model.regressor.target_mean, model.regressor.target_std
     default_cell = dataset.default_cell
-    surface = dataset.mean_surface.double()
 
     # Iterate over the batches of the dataset.
-    preds, ys, ys_raw = [], [], []
+    preds, ys_raw = [], []
     for batch in loader:
-        out = model.regressor(
+        pred = model.regressor(
             batch.image_tokens,
             batch.source_tokens,
             batch.target_tokens,
@@ -157,36 +158,32 @@ def eval(
             batch.target_mask,
             batch.mask_features,
         )
-        preds.append(model.regressor.destandardize(out))
-        ys.append(batch.y)
+        preds.append(pred)
         ys_raw.append(batch.y_raw)
     pred = torch.cat(preds)
-    y = torch.cat(ys)
     y_raw = torch.cat(ys_raw)
 
-    # Both sides leave PREDICTION_SPACE here, so phi sees deltas either way.
-    pred_deltas = preds_to_deltas(pred.double(), default_cell, surface)
-    true_deltas = preds_to_deltas(y.double(), default_cell, surface)
-    true_phi = selector.calc_phi(true_deltas)
-    pred_phi = selector.calc_phi(pred_deltas)
-    selected = selector.select_deltas(pred_deltas)
-
-    pred_std = (pred - mean) / std
-    y_std = (y - mean) / std
-    loss_pred_deltas = preds_to_deltas(pred_std, default_cell, dataset.mean_surface)
-    loss_true_deltas = preds_to_deltas(y_std, default_cell, dataset.mean_surface)
-    weights = None if TRAIN_PHI_WEIGHTS is None else loss_pred_deltas.new_tensor(TRAIN_PHI_WEIGHTS)
-    loss_pred_phi = selector.calc_phi(loss_pred_deltas, weights=weights, phi_func=TRAIN_SCORE_PHI)
-    loss_true_phi = selector.calc_phi(loss_true_deltas, weights=weights, phi_func=TRAIN_SCORE_PHI)
+    regressor = model.regressor
+    pred_sel = regressor.to_selector(regressor.to_raw(pred.double()))
+    true_sel = regressor.to_selector(y_raw.double())
+    true_phi = selector.calc_phi(true_sel)
+    pred_phi = selector.calc_phi(pred_sel)
+    selected = selector.select_deltas(
+        pred_sel,
+        delta_weights=TRAINING_DELTA_WEIGHTS,
+        delta_floors=TRAINING_DELTA_FLOORS,
+        phi_floor=TRAINING_PHI_FLOOR,
+        temperature=TRAINING_TEMPERATURE,
+    )
 
     return {
         # How well the predicted phi surface matches the true one.
         **training_metrics(
             true_phi, pred_phi,
-            lambda: calc_loss(pred_std, y_std, default_cell, dataset.mean_surface, selector),
-            lambda: mse_loss(loss_pred_phi, loss_true_phi, top_k=MSE_LOSS_TOP_K),
-            lambda: ranking_loss(loss_pred_phi, loss_true_phi, top_k=RANKING_LOSS_TOP_K),
-            lambda: col_loss(loss_pred_deltas, loss_true_deltas),
+            lambda: calc_loss(pred, y_raw, selector),
+            lambda: mse_loss(pred_phi, true_phi, top_k=MSE_LOSS_TOP_K),
+            lambda: ranking_loss(pred_phi, true_phi, top_k=RANKING_LOSS_TOP_K),
+            lambda: col_loss(pred_sel, true_sel, top_k=COL_LOSS_TOP_K),
         ),
         # How well the selected cell compares to the true best cell.
         **selection_metrics(
@@ -194,7 +191,7 @@ def eval(
         ),
         # Per-column training and selection metrics.
         **per_col_metrics(
-            true_deltas, y_raw.double(), pred_deltas,
+            true_sel, y_raw.double(), pred_sel,
             selected, default_cell, TARGET_COLS,
         ),
     }
@@ -210,7 +207,7 @@ def train(device: torch.device) -> None:
     # Create run directory to save information to.
     run_name = RUN_NAME or datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = RUNS_DIR / run_name
-    if any((run_dir / name).exists() for name in (ID_TO_SPLIT_NAME, "mean_surface.pt", "regressor_weights.pt")):
+    if any((run_dir / name).exists() for name in (ID_TO_SPLIT_NAME, TRAIN_METADATA_NAME, "regressor_weights.pt")):
         run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_dir = RUNS_DIR / run_name
         print(f"{run_dir} already exists. Falling back to {run_name}.")
@@ -222,49 +219,43 @@ def train(device: torch.device) -> None:
     # Build the device-resident datasets.
     bundle = get_dataset(device, run_dir)
     train, val, test = bundle.train, bundle.val, bundle.test
-    metadata = bundle.metadata
     print(
         f"Dataset splits:\n"
-        f"  train: {train.n_samples * metadata.n_cells} cells ({train.n_samples} samples)\n"
-        f"  val: {val.n_samples * metadata.n_cells} cells ({val.n_samples} samples)\n"
+        f"  train: {train.n_samples * train.n_cells} cells ({train.n_samples} samples)\n"
+        f"  val: {val.n_samples * val.n_cells} cells ({val.n_samples} samples)\n"
         f"  test: {test.n_samples * test.y.shape[1]} cells ({test.n_samples} samples)"
     )
 
-    # Size the predictor from the bundle's metadata
+    # Size the predictor from train metadata only.
+    metadata = train.metadata
     model = AttentionModel(
-        metadata.image_shape, 
-        metadata.source_shape[-1],
+        train.image_shape, 
+        train.source_shape[-1],
         metadata.n_cells, 
         device=device,
         default_cell=metadata.default_cell,
-        feat_dim=metadata.feature_shape[-1],
+        feat_dim=train.feature_shape[-1],
     )
 
     t_start_values = torch.as_tensor(np.sort(np.unique(metadata.cell_labels[:, 0].numpy())), dtype=torch.float64)
     t_end_values = torch.as_tensor(np.sort(np.unique(metadata.cell_labels[:, 1].numpy())), dtype=torch.float64)
-    selector = SelectorModel(model, metadata.cell_labels.numpy(), train.mean_surface)
+    selector = SelectorModel(model, metadata.cell_labels.numpy())
 
     run = init_run(run_dir, {
-        "image_shape": list(metadata.image_shape),
-        "source_shape": list(metadata.source_shape),
-        "target_shape": list(metadata.target_shape),
-        "n_cells": int(metadata.n_cells),
+        "n_cells": int(train.n_cells),
         "n_train_samples": int(train.n_samples),
         "n_val_samples": int(val.n_samples),
         "n_test_samples": int(test.n_samples),
     })
 
-    # Only "raws" needs standardization as the delta spaces are already standardized.
-    if PREDICTION_SPACE == "raws":
-        y_train = train.y.detach().float().reshape(-1, train.y.shape[-1]).cpu()
-        model.regressor.set_target_standardization(y_train.mean(0), y_train.std(0))
+    model.regressor.set_metadata(metadata)
     print(
         "Target columns (train):\n"
         f"  {'Target':<38} {'Mean':>8} {'Std':>8}\n"
         + "\n".join(
             f"  {c:<38} "
-            f"{model.regressor.target_mean[i]:8.3f} "
-            f"{model.regressor.target_std[i]:8.3f}"
+            f"{model.regressor.zscore_mean[i]:8.3f} "
+            f"{model.regressor.zscore_std[i]:8.3f}"
             for i, c in enumerate(TARGET_COLS)
         )
     )
@@ -273,7 +264,6 @@ def train(device: torch.device) -> None:
     optimizer = torch.optim.AdamW(model.regressor.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, EPOCHS)) if LR_SCHEDULER == "cosine" else None)
 
-    y_mean, y_std = model.regressor.target_mean, model.regressor.target_std
     train_loader = get_dataloader(train, shuffle=True)
     val_loader = get_dataloader(val, shuffle=False)
     test_loader = get_dataloader(test, shuffle=False)
@@ -285,7 +275,7 @@ def train(device: torch.device) -> None:
         best_epoch, since_improved = 0, 0
         best_val_loss = float("inf")
         history: list[dict] = []
-        n_cells, n_samples = train.n_samples * metadata.n_cells, train.n_samples
+        n_cells, n_samples = train.n_samples * train.n_cells, train.n_samples
         ema_state = {k: v.detach().clone() for k, v in model.regressor.state_dict().items()} if EMA_DECAY > 0 else None
 
         # Iterate over the epochs.
@@ -305,7 +295,9 @@ def train(device: torch.device) -> None:
                     batch.target_mask,
                     batch.mask_features,
                 )
-                loss = calc_loss(out, (batch.y - y_mean) / y_std, train.default_cell, train.mean_surface, selector)
+                loss = calc_loss(
+                    out, batch.y_raw, selector,
+                )
 
                 # Backpropagate the loss.
                 optimizer.zero_grad()
@@ -364,14 +356,12 @@ def train(device: torch.device) -> None:
                 best_val_loss = val_metrics["loss"]
                 torch.save({
                     "regressor_state_dict": model.regressor.state_dict(),
-                    "target_mean": model.regressor.target_mean.cpu(),
-                    "target_std": model.regressor.target_std.cpu(),
                     "target_cols": list(TARGET_COLS),
-                    "prediction_space": str(PREDICTION_SPACE),
-                    "image_shape": metadata.image_shape,
-                    "source_shape": metadata.source_shape,
+                    "regressor_pred_space": str(TRAINING_PRED_SPACE),
+                    "image_shape": train.image_shape,
+                    "source_shape": train.source_shape,
                     "img_emb_pool": bool(IMG_EMB_POOL),
-                    "feature_shape": metadata.feature_shape,
+                    "feature_shape": train.feature_shape,
                     "use_zedit_mask": bool(USE_ZEDIT_MASK),
                     "cell_t_pairs": metadata.cell_labels,
                     "t_start_values": t_start_values,
@@ -417,20 +407,6 @@ def train(device: torch.device) -> None:
             history[best_epoch - 1]["val"] if history else {},
             best_epoch, len(history),
         )
-
-        # Save metrics. Splits membership and mean surface were written by get_dataset.
-        metrics_out = run_dir / "regression_metrics.json"
-        with open(metrics_out, "w") as f:
-            json.dump({
-                "best_epoch": best_epoch,
-                "epochs_ran": len(history),
-                "ckpt_metric": str(CKPT_METRIC),
-                "prediction_space": str(PREDICTION_SPACE),
-                "val_best_loss": best_val_loss,
-                "val_best": history[best_epoch - 1]["val"] if history else {},
-                "test": test_metrics,
-                "history": history,
-            }, f, indent=4)
 
         print(f"\nSaved to {run_dir.resolve()}")
 

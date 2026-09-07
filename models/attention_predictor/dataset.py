@@ -15,36 +15,11 @@ import torch
 
 from _helpers import get_default_cell, prep_sample_id
 from embeddings import EmbeddingsTable, SampleEmbeddings, get_embeddings
+from model import apply_pipeline, pin_default
 from settings import *
 
 ID_TO_SPLIT_NAME = "id_to_split.csv"
-
-
-def get_mean_surface(run_dir: Path, y: torch.Tensor) -> torch.Tensor:
-    """Load the saved (n_cells, 2) surface, or calculate it from y and save."""
-
-    def _calc_mean_surface(y: torch.Tensor) -> torch.Tensor:
-        surface = y.double().mean(dim=0)
-        return surface
-
-    def _load_mean_surface(path: Path) -> torch.Tensor:
-        surface = torch.load(path, map_location="cpu", weights_only=True)
-        return surface
-
-    def _save_mean_surface(path: Path, surface: torch.Tensor) -> None:
-        torch.save(surface.detach().cpu().contiguous(), path)
-        print(f"Saved {path.name}.")
-
-    # Load the mean surface if it exists.
-    path = Path(run_dir) / "mean_surface.pt"
-    if path.exists():
-        return _load_mean_surface(path)
-    
-    # Otherwise calculate it and save it.
-    surface = _calc_mean_surface(y)
-    _save_mean_surface(path, surface)
-    
-    return surface
+TRAIN_METADATA_NAME = "train_metadata.pt"
 
 
 """
@@ -53,26 +28,64 @@ Sample and split classes.
 
 
 @dataclass(frozen=True)
+class DatasetMetadata:
+    """Train-global grid identity and invert stats, shared by every split."""
+
+    n_cells: int                     # cells per grid
+    cell_labels: torch.Tensor        # (n_cells, 2) being (t_start, t_end)
+    default_cell: int                # shared default-cell index; raises if not unique
+    mean_surface: torch.Tensor       # (n_cells, C)
+    minmax_max: torch.Tensor         # (C,)
+    minmax_min: torch.Tensor         # (C,)
+    zscore_mean: torch.Tensor        # (C,)
+    zscore_std: torch.Tensor         # (C,)
+
+    def pipeline_stats(self) -> dict[str, int | torch.Tensor]:
+        """Kwargs for apply_pipeline / invert_pipeline."""
+        return dict(
+            default_cell=self.default_cell,
+            minmax_min=self.minmax_min,
+            minmax_max=self.minmax_max,
+            zscore_mean=self.zscore_mean,
+            zscore_std=self.zscore_std,
+            mean_surface=self.mean_surface,
+        )
+
+
+def get_train_metadata(run_dir: Path, built: DatasetMetadata | None = None) -> DatasetMetadata:
+    """Load saved train metadata, or write `built` and return it."""
+
+    path = Path(run_dir) / TRAIN_METADATA_NAME
+    if path.exists():
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        payload["n_cells"] = int(payload["n_cells"])
+        payload["default_cell"] = int(payload["default_cell"])
+        return DatasetMetadata(**payload)
+    if built is None:
+        raise FileNotFoundError(f"Missing {path}")
+
+    torch.save({
+        "n_cells": built.n_cells,
+        "cell_labels": built.cell_labels.detach().cpu().contiguous(),
+        "default_cell": built.default_cell,
+        "mean_surface": built.mean_surface.detach().cpu().contiguous(),
+        "minmax_max": built.minmax_max.detach().cpu().contiguous(),
+        "minmax_min": built.minmax_min.detach().cpu().contiguous(),
+        "zscore_mean": built.zscore_mean.detach().cpu().contiguous(),
+        "zscore_std": built.zscore_std.detach().cpu().contiguous(),
+    }, path)
+    print(f"Saved {path.name}.")
+    return built
+
+
+@dataclass(frozen=True)
 class SampleData:
     """One sample's data, embeddings and targets."""
 
     sample_id: str
     x: SampleEmbeddings
-    y: torch.Tensor                  # (n_cells, C) PREDICTION_SPACE targets
-    y_raw: torch.Tensor              # (n_cells, C) "raw" targets
-
-
-@dataclass(frozen=True)
-class SampleMetadata:
-    """One sample's metadata."""
-
-    image_shape: tuple[int, ...]     # per-sample image_tokens shape
-    source_shape: tuple[int, ...]    # per-sample source_tokens shape
-    target_shape: tuple[int, ...]    # per-sample target_tokens shape
-    feature_shape: tuple[int, ...]   # per-sample mask_features shape
-    n_cells: int                     # cells per grid
-    cell_labels: torch.Tensor        # (n_cells, 2) being (t_start, t_end)
-    default_cell: int                # shared default-cell index; raises if not unique
+    y: torch.Tensor                  # (n_cells, C) TRAINING_* targets
+    y_raw: torch.Tensor              # (n_cells, C) raw CLIP/PSNR
 
 
 @dataclass(frozen=True)
@@ -82,10 +95,13 @@ class DatasetSplit:
     split_name: str                  # "train" / "val" / "test"
     sample_ids: tuple[str, ...]      # (N,) one sample_id per grid
     x: EmbeddingsTable               # shared across splits; index via sample_ids
-    y: torch.Tensor                  # (N, n_cells, C) PREDICTION_SPACE targets
-    y_raw: torch.Tensor              # (N, n_cells, C) "raw" targets
-    default_cell: int                # position of the default cell within each grid
-    mean_surface: torch.Tensor       # (n_cells, 2); unused unless PREDICTION_SPACE is "residuals"
+    y: torch.Tensor                  # (N, n_cells, C) TRAINING_* targets
+    y_raw: torch.Tensor              # (N, n_cells, C) raw CLIP/PSNR
+    image_shape: tuple[int, ...]     # per-sample image_tokens shape
+    source_shape: tuple[int, ...]    # per-sample source_tokens shape
+    target_shape: tuple[int, ...]    # per-sample target_tokens shape
+    feature_shape: tuple[int, ...]   # per-sample mask_features shape
+    metadata: DatasetMetadata        # train-global grid + invert stats
 
     def __post_init__(self):
         # Translate sample ids to table rows once, so gather is pure tensor
@@ -98,12 +114,24 @@ class DatasetSplit:
         """Number of samples in the split."""
         return len(self.sample_ids)
 
+    @property
+    def n_cells(self) -> int:
+        return self.metadata.n_cells
+
+    @property
+    def default_cell(self) -> int:
+        return self.metadata.default_cell
+
+    @property
+    def cell_labels(self) -> torch.Tensor:
+        return self.metadata.cell_labels
+
     def __getitem__(self, sample_id: str) -> SampleData:
         """Get SampleData by sample_id."""
         i = self._sid_to_i[sample_id]
         return SampleData(
             sample_id=sample_id,
-            x=self.x.get_sample_embeddings(sample_id),
+            x=self.x[sample_id],
             y=self.y[i],
             y_raw=self.y_raw[i],
         )
@@ -129,7 +157,6 @@ class DatasetSplitBundle:
     """Separate splits of the dataset, train/val/test."""
 
     splits: dict[str, DatasetSplit]
-    metadata: SampleMetadata
 
     @property
     def train(self) -> DatasetSplit:
@@ -219,18 +246,14 @@ def get_df() -> pd.DataFrame:
 
 
 def get_splits_df(splits_df_path: Path) -> dict[str, tuple[pd.DataFrame, pd.DataFrame]]:
-    """Create train/val/test frames keyed by split name in PREDICTION_SPACE."""
+    """Create train/val/test frames keyed by split name. y is raw CLIP/PSNR."""
     
     def _prepare_df(data_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Split the loaded table into features X and targets y in PREDICTION_SPACE."""
-        from scores import compute_delta_df
+        """Split the loaded table into features X and raw metric targets y."""
         X_df = data_df.drop(columns=list(TARGET_COLS)).copy()
         for col in TARGET_COLS:
             X_df[f"{col}__raw"] = data_df[col].to_numpy()
-        if PREDICTION_SPACE == "raws":
-            y_df = data_df.loc[:, list(TARGET_COLS)].copy()
-        else:
-            y_df = compute_delta_df(data_df, *TARGET_COLS)
+        y_df = data_df.loc[:, list(TARGET_COLS)].copy()
         return X_df, y_df
 
     def _split_df(X_df: pd.DataFrame, y_df: pd.DataFrame) -> tuple[pd.DataFrame, ...]:
@@ -306,10 +329,10 @@ def get_dataset(
         samples = pd.concat([X for X, _ in splits.values()], ignore_index=True)
         return get_embeddings(samples, device)
 
-    def _grid_arrange(X_df: pd.DataFrame, y_df: pd.DataFrame) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor]:
-        """One split's cells as grids: (sample_ids, t (n_cells, 2), y, y_raw)."""
+    def _grid_arrange(X_df: pd.DataFrame, y_df: pd.DataFrame) -> tuple[list[str], torch.Tensor, torch.Tensor]:
+        """One split's cells as grids: (sample_ids, t (n_cells, 2), y_raw)."""
+        del y_df  # raw metrics live on X_df as *__raw columns
         Xs = X_df.sort_values([SAMPLE_ID_COL, T_START_COL, T_END_COL], kind="stable")
-        order = Xs.index.to_numpy()
         sample_ids = Xs[SAMPLE_ID_COL].to_numpy()
         unique_ids, counts = np.unique(sample_ids, return_counts=True)
         if len(set(counts)) != 1:
@@ -324,52 +347,75 @@ def get_dataset(
             print(f"Dropped {int((~keep).sum())} sample(s) whose grid does not match the split's canonical cells.")
 
         raw_cols = [f"{c}__raw" for c in TARGET_COLS]
-        y = torch.tensor(y_df.loc[order, list(TARGET_COLS)].to_numpy(), dtype=torch.float).reshape(n, n_cells, -1)
         y_raw = torch.tensor(Xs[raw_cols].to_numpy(), dtype=torch.float).reshape(n, n_cells, -1)
         t_pairs = torch.tensor(t[keep][0], dtype=torch.float64)
-        return list(unique_ids[keep]), t_pairs, y[torch.as_tensor(keep)], y_raw[torch.as_tensor(keep)]
+        return list(unique_ids[keep]), t_pairs, y_raw[torch.as_tensor(keep)]
 
-    def _get_metadata(t_pairs: torch.Tensor) -> SampleMetadata:
-        """Get the metadata from the train split."""
-        return SampleMetadata(
-            image_shape=table.image_shape,
-            source_shape=table.source_shape,
-            target_shape=table.target_shape,
-            n_cells=int(t_pairs.shape[0]),
-            cell_labels=t_pairs,
-            default_cell=get_default_cell(t_pairs),
-            feature_shape=table.feature_shape,
+    def _metadata_to_device(meta: DatasetMetadata) -> DatasetMetadata:
+        """Copy train metadata tensors onto the dataset device."""
+        def col(x: torch.Tensor) -> torch.Tensor:
+            return x.to(device=device, dtype=torch.float)
+        return DatasetMetadata(
+            n_cells=int(meta.n_cells),
+            cell_labels=meta.cell_labels.to(device=device),
+            default_cell=int(meta.default_cell),
+            mean_surface=col(meta.mean_surface),
+            minmax_max=col(meta.minmax_max),
+            minmax_min=col(meta.minmax_min),
+            zscore_mean=col(meta.zscore_mean),
+            zscore_std=col(meta.zscore_std),
         )
 
-    def _get_splits() -> dict[str, DatasetSplit]:
-        """Get the splits from the splits_df."""
+    def _get_metadata() -> DatasetMetadata:
+        """Train-split grid and CLIP/PSNR stats, shared by every split and the model."""
+        if (Path(run_dir) / TRAIN_METADATA_NAME).exists():
+            return _metadata_to_device(get_train_metadata(run_dir))
+        train_pairs, train_raw = arranged["train"][1], arranged["train"][2]
+        flat = train_raw.reshape(-1, train_raw.shape[-1])
+        zflat = flat.double()
+        built = DatasetMetadata(
+            n_cells=int(train_pairs.shape[0]),
+            cell_labels=train_pairs,
+            default_cell=get_default_cell(train_pairs),
+            mean_surface=train_raw.double().mean(dim=0).to(dtype=train_raw.dtype),
+            minmax_max=flat.nan_to_num(nan=float("-inf")).amax(dim=0),
+            minmax_min=flat.nan_to_num(nan=float("inf")).amin(dim=0),
+            zscore_mean=zflat.mean(dim=0).to(dtype=train_raw.dtype),
+            zscore_std=zflat.std(dim=0).clamp(min=1e-8).to(dtype=train_raw.dtype),
+        )
+        return _metadata_to_device(get_train_metadata(run_dir, built))
+
+    def _get_splits(metadata: DatasetMetadata) -> dict[str, DatasetSplit]:
+        """Get the splits from the packed grids, transformed with train metadata."""
         out: dict[str, DatasetSplit] = {}
-        for name, (sample_ids, t_pairs, y, y_raw) in arranged.items():
-            surface = mean_surface.to(dtype=torch.float)
-            if PREDICTION_SPACE == "residuals":
-                # Anchor each cell on the train split's mean, so the heads only
-                # have to predict how a sample deviates from the population
-                y = y - surface.to(y)
+        for name, (sample_ids, t_pairs, y_raw) in arranged.items():
+            if int(t_pairs.shape[0]) != metadata.n_cells:
+                raise ValueError(f"{name} grid has {t_pairs.shape[0]} cells, train has {metadata.n_cells}")
+            y = apply_pipeline(
+                y_raw,
+                pred_space=TRAINING_PRED_SPACE,
+                use_minmax_norm=TRAINING_USE_MINMAX_NORM,
+                use_persample_norm=TRAINING_USE_PERSAMPLE_NORM,
+                use_zscore_stand=TRAINING_USE_ZSCORE_STAND,
+                **metadata.pipeline_stats(),
+            )
+            if PIN_DEFAULT_CELL:
+                y = pin_default(y, metadata.default_cell)
             out[name] = DatasetSplit(
                 split_name=name,
                 sample_ids=tuple(sample_ids),
                 x=table,
                 y=y.to(device),
                 y_raw=y_raw.to(device),
-                default_cell=get_default_cell(t_pairs),
-                mean_surface=surface.to(device=device),
+                image_shape=table.image_shape,
+                source_shape=table.source_shape,
+                target_shape=table.target_shape,
+                feature_shape=table.feature_shape,
+                metadata=metadata,
             )
         return out
-
-    def _get_bundle() -> DatasetSplitBundle:
-        """Get the bundle from the splits, metadata, and mean surface."""
-        return DatasetSplitBundle(splits=split_datasets, metadata=meta)
 
     splits = _get_splits_df()
     table = _get_embeddings()
     arranged = {name: _grid_arrange(X, y) for name, (X, y) in splits.items()}
-    _, train_t, train_y, _ = arranged["train"]
-    mean_surface = get_mean_surface(run_dir, train_y)
-    meta = _get_metadata(train_t)
-    split_datasets = _get_splits()
-    return _get_bundle()
+    return DatasetSplitBundle(splits=_get_splits(_get_metadata()))

@@ -112,7 +112,7 @@ class EmbeddingsTable:
         idx = [self._sid_to_idx[sid] for sid in sample_ids]
         return torch.tensor(idx, dtype=torch.long, device=self.image_tokens.device)
 
-    def get_sample_embeddings(self, sample_id: str) -> SampleEmbeddings:
+    def __getitem__(self, sample_id: str) -> SampleEmbeddings:
         """Get one sample's embeddings by sample_id."""
         i = self._sid_to_idx[sample_id]
         return SampleEmbeddings(
@@ -338,11 +338,10 @@ def get_packed_embeddings(
         tmp.replace(path)
         print(f"Saved packed embeddings: {path}")
 
-    use_tokens = TEXT_EMB_TYPE == "tokens"
     main_keys = ("img", "src", "tar") + (tuple(_MASK_FILES) if USE_IMG_MASK else ())
     main_meta |= {"masked": bool(USE_IMG_MASK)}
     main = _load_packed_cache(main_path, main_meta, main_keys)
-    token = _load_packed_cache(token_path, token_meta, ("src_tokens", "tar_tokens", "src_mask", "tar_mask")) if use_tokens else {}
+    token = _load_packed_cache(token_path, token_meta, ("src_tokens", "tar_tokens", "src_mask", "tar_mask")) if not TEXT_EMB_POOL else {}
     if main is None or token is None:
         scattered = get_scattered_embeddings(samples, scattered_dir=scattered_dir)
         main = {k: scattered[k] for k in main_keys}
@@ -351,7 +350,7 @@ def get_packed_embeddings(
             "img_shape": tuple(main["img"].shape[1:]),
             "text_shape": tuple(main["src"].shape[1:]),
         }, main)
-        if use_tokens:
+        if not TEXT_EMB_POOL:
             token = {k: scattered[k] for k in ("src_tokens", "tar_tokens", "src_mask", "tar_mask")}
             _save_packed_cache(token_path, token_meta | {"text_shape": tuple(token["src_tokens"].shape[1:])}, token)
     else:
@@ -371,8 +370,8 @@ def get_embeddings(
         raise ValueError("Expected samples with embeddings")
 
     if PIE_BENCH:
-        if TEXT_EMB_TYPE == "tokens":
-            raise NotImplementedError("TEXT_EMB_TYPE='tokens' has no PIE-Bench path yet")
+        if not TEXT_EMB_POOL:
+            raise NotImplementedError("TEXT_EMB_POOL=false has no PIE-Bench path yet")
         sids = samples[SAMPLE_ID_COL].astype(str)
         is_pie = sids.str.startswith(PIE_SAMPLE_ID_PREFIX)
         parts, sample_ids = [], []
@@ -393,9 +392,8 @@ def get_embeddings(
         tables = get_packed_embeddings(samples)
         sample_ids = samples[SAMPLE_ID_COL].tolist()
 
-    use_tokens = TEXT_EMB_TYPE == "tokens"
-    source_tokens = tables["src_tokens"].float() if use_tokens else tables["src"]
-    target_tokens = tables["tar_tokens"].float() if use_tokens else tables["tar"]
+    source_tokens = tables["src_tokens"].float() if not TEXT_EMB_POOL else tables["src"]
+    target_tokens = tables["tar_tokens"].float() if not TEXT_EMB_POOL else tables["tar"]
 
     # Get the image tokens.
     if IMG_EMB_TYPE == "vae":
@@ -406,7 +404,7 @@ def get_embeddings(
         clip = get_clip_tokens(samples)
         image_tokens = _concat_vae_clip_tokens(tables["img"], clip)
 
-    if use_tokens:
+    if not TEXT_EMB_POOL:
         source_mask = tables["src_mask"].to(device)
         target_mask = tables["tar_mask"].to(device)
     else:
