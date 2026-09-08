@@ -140,25 +140,38 @@ LAYERSCALE_INIT = float(CONFIG["LAYERSCALE_INIT"]) if CONFIG["LAYERSCALE_INIT"] 
 Data pipeline settings.
 """
 
-# Choose PRED_SPACE from "deltas", "phis", or "norms".
+# Choose PRED_SPACE from "raws", "deltas", or "residuals".
+PRED_SPACES = ("raws", "deltas", "residuals")
 PRED_SPACE = str(CONFIG["PRED_SPACE"])
+if PRED_SPACE not in PRED_SPACES:
+    raise ValueError(f"Expected PRED_SPACE in {PRED_SPACES}, got {PRED_SPACE!r}")
 USE_MINMAX_NORM = bool(CONFIG["USE_MINMAX_NORM"])
 USE_PERSAMPLE_NORM = bool(CONFIG["USE_PERSAMPLE_NORM"])
 USE_ZSCORE_STAND = bool(CONFIG["USE_ZSCORE_STAND"])
 
-# These levers reweight, floor, and gate ranking at selection time.
-DELTA_WEIGHTS = tuple(float(w) for w in list(CONFIG["DELTA_WEIGHTS"])) if CONFIG["DELTA_WEIGHTS"] is not None else None
-DELTA_FLOORS = tuple(float(v) if v is not None else None for v in list(CONFIG["DELTA_FLOORS"])) if CONFIG["DELTA_FLOORS"] is not None else None
+# Bound the selector-space deltas to (-DELTA_SQUASH, DELTA_SQUASH) with a tanh
+# before phi, so unbounded (z-scored) deltas cannot blow up the exponential
+# tail of the score and the loss. Null leaves the deltas as they are.
+DELTA_SQUASH = float(CONFIG["DELTA_SQUASH"]) if CONFIG["DELTA_SQUASH"] is not None else None
+if DELTA_SQUASH is not None and DELTA_SQUASH <= 0:
+    raise ValueError(f"Expected DELTA_SQUASH > 0, got {DELTA_SQUASH}")
+
+# These levers reweight, floor, and gate ranking at selection time. Lists are
+# empty or null for "unused".
+DELTA_WEIGHTS = tuple(float(w) for w in list(CONFIG["DELTA_WEIGHTS"] or [])) or None
+DELTA_FLOORS = tuple(float(v) if v is not None else None for v in list(CONFIG["DELTA_FLOORS"] or [])) or None
 PHI_FLOOR = float(CONFIG["PHI_FLOOR"]) if CONFIG["PHI_FLOOR"] is not None else None
 TEMPERATURE = float(CONFIG["TEMPERATURE"]) if CONFIG["TEMPERATURE"] is not None else None
 
-# TRAINING_* null falls back to the selection setting of the same name.
+# TRAINING_* null (scalars) or [] (lists) falls back to the selection setting of the same name.
 TRAINING_PRED_SPACE = str(CONFIG["TRAINING_PRED_SPACE"]) if CONFIG["TRAINING_PRED_SPACE"] is not None else PRED_SPACE
+if TRAINING_PRED_SPACE not in PRED_SPACES:
+    raise ValueError(f"Expected TRAINING_PRED_SPACE in {PRED_SPACES}, got {TRAINING_PRED_SPACE!r}")
 TRAINING_USE_MINMAX_NORM = bool(CONFIG["TRAINING_USE_MINMAX_NORM"]) if CONFIG["TRAINING_USE_MINMAX_NORM"] is not None else USE_MINMAX_NORM
 TRAINING_USE_PERSAMPLE_NORM = bool(CONFIG["TRAINING_USE_PERSAMPLE_NORM"]) if CONFIG["TRAINING_USE_PERSAMPLE_NORM"] is not None else USE_PERSAMPLE_NORM
 TRAINING_USE_ZSCORE_STAND = bool(CONFIG["TRAINING_USE_ZSCORE_STAND"]) if CONFIG["TRAINING_USE_ZSCORE_STAND"] is not None else USE_ZSCORE_STAND
-TRAINING_DELTA_WEIGHTS = tuple(float(w) for w in list(CONFIG["TRAINING_DELTA_WEIGHTS"])) if CONFIG["TRAINING_DELTA_WEIGHTS"] is not None else DELTA_WEIGHTS
-TRAINING_DELTA_FLOORS = tuple(float(v) if v is not None else None for v in list(CONFIG["TRAINING_DELTA_FLOORS"])) if CONFIG["TRAINING_DELTA_FLOORS"] is not None else DELTA_FLOORS
+TRAINING_DELTA_WEIGHTS = tuple(float(w) for w in list(CONFIG["TRAINING_DELTA_WEIGHTS"] or [])) or DELTA_WEIGHTS
+TRAINING_DELTA_FLOORS = tuple(float(v) if v is not None else None for v in list(CONFIG["TRAINING_DELTA_FLOORS"] or [])) or DELTA_FLOORS
 TRAINING_PHI_FLOOR = float(CONFIG["TRAINING_PHI_FLOOR"]) if CONFIG["TRAINING_PHI_FLOOR"] is not None else PHI_FLOOR
 TRAINING_TEMPERATURE = float(CONFIG["TRAINING_TEMPERATURE"]) if CONFIG["TRAINING_TEMPERATURE"] is not None else TEMPERATURE
 
@@ -237,7 +250,7 @@ SCORE_FN = str(CONFIG["SCORE_FN"])
 _SCORE_FN = SCORE_FNS[SCORE_FN]
 
 PHI_ALPHA = float(CONFIG["PHI_ALPHA"])
-PHI_WEIGHTS = tuple(float(w) for w in list(CONFIG["PHI_WEIGHTS"])) if CONFIG["PHI_WEIGHTS"] is not None else None
+PHI_WEIGHTS = tuple(float(w) for w in list(CONFIG["PHI_WEIGHTS"] or [])) or None
 _SCORE_KW = {"alpha": PHI_ALPHA} if "alpha" in _signature(_SCORE_FN).parameters else {}
 SCORE_PHI = partial(_SCORE_FN, **_SCORE_KW)  # Torch phi(Delta)
 

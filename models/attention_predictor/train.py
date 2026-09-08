@@ -237,9 +237,10 @@ def train(device: torch.device) -> None:
         feat_dim=train.feature_shape[-1],
     )
 
-    t_start_values = torch.as_tensor(np.sort(np.unique(metadata.cell_labels[:, 0].numpy())), dtype=torch.float64)
-    t_end_values = torch.as_tensor(np.sort(np.unique(metadata.cell_labels[:, 1].numpy())), dtype=torch.float64)
-    selector = SelectorModel(model, metadata.cell_labels.numpy())
+    cell_labels = metadata.cell_labels.detach().cpu().numpy()
+    t_start_values = torch.as_tensor(np.sort(np.unique(cell_labels[:, 0])), dtype=torch.float64)
+    t_end_values = torch.as_tensor(np.sort(np.unique(cell_labels[:, 1])), dtype=torch.float64)
+    selector = SelectorModel(model, cell_labels)
 
     run = init_run(run_dir, {
         "n_cells": int(train.n_cells),
@@ -250,7 +251,7 @@ def train(device: torch.device) -> None:
 
     model.regressor.set_metadata(metadata)
     print(
-        "Target columns (train):\n"
+        "Target columns (train, TRAINING_* space before z-score):\n"
         f"  {'Target':<38} {'Mean':>8} {'Std':>8}\n"
         + "\n".join(
             f"  {c:<38} "

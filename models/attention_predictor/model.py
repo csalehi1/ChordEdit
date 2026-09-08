@@ -82,6 +82,16 @@ def zscore_denorm(values: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -
     return values * std + mean
 
 
+def squash_deltas(values: torch.Tensor, bound: float) -> torch.Tensor:
+    """Bound selector-space deltas to (-bound, bound) with bound * tanh(x / bound).
+
+    Identity near zero, so ordinary cells are barely moved, but the far
+    negative tail saturates instead of feeding exp(-alpha * Delta) in phi.
+    """
+    # (N, n_cells, C), float -> (N, n_cells, C)
+    return bound * torch.tanh(values / bound)
+
+
 def apply_pipeline(
     raw: torch.Tensor,
     *,
@@ -96,9 +106,11 @@ def apply_pipeline(
     zscore_std: torch.Tensor,
     mean_surface: torch.Tensor,
 ) -> torch.Tensor:
-    """Map raw CLIP/PSNR grids (N, n_cells, C) through a TRAINING_* or selection stack."""
-    if pred_space not in PRED_SPACES:
-        raise ValueError(f"Unknown pred_space={pred_space!r}")
+    """Map raw CLIP/PSNR grids (N, n_cells, C) through a TRAINING_* or selection stack.
+
+    The z-score stats must describe the values after the earlier steps, not raw
+    CLIP/PSNR; see dataset._get_metadata.
+    """
     if raw.ndim < 2:
         raise ValueError(f"Expected {tuple(raw.shape)} == (..., n_cells, C)")
 
@@ -114,7 +126,11 @@ def apply_pipeline(
     elif pred_space == "residuals":
         surface = mean_surface.to(device=x.device, dtype=x.dtype)
         if use_minmax_norm:
-            surface = minmax_norm(surface.unsqueeze(0), minmax_min, minmax_max).squeeze(0)
+            surface = minmax_norm(surface, minmax_min, minmax_max)
+        if use_persample_norm:
+            vmin = surface.nan_to_num(nan=math.inf).amin(dim=-2, keepdim=True)
+            vmax = surface.nan_to_num(nan=-math.inf).amax(dim=-2, keepdim=True)
+            surface = persample_norm(surface, vmin, vmax)
         x = x - surface
 
     if use_zscore_stand:
@@ -137,15 +153,11 @@ def invert_pipeline(
     mean_surface: torch.Tensor,
 ) -> torch.Tensor:
     """Undo apply_pipeline with train stats. Persample is not inverted."""
-    if pred_space not in PRED_SPACES:
-        raise ValueError(f"Unknown pred_space={pred_space!r}")
-    x = values
 
+    x = values
     if use_zscore_stand:
         x = zscore_denorm(x, zscore_mean, zscore_std)
-
-    if pred_space == "deltas":
-        # Heads see a zero default, so add the train-mean default in the same prep space.
+    if pred_space in ("deltas", "residuals"):
         surface = mean_surface.to(device=x.device, dtype=x.dtype)
         if use_minmax_norm:
             surface = minmax_norm(surface, minmax_min, minmax_max)
@@ -153,11 +165,9 @@ def invert_pipeline(
             vmin = surface.nan_to_num(nan=math.inf).amin(dim=-2, keepdim=True)
             vmax = surface.nan_to_num(nan=-math.inf).amax(dim=-2, keepdim=True)
             surface = persample_norm(surface, vmin, vmax)
-        x = x + surface[..., default_cell, :].unsqueeze(-2)
-    elif pred_space == "residuals":
-        surface = mean_surface.to(device=x.device, dtype=x.dtype)
-        if use_minmax_norm:
-            surface = minmax_norm(surface.unsqueeze(0), minmax_min, minmax_max).squeeze(0)
+        if pred_space == "deltas":
+            # Heads see a zero default, so add the train-mean default in the same prep space.
+            surface = surface[..., default_cell, :].unsqueeze(-2)
         x = x + surface
 
     if use_minmax_norm:
@@ -588,8 +598,8 @@ class AttentionRegressor(nn.Module):
         )
 
     def to_selector(self, raw: torch.Tensor) -> torch.Tensor:
-        """Apply PRED_SPACE / USE_*_NORM to a raw CLIP/PSNR grid using this module's train stats."""
-        return apply_pipeline(
+        """Apply PRED_SPACE / USE_*_NORM (and DELTA_SQUASH) to a raw CLIP/PSNR grid using this module's train stats."""
+        x = apply_pipeline(
             raw,
             pred_space=PRED_SPACE,
             use_minmax_norm=USE_MINMAX_NORM,
@@ -597,6 +607,9 @@ class AttentionRegressor(nn.Module):
             use_zscore_stand=USE_ZSCORE_STAND,
             **self._pipeline_stats(),
         )
+        if DELTA_SQUASH is not None:
+            x = squash_deltas(x, DELTA_SQUASH)
+        return x
 
     def forward(
         self,

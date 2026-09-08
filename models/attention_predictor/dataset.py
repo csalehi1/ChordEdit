@@ -372,16 +372,29 @@ def get_dataset(
             return _metadata_to_device(get_train_metadata(run_dir))
         train_pairs, train_raw = arranged["train"][1], arranged["train"][2]
         flat = train_raw.reshape(-1, train_raw.shape[-1])
-        zflat = flat.double()
-        built = DatasetMetadata(
+        n_targets = int(flat.shape[-1])
+        raw_stats = DatasetMetadata(
             n_cells=int(train_pairs.shape[0]),
             cell_labels=train_pairs,
             default_cell=get_default_cell(train_pairs),
             mean_surface=train_raw.double().mean(dim=0).to(dtype=train_raw.dtype),
             minmax_max=flat.nan_to_num(nan=float("-inf")).amax(dim=0),
             minmax_min=flat.nan_to_num(nan=float("inf")).amin(dim=0),
-            zscore_mean=zflat.mean(dim=0).to(dtype=train_raw.dtype),
-            zscore_std=zflat.std(dim=0).clamp(min=1e-8).to(dtype=train_raw.dtype),
+            zscore_mean=torch.zeros(n_targets, dtype=train_raw.dtype),
+            zscore_std=torch.ones(n_targets, dtype=train_raw.dtype),
+        )
+        pre_zscore = apply_pipeline(
+            train_raw.double(),
+            pred_space=TRAINING_PRED_SPACE,
+            use_minmax_norm=TRAINING_USE_MINMAX_NORM,
+            use_persample_norm=TRAINING_USE_PERSAMPLE_NORM,
+            use_zscore_stand=False,
+            **raw_stats.pipeline_stats(),
+        ).reshape(-1, n_targets)
+        built = DatasetMetadata(
+            **{**raw_stats.__dict__,
+               "zscore_mean": pre_zscore.mean(dim=0).to(dtype=train_raw.dtype),
+               "zscore_std": pre_zscore.std(dim=0).clamp(min=1e-8).to(dtype=train_raw.dtype)},
         )
         return _metadata_to_device(get_train_metadata(run_dir, built))
 
