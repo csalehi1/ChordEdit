@@ -1,6 +1,6 @@
 {
   "CHORD_EDIT_MODEL": "sd_turbo",
-  "DIR_NAME": "UltraEdit_Region_10",
+  "DIR_NAME": "UltraEdit_Region_10000",
   "TARGET_T_DELTA": 0.0,
   "TRAIN_FRAC": 0.8,
   "VAL_FRAC": 0.1,
@@ -21,6 +21,8 @@
   "USE_MINMAX_NORM": false,
   "USE_PERSAMPLE_NORM": true,
   "USE_ZSCORE_STAND": false,
+  "MINMAX_SCALE": "global",
+  "CLAMP_DELTAS": null,
   "DELTA_SQUASH": null,
   "DELTA_WEIGHTS": [],
   "DELTA_FLOORS": [],

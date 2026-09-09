@@ -149,15 +149,16 @@ USE_MINMAX_NORM = bool(CONFIG["USE_MINMAX_NORM"])
 USE_PERSAMPLE_NORM = bool(CONFIG["USE_PERSAMPLE_NORM"])
 USE_ZSCORE_STAND = bool(CONFIG["USE_ZSCORE_STAND"])
 
-# Bound the selector-space deltas to (-DELTA_SQUASH, DELTA_SQUASH) with a tanh
-# before phi, so unbounded (z-scored) deltas cannot blow up the exponential
-# tail of the score and the loss. Null leaves the deltas as they are.
-DELTA_SQUASH = float(CONFIG["DELTA_SQUASH"]) if CONFIG["DELTA_SQUASH"] is not None else None
-if DELTA_SQUASH is not None and DELTA_SQUASH <= 0:
-    raise ValueError(f"Expected DELTA_SQUASH > 0, got {DELTA_SQUASH}")
+# Choose from "global" (per-col minmax) or "median_range" (per-col median range).
+MINMAX_SCALE = str(CONFIG["MINMAX_SCALE"])
 
-# These levers reweight, floor, and gate ranking at selection time. Lists are
-# empty or null for "unused".
+# Clamp selector-space deltas to [-CLAMP_DELTAS, CLAMP_DELTAS] before phi.
+CLAMP_DELTAS = float(CONFIG["CLAMP_DELTAS"]) if CONFIG.get("CLAMP_DELTAS") is not None else None
+
+# Bound the selector-space deltas to (-DELTA_SQUASH, DELTA_SQUASH) with a tanh
+DELTA_SQUASH = float(CONFIG["DELTA_SQUASH"]) if CONFIG["DELTA_SQUASH"] is not None else None
+
+# These levers reweight, floor, and gate ranking at selection time.
 DELTA_WEIGHTS = tuple(float(w) for w in list(CONFIG["DELTA_WEIGHTS"] or [])) or None
 DELTA_FLOORS = tuple(float(v) if v is not None else None for v in list(CONFIG["DELTA_FLOORS"] or [])) or None
 PHI_FLOOR = float(CONFIG["PHI_FLOOR"]) if CONFIG["PHI_FLOOR"] is not None else None

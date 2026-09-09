@@ -21,6 +21,8 @@
   "USE_MINMAX_NORM": true,
   "USE_PERSAMPLE_NORM": false,
   "USE_ZSCORE_STAND": true,
+  "MINMAX_SCALE": "global",
+  "CLAMP_DELTAS": null,
   "DELTA_SQUASH": 1.5,
   "DELTA_WEIGHTS": [],
   "DELTA_FLOORS": [],

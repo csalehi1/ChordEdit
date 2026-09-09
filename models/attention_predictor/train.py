@@ -29,7 +29,8 @@ from _wandb import finish_run, init_run, log_epoch, log_summary
 from dataloader import SplitDatasetLoader, get_dataloader
 from dataset import ID_TO_SPLIT_NAME, TRAIN_METADATA_NAME, get_dataset
 from metrics import *
-from model import AttentionModel
+from model import AttentionModel, apply_pipeline
+from scores import linex_score
 from selector import SelectorModel
 from settings import *
 
@@ -176,7 +177,14 @@ def eval(
         temperature=TRAINING_TEMPERATURE,
     )
 
+    # The paper's scoreboard, fixed regardless of the run's own selection stack.
+    canon_pipeline_stats = regressor._pipeline_stats()
+    canon_pipeline = apply_pipeline(y_raw.double(), pred_space="deltas", use_minmax_norm=False, use_persample_norm=True, use_zscore_stand=False, **canon_pipeline_stats)
+    canon_phi = linex_score(canon_pipeline, alpha=2.0)
+
     return {
+        # The same selections on the canonical scoreboard.
+        **{f"canon_{k}": v for k, v in selection_metrics(canon_phi, selected, default_cell).items()},
         # How well the predicted phi surface matches the true one.
         **training_metrics(
             true_phi, pred_phi,
@@ -408,6 +416,15 @@ def train(device: torch.device) -> None:
             history[best_epoch - 1]["val"] if history else {},
             best_epoch, len(history),
         )
+        # Offline wandb keeps the summary in its binary log only, so the run dir
+        # carries a plain JSON copy for the sweep and report tooling.
+        (run_dir / "regression_metrics.json").write_text(json.dumps({
+            "best_epoch": best_epoch,
+            "epochs_ran": len(history),
+            "test": test_metrics,
+            "val_best": history[best_epoch - 1]["val"] if history else {},
+            "history": history,
+        }, indent=2) + "\n")
 
         print(f"\nSaved to {run_dir.resolve()}")
 

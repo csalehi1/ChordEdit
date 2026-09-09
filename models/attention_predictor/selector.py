@@ -123,14 +123,11 @@ class SelectorModel:
         print("Loaded model.")
         return cls(cls._build(ckpt, device), t_pairs)
 
-    def calc_phi(
-        self,
-        deltas: torch.Tensor,
-        weights: torch.Tensor | None = None,
-        phi_func=None,
-    ) -> torch.Tensor:
+    def calc_phi(self, deltas: torch.Tensor, weights: torch.Tensor | None = None, phi_func=None,) -> torch.Tensor:
         """Score phi on normalized deltas. Defaults to SCORE_PHI."""
         phi = SCORE_PHI if phi_func is None else phi_func
+        if CLAMP_DELTAS is not None:
+            deltas = deltas.clamp(-CLAMP_DELTAS, CLAMP_DELTAS)
         if weights is None:
             return phi(deltas)
         return phi(deltas, weights=weights)

@@ -373,13 +373,20 @@ def get_dataset(
         train_pairs, train_raw = arranged["train"][1], arranged["train"][2]
         flat = train_raw.reshape(-1, train_raw.shape[-1])
         n_targets = int(flat.shape[-1])
+        if MINMAX_SCALE == "median_range":
+            ranges = train_raw.nan_to_num(nan=float("-inf")).amax(dim=1) - train_raw.nan_to_num(nan=float("inf")).amin(dim=1)
+            minmax_min = torch.zeros(n_targets, dtype=train_raw.dtype)
+            minmax_max = ranges.double().median(dim=0).values.to(dtype=train_raw.dtype)
+        else:
+            minmax_max = flat.nan_to_num(nan=float("-inf")).amax(dim=0)
+            minmax_min = flat.nan_to_num(nan=float("inf")).amin(dim=0)
         raw_stats = DatasetMetadata(
             n_cells=int(train_pairs.shape[0]),
             cell_labels=train_pairs,
             default_cell=get_default_cell(train_pairs),
             mean_surface=train_raw.double().mean(dim=0).to(dtype=train_raw.dtype),
-            minmax_max=flat.nan_to_num(nan=float("-inf")).amax(dim=0),
-            minmax_min=flat.nan_to_num(nan=float("inf")).amin(dim=0),
+            minmax_max=minmax_max,
+            minmax_min=minmax_min,
             zscore_mean=torch.zeros(n_targets, dtype=train_raw.dtype),
             zscore_std=torch.ones(n_targets, dtype=train_raw.dtype),
         )
@@ -389,7 +396,12 @@ def get_dataset(
             use_minmax_norm=TRAINING_USE_MINMAX_NORM,
             use_persample_norm=TRAINING_USE_PERSAMPLE_NORM,
             use_zscore_stand=False,
-            **raw_stats.pipeline_stats(),
+            default_cell=raw_stats.default_cell,
+            minmax_min=raw_stats.minmax_min,
+            minmax_max=raw_stats.minmax_max,
+            zscore_mean=raw_stats.zscore_mean,
+            zscore_std=raw_stats.zscore_std,
+            mean_surface=raw_stats.mean_surface,
         ).reshape(-1, n_targets)
         built = DatasetMetadata(
             **{**raw_stats.__dict__,
@@ -410,7 +422,12 @@ def get_dataset(
                 use_minmax_norm=TRAINING_USE_MINMAX_NORM,
                 use_persample_norm=TRAINING_USE_PERSAMPLE_NORM,
                 use_zscore_stand=TRAINING_USE_ZSCORE_STAND,
-                **metadata.pipeline_stats(),
+                default_cell=metadata.default_cell,
+                minmax_min=metadata.minmax_min,
+                minmax_max=metadata.minmax_max,
+                zscore_mean=metadata.zscore_mean,
+                zscore_std=metadata.zscore_std,
+                mean_surface=metadata.mean_surface,
             )
             if PIN_DEFAULT_CELL:
                 y = pin_default(y, metadata.default_cell)
