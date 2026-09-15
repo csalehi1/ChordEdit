@@ -82,9 +82,10 @@ class SelectorModel:
         self.models = list(model) if isinstance(model, (list, tuple)) else [model]
         self.model = self.models[0]
         self.t_pairs = np.asarray(t_pairs, dtype=np.float64)
+        self.cell_mask = torch.as_tensor(self.t_pairs[:, 0] > self.t_pairs[:, 1], dtype=torch.bool) if USE_DIAGONAL_MASK else None
 
         # Calculate the neighbor map here and reuse it for every batch, if requested.
-        if TEMPERATURE is not None or TRAINING_TEMPERATURE is not None:
+        if TEMPERATURE is not None:
             self.neighbor_map = get_neighbor_map(self.t_pairs)
 
     @staticmethod
@@ -123,60 +124,65 @@ class SelectorModel:
         print("Loaded model.")
         return cls(cls._build(ckpt, device), t_pairs)
 
-    def calc_phi(self, deltas: torch.Tensor, weights: torch.Tensor | None = None, phi_func=None,) -> torch.Tensor:
-        """Score phi on normalized deltas. Defaults to SCORE_PHI."""
-        phi = SCORE_PHI if phi_func is None else phi_func
+    def calc_phi(self, deltas: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
+        """Score phi on normalized deltas with SCORE_PHI."""
         if CLAMP_DELTAS is not None:
             deltas = deltas.clamp(-CLAMP_DELTAS, CLAMP_DELTAS)
         if weights is None:
-            return phi(deltas)
-        return phi(deltas, weights=weights)
+            return SCORE_PHI(deltas)
+        return SCORE_PHI(deltas, weights=weights)
 
     @torch.no_grad()
-    def select_deltas(
-        self,
-        deltas: torch.Tensor,
-        delta_weights=DELTA_WEIGHTS,
-        delta_floors=DELTA_FLOORS,
-        phi_floor=PHI_FLOOR,
-        temperature=TEMPERATURE,
-    ) -> torch.Tensor:
+    def select_deltas(self, deltas: torch.Tensor) -> torch.Tensor:
         """Return selected cell indices of shape (N,) from a delta surface."""
         default_cell = self.model.regressor.default_cell
 
         # Calculate phi.
-        phi = self.calc_phi(deltas)
+        weights = None if PHI_WEIGHTS is None else deltas.new_tensor(PHI_WEIGHTS)
+        phi = self.calc_phi(deltas, weights=weights)
 
         # Rank on a per-column reweighted phi, if requested.
-        if delta_weights is not None:
-            rank = self.calc_phi(deltas, weights=deltas.new_tensor(delta_weights))
+        if DELTA_WEIGHTS is not None:
+            rank = self.calc_phi(deltas, weights=deltas.new_tensor(DELTA_WEIGHTS))
         else:
             rank = phi
 
         # Restrict the argmax to cells clearing per-column floors, if requested.
-        keep = None
-        if delta_floors is not None:
-            floors = deltas.new_tensor([float("-inf") if f is None else f for f in delta_floors])
+        cell_mask = None
+        if DELTA_FLOORS is not None:
+            floors = deltas.new_tensor([float("-inf") if f is None else f for f in DELTA_FLOORS])
             eligible = (deltas >= floors).all(dim=-1)
-            keep = eligible | ~eligible.any(dim=-1, keepdim=True)
-            rank = rank.masked_fill(~keep, -float("inf"))
+            cell_mask = eligible | ~eligible.any(dim=-1, keepdim=True)
+
+        # Restrict the argmax to cells with t_start > t_end, if requested.
+        if self.cell_mask is not None:
+            diag = self.cell_mask.to(device=rank.device)
+            cell_mask = diag if cell_mask is None else cell_mask & diag
+            if cell_mask.ndim == 2:
+                none = ~cell_mask.any(dim=-1)
+                if none.any():
+                    cell_mask = cell_mask.clone()
+                    cell_mask[none, default_cell] = True
+
+        if cell_mask is not None:
+            rank = rank.masked_fill(~cell_mask, -float("inf"))
 
         # Sort each cell by the phi mass over its neighborhood, if requested.
-        if temperature is not None:
-            probs = torch.softmax(rank / temperature, dim=-1)
+        if TEMPERATURE is not None:
+            probs = torch.softmax(rank / TEMPERATURE, dim=-1)
             rank = probs[..., self.neighbor_map.to(probs.device)].sum(dim=-1)
-            if keep is not None:
-                rank = rank.masked_fill(~keep, -float("inf"))
+            if cell_mask is not None:
+                rank = rank.masked_fill(~cell_mask, -float("inf"))
 
         # Select the best cell for each sample.
         selected = rank.argmax(dim=-1)
 
         # Stay on the default cell unless the selected cell clears a phi floor, if requested.
-        if phi_floor is not None:
+        if PHI_FLOOR is not None:
             n = selected.shape[0]
             rows = torch.arange(n, device=selected.device)
             gain = phi[rows, selected] - phi[:, default_cell]
-            selected = torch.where(gain > phi_floor, selected, selected.new_full((n,), default_cell))
+            selected = torch.where(gain > PHI_FLOOR, selected, selected.new_full((n,), default_cell))
 
         return selected
 

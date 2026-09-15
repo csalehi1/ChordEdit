@@ -9,11 +9,11 @@
   "MAX_SAMPLES": null,
   "PIE_BENCH": false,
 
-  "IMG_EMB_TYPE": "clip",
-  "IMG_EMB_POOL": true,
-  "USE_IMG_MASK": true,
-  "USE_ZEDIT_MASK": true,
-  "TEXT_EMB_POOL": true,
+  "IMG_EMB_TYPE": "vae",
+  "IMG_EMB_POOL": false,
+  "USE_IMG_MASK": false,
+  "USE_ZEDIT_MASK": false,
+  "TEXT_EMB_POOL": false,
   "USE_DIFF_SALIENCY": false,
   "LAYERSCALE_INIT": null,
 
@@ -33,10 +33,6 @@
   "TRAINING_USE_MINMAX_NORM": null,
   "TRAINING_USE_PERSAMPLE_NORM": null,
   "TRAINING_USE_ZSCORE_STAND": null,
-  "TRAINING_DELTA_WEIGHTS": [],
-  "TRAINING_DELTA_FLOORS": [],
-  "TRAINING_PHI_FLOOR": null,
-  "TRAINING_TEMPERATURE": null,
 
   "PIN_DEFAULT_CELL": true,
   "ATTN_DIM": 512,
@@ -56,7 +52,7 @@
   "LR_SCHEDULER": "cosine",
   "EARLY_STOP_PATIENCE": 0,
   "EMA_DECAY": 0.0,
-  "CKPT_METRIC": "val_phi_spearman",
+  "CKPT_METRIC": "val_regret",
   "SAMPLES_PER_BATCH": 32,
 
   "MSE_LOSS_WEIGHT": 3.0,
@@ -71,6 +67,7 @@
   "PHI_WEIGHTS": [],
   "DEFAULT_T_START": 0.8,
   "DEFAULT_T_END": 0.3,
+  "USE_DIAGONAL_MASK": true,
 
   "RUN_NAME": "",
   "RUN_TAGS": []

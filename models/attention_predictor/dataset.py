@@ -175,6 +175,7 @@ class DatasetSplitBundle:
 Dataframes and splits.
 """
 
+
 def get_df() -> pd.DataFrame:
     """Load the metrics, attach source-image paths and prompts, one row per cell."""
 
@@ -187,10 +188,32 @@ def get_df() -> pd.DataFrame:
             pie_df[SAMPLE_ID_COL] = PIE_SAMPLE_ID_PREFIX + pie_df[SAMPLE_ID_COL]
             return pie_df
 
+        def _average_label_cells(metrics_df: pd.DataFrame) -> pd.DataFrame:
+            """Average list cells ('[a, b]') to one value; a NaN in the list makes the cell NaN."""
+
+            def _parse_list_cell(value) -> np.ndarray:
+                if isinstance(value, str) and value.strip().startswith("["):
+                    parts = [p.strip() for p in value.strip()[1:-1].split(",")]
+                    return np.array([float(p) if p else np.nan for p in parts], dtype=np.float64)
+                if pd.isna(value):
+                    return np.array([], dtype=np.float64)
+                return np.array([float(value)], dtype=np.float64)
+
+            for col in TARGET_COLS:
+                values = [_parse_list_cell(v) for v in metrics_df[col]]
+                out = np.full(len(values), np.nan, dtype=np.float64)
+                for i, vals in enumerate(values):
+                    if vals.size == 0 or np.isnan(vals).any():
+                        continue
+                    out[i] = float(vals.mean())
+                metrics_df[col] = out
+            return metrics_df
+
         is_primary = metrics_csv == METRICS_CSV
 
         # Clean metrics CSV: drop rows that do not have target metrics or t_delta.
         metrics_df = pd.read_csv(metrics_csv)
+        metrics_df = _average_label_cells(metrics_df)
         n_before = len(metrics_df)
         metrics_df = metrics_df.dropna(subset=list(TARGET_COLS)).reset_index(drop=True)
         if len(metrics_df) < n_before:

@@ -29,8 +29,7 @@ from _wandb import finish_run, init_run, log_epoch, log_summary
 from dataloader import SplitDatasetLoader, get_dataloader
 from dataset import ID_TO_SPLIT_NAME, TRAIN_METADATA_NAME, get_dataset
 from metrics import *
-from model import AttentionModel, apply_pipeline
-from scores import linex_score
+from model import AttentionModel
 from selector import SelectorModel
 from settings import *
 
@@ -110,6 +109,7 @@ def calc_loss(
     pred: torch.Tensor,                        # (G, n_cells, 2) TRAINING_* units
     y_raw: torch.Tensor,                       # (G, n_cells, 2) raw CLIP/PSNR
     selector: SelectorModel,
+    cell_mask: torch.Tensor | None = None,     # (n_cells,) bool, or None for all
 ) -> torch.Tensor:
     """Weighted phi MSE, pairwise ranking, and per-column MSE on selection surfaces."""
 
@@ -119,7 +119,9 @@ def calc_loss(
     weights = None if PHI_WEIGHTS is None else pred_sel.new_tensor(PHI_WEIGHTS)
     pred_phi = selector.calc_phi(pred_sel, weights=weights)
     true_phi = selector.calc_phi(true_sel, weights=weights)
-    
+    if cell_mask is not None:
+        pred_sel, true_sel, pred_phi, true_phi = pred_sel[:, cell_mask], true_sel[:, cell_mask], pred_phi[:, cell_mask], true_phi[:, cell_mask]
+
     loss = pred_phi.new_zeros(())
     if MSE_LOSS_WEIGHT > 0:
         loss = loss + MSE_LOSS_WEIGHT * mse_loss(pred_phi, true_phi, top_k=MSE_LOSS_TOP_K)
@@ -167,28 +169,31 @@ def eval(
     regressor = model.regressor
     pred_sel = regressor.to_selector(regressor.to_raw(pred.double()))
     true_sel = regressor.to_selector(y_raw.double())
-    true_phi = selector.calc_phi(true_sel)
-    pred_phi = selector.calc_phi(pred_sel)
-    selected = selector.select_deltas(
-        pred_sel,
-        delta_weights=TRAINING_DELTA_WEIGHTS,
-        delta_floors=TRAINING_DELTA_FLOORS,
-        phi_floor=TRAINING_PHI_FLOOR,
-        temperature=TRAINING_TEMPERATURE,
-    )
+    weights = None if PHI_WEIGHTS is None else pred_sel.new_tensor(PHI_WEIGHTS)
+    true_phi = selector.calc_phi(true_sel, weights=weights)
+    pred_phi = selector.calc_phi(pred_sel, weights=weights)
+    selected = selector.select_deltas(pred_sel)
 
-    # The paper's scoreboard, fixed regardless of the run's own selection stack.
-    canon_pipeline_stats = regressor._pipeline_stats()
-    canon_pipeline = apply_pipeline(y_raw.double(), pred_space="deltas", use_minmax_norm=False, use_persample_norm=True, use_zscore_stand=False, **canon_pipeline_stats)
-    canon_phi = linex_score(canon_pipeline, alpha=2.0)
+    # Restrict selector-facing stats to t_start > t_end cells, if requested.
+    cell_mask = None if selector.cell_mask is None else selector.cell_mask.to(device=pred.device)
+    y_raw_eval = y_raw.double()
+    if cell_mask is not None:
+        n_cells = true_phi.shape[-1]
+        inv = selected.new_full((n_cells,), -1)
+        inv[cell_mask] = torch.arange(int(cell_mask.sum()), device=selected.device, dtype=selected.dtype)
+        selected = inv[selected]
+        default_cell = int(inv[default_cell].item())
+        true_phi = true_phi[:, cell_mask]
+        pred_phi = pred_phi[:, cell_mask]
+        pred_sel = pred_sel[:, cell_mask]
+        true_sel = true_sel[:, cell_mask]
+        y_raw_eval = y_raw_eval[:, cell_mask]
 
     return {
-        # The same selections on the canonical scoreboard.
-        **{f"canon_{k}": v for k, v in selection_metrics(canon_phi, selected, default_cell).items()},
         # How well the predicted phi surface matches the true one.
         **training_metrics(
             true_phi, pred_phi,
-            lambda: calc_loss(pred, y_raw, selector),
+            lambda: calc_loss(pred, y_raw, selector, cell_mask=cell_mask),
             lambda: mse_loss(pred_phi, true_phi, top_k=MSE_LOSS_TOP_K),
             lambda: ranking_loss(pred_phi, true_phi, top_k=RANKING_LOSS_TOP_K),
             lambda: col_loss(pred_sel, true_sel, top_k=COL_LOSS_TOP_K),
@@ -199,7 +204,7 @@ def eval(
         ),
         # Per-column training and selection metrics.
         **per_col_metrics(
-            true_sel, y_raw.double(), pred_sel,
+            true_sel, y_raw_eval, pred_sel,
             selected, default_cell, TARGET_COLS,
         ),
     }

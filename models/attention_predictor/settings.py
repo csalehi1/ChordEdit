@@ -140,8 +140,8 @@ LAYERSCALE_INIT = float(CONFIG["LAYERSCALE_INIT"]) if CONFIG["LAYERSCALE_INIT"] 
 Data pipeline settings.
 """
 
-# Choose PRED_SPACE from "raws", "deltas", or "residuals".
-PRED_SPACES = ("raws", "deltas", "residuals")
+# Choose PRED_SPACE from "raws", "deltas", "residuals", or "fixed".
+PRED_SPACES = ("raws", "deltas", "residuals", "fixed")
 PRED_SPACE = str(CONFIG["PRED_SPACE"])
 if PRED_SPACE not in PRED_SPACES:
     raise ValueError(f"Expected PRED_SPACE in {PRED_SPACES}, got {PRED_SPACE!r}")
@@ -164,17 +164,13 @@ DELTA_FLOORS = tuple(float(v) if v is not None else None for v in list(CONFIG["D
 PHI_FLOOR = float(CONFIG["PHI_FLOOR"]) if CONFIG["PHI_FLOOR"] is not None else None
 TEMPERATURE = float(CONFIG["TEMPERATURE"]) if CONFIG["TEMPERATURE"] is not None else None
 
-# TRAINING_* null (scalars) or [] (lists) falls back to the selection setting of the same name.
+# TRAINING_* null falls back to the selection setting of the same name.
 TRAINING_PRED_SPACE = str(CONFIG["TRAINING_PRED_SPACE"]) if CONFIG["TRAINING_PRED_SPACE"] is not None else PRED_SPACE
 if TRAINING_PRED_SPACE not in PRED_SPACES:
     raise ValueError(f"Expected TRAINING_PRED_SPACE in {PRED_SPACES}, got {TRAINING_PRED_SPACE!r}")
 TRAINING_USE_MINMAX_NORM = bool(CONFIG["TRAINING_USE_MINMAX_NORM"]) if CONFIG["TRAINING_USE_MINMAX_NORM"] is not None else USE_MINMAX_NORM
 TRAINING_USE_PERSAMPLE_NORM = bool(CONFIG["TRAINING_USE_PERSAMPLE_NORM"]) if CONFIG["TRAINING_USE_PERSAMPLE_NORM"] is not None else USE_PERSAMPLE_NORM
 TRAINING_USE_ZSCORE_STAND = bool(CONFIG["TRAINING_USE_ZSCORE_STAND"]) if CONFIG["TRAINING_USE_ZSCORE_STAND"] is not None else USE_ZSCORE_STAND
-TRAINING_DELTA_WEIGHTS = tuple(float(w) for w in list(CONFIG["TRAINING_DELTA_WEIGHTS"] or [])) or DELTA_WEIGHTS
-TRAINING_DELTA_FLOORS = tuple(float(v) if v is not None else None for v in list(CONFIG["TRAINING_DELTA_FLOORS"] or [])) or DELTA_FLOORS
-TRAINING_PHI_FLOOR = float(CONFIG["TRAINING_PHI_FLOOR"]) if CONFIG["TRAINING_PHI_FLOOR"] is not None else PHI_FLOOR
-TRAINING_TEMPERATURE = float(CONFIG["TRAINING_TEMPERATURE"]) if CONFIG["TRAINING_TEMPERATURE"] is not None else TEMPERATURE
 
 
 """
@@ -258,6 +254,9 @@ SCORE_PHI = partial(_SCORE_FN, **_SCORE_KW)  # Torch phi(Delta)
 # DEFAULT_T_START and DEFAULT_T_END are the ChordEdit baseline bounds and must match (0.85+t_delta, 0.3).
 DEFAULT_T_START = float(CONFIG["DEFAULT_T_START"])
 DEFAULT_T_END = float(CONFIG["DEFAULT_T_END"])
+
+# If true, the selector and eval stats only consider cells with t_start > t_end.
+USE_DIAGONAL_MASK = bool(CONFIG.get("USE_DIAGONAL_MASK", False))
 
 # The run directory name under RUNS_DIR, and an empty string uses a timestamp.
 RUN_NAME = str(CONFIG["RUN_NAME"])

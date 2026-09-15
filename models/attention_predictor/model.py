@@ -132,6 +132,8 @@ def apply_pipeline(
             vmax = surface.nan_to_num(nan=-math.inf).amax(dim=-2, keepdim=True)
             surface = persample_norm(surface, vmin, vmax)
         x = x - surface
+    elif pred_space == "fixed":
+        x = zscore_norm(x, zscore_mean, zscore_std)
 
     if use_zscore_stand:
         x = zscore_norm(x, zscore_mean, zscore_std)
@@ -157,7 +159,9 @@ def invert_pipeline(
     x = values
     if use_zscore_stand:
         x = zscore_denorm(x, zscore_mean, zscore_std)
-    if pred_space in ("deltas", "residuals"):
+    if pred_space == "fixed":
+        x = zscore_denorm(x, zscore_mean, zscore_std)
+    elif pred_space in ("deltas", "residuals"):
         surface = mean_surface.to(device=x.device, dtype=x.dtype)
         if use_minmax_norm:
             surface = minmax_norm(surface, minmax_min, minmax_max)
