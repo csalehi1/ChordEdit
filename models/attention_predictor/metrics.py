@@ -233,6 +233,29 @@ def selection_metrics(
     }
 
 
+def deviation_metrics(
+    true_dev: torch.Tensor,          # (N, n_cells, C) true deviation from the mean surface
+    pred_dev: torch.Tensor,          # (N, n_cells, C) predicted deviation
+    cols: tuple[str, ...] | list[str],
+) -> dict[str, float]:
+    """
+    How well the per-image deviations from the shared surface are predicted.
+
+    * dev_corr_<col>: Pearson correlation pooled over samples and cells
+    * dev_slope_<col>: slope of the true on the predicted deviation; 1 means calibrated amplitude
+    * dev_corr: mean of the per-column correlations
+    """
+    assert true_dev.shape == pred_dev.shape and true_dev.shape[-1] == len(cols)
+    out: dict[str, float] = {}
+    for i, col in enumerate(cols):
+        t, p = true_dev[..., i].reshape(-1), pred_dev[..., i].reshape(-1)
+        t, p = t - t.mean(), p - p.mean()
+        out[f"dev_corr_{col}"] = float(((t * p).sum() / (t.norm() * p.norm()).clamp(min=1e-12)).item())
+        out[f"dev_slope_{col}"] = float(((t * p).sum() / (p ** 2).sum().clamp(min=1e-12)).item())
+    out["dev_corr"] = sum(out[f"dev_corr_{col}"] for col in cols) / len(cols)
+    return out
+
+
 def per_col_metrics(
     true_cols: torch.Tensor,         # (N, n_cells, C) delta surfaces
     true_raw: torch.Tensor,          # (N, n_cells, C) measured PSNR/CLIP

@@ -102,6 +102,7 @@ class SelectorModel:
             device=device,
             default_cell=get_default_cell(cell_t_pairs, t_start_values, t_end_values),
             feat_dim=int(tuple(ckpt["feature_shape"])[-1]),
+            mask_dim=int(tuple(ckpt["mask_shape"])[-1]),
         )
         model.regressor.load_state_dict(ckpt["regressor_state_dict"])
         model.regressor.to(device).eval()
@@ -187,20 +188,11 @@ class SelectorModel:
         return selected
 
     @torch.no_grad()
-    def select_batch(
-        self,
-        image_tokens: torch.Tensor,
-        source_tokens: torch.Tensor,
-        target_tokens: torch.Tensor,
-        source_mask: torch.Tensor,
-        target_mask: torch.Tensor,
-        mask_features: torch.Tensor,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Return (t_start, t_end) arrays of shape (N,)."""
+    def select_batch(self, *inputs: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
+        """Return (t_start, t_end) arrays of shape (N,) for one batch of model inputs."""
 
-        pred_args = (image_tokens, source_tokens, target_tokens, source_mask, target_mask, mask_features)
-        raws = [model.pred_raw(*pred_args) for model in self.models]
-        raw = torch.stack(raws).mean(dim=0)
+        # Predicted raw PSNR/CLIP (averaged over ensemble members), per-sample normalized, then phi.
+        raw = torch.stack([model.pred_raw(*inputs) for model in self.models]).mean(dim=0)
         selected_surface = self.model.to_selector(raw)
 
         pairs = self.t_pairs[self.select_deltas(selected_surface).detach().cpu().numpy()]
@@ -239,6 +231,7 @@ def eval(run_dir: Path) -> Path:
             embs.source_mask[sel],
             embs.target_mask[sel],
             embs.mask_features[sel],
+            embs.mask_tokens[sel],
         )
         t_starts.append(t_start)
         t_ends.append(t_end)

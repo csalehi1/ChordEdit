@@ -29,7 +29,7 @@ from _wandb import finish_run, init_run, log_epoch, log_summary
 from dataloader import SplitDatasetLoader, get_dataloader
 from dataset import ID_TO_SPLIT_NAME, TRAIN_METADATA_NAME, get_dataset
 from metrics import *
-from model import AttentionModel
+from model import AttentionModel, pin_default
 from selector import SelectorModel
 from settings import *
 
@@ -105,30 +105,43 @@ def col_loss(
     return (((pred_deltas - true_deltas) ** 2) * weights).mean()
 
 
+def dev_loss(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
+    """1 - Pearson correlation of the predicted and true per-image deviations, per column.
+
+    Each cell is centered across the samples of the batch, which removes the shared
+    surface, so the term scores the direction of the per-image structure and not its
+    amplitude, which the post-training calibration handles.
+    """
+    dp = pred - pred.mean(dim=0, keepdim=True)
+    dt = true - true.mean(dim=0, keepdim=True)
+    corr = (dp * dt).sum(dim=(0, 1)) / (dp.pow(2).sum(dim=(0, 1)).sqrt() * dt.pow(2).sum(dim=(0, 1)).sqrt()).clamp(min=1e-8)
+    return (1 - corr).mean()
+
+
 def calc_loss(
-    pred: torch.Tensor,                        # (G, n_cells, 2) TRAINING_* units
+    pred: torch.Tensor,                        # (G, n_cells, 2) regression-space deltas
     y_raw: torch.Tensor,                       # (G, n_cells, 2) raw CLIP/PSNR
     selector: SelectorModel,
     cell_mask: torch.Tensor | None = None,     # (n_cells,) bool, or None for all
 ) -> torch.Tensor:
-    """Weighted phi MSE, pairwise ranking, and per-column MSE on selection surfaces."""
+    """Weighted phi MSE, pairwise ranking, per-column MSE and deviation correlation, in the regression space."""
 
-    regressor = selector.model.regressor
-    pred_sel = regressor.to_selector(regressor.to_raw(pred))
-    true_sel = regressor.to_selector(y_raw)
-    weights = None if PHI_WEIGHTS is None else pred_sel.new_tensor(PHI_WEIGHTS)
-    pred_phi = selector.calc_phi(pred_sel, weights=weights)
-    true_phi = selector.calc_phi(true_sel, weights=weights)
+    true = selector.model.regressor.to_training(y_raw)
+    weights = None if PHI_WEIGHTS is None else pred.new_tensor(PHI_WEIGHTS)
+    pred_phi = selector.calc_phi(pred, weights=weights)
+    true_phi = selector.calc_phi(true, weights=weights)
     if cell_mask is not None:
-        pred_sel, true_sel, pred_phi, true_phi = pred_sel[:, cell_mask], true_sel[:, cell_mask], pred_phi[:, cell_mask], true_phi[:, cell_mask]
+        pred, true, pred_phi, true_phi = pred[:, cell_mask], true[:, cell_mask], pred_phi[:, cell_mask], true_phi[:, cell_mask]
 
     loss = pred_phi.new_zeros(())
     if MSE_LOSS_WEIGHT > 0:
-        loss = loss + MSE_LOSS_WEIGHT * mse_loss(pred_phi, true_phi, top_k=MSE_LOSS_TOP_K)
+        loss = loss + MSE_LOSS_WEIGHT * mse_loss(pred_phi, true_phi)
     if RANKING_LOSS_WEIGHT > 0:
         loss = loss + RANKING_LOSS_WEIGHT * ranking_loss(pred_phi, true_phi, top_k=RANKING_LOSS_TOP_K)
     if any(w > 0 for w in COL_LOSS_WEIGHTS):
-        loss = loss + col_loss(pred_sel, true_sel, top_k=COL_LOSS_TOP_K)
+        loss = loss + col_loss(pred, true)
+    if DEV_LOSS_WEIGHT > 0:
+        loss = loss + DEV_LOSS_WEIGHT * dev_loss(pred, true)
     return loss
 
 
@@ -138,75 +151,97 @@ Evaluation.
 
 
 @torch.no_grad()
-def eval(
-    model: AttentionModel,
-    loader: SplitDatasetLoader,
-    selector: SelectorModel,
-) -> dict[str, float]:
-    """Regression and selection metrics for one split, from a single forward pass."""
-    
-    # Set the model to evaluation mode.
+def predict_split(model: AttentionModel, loader: SplitDatasetLoader) -> tuple[torch.Tensor, torch.Tensor]:
+    """Regression-space predictions and raw labels for a whole split, in double precision."""
     model.regressor.eval()
-    dataset = loader.dataset
-    default_cell = dataset.default_cell
-
-    # Iterate over the batches of the dataset.
     preds, ys_raw = [], []
     for batch in loader:
-        pred = model.regressor(
+        preds.append(model.regressor(
             batch.image_tokens,
             batch.source_tokens,
             batch.target_tokens,
             batch.source_mask,
             batch.target_mask,
             batch.mask_features,
-        )
-        preds.append(pred)
+            batch.mask_tokens,
+        ))
         ys_raw.append(batch.y_raw)
-    pred = torch.cat(preds)
-    y_raw = torch.cat(ys_raw)
+    return torch.cat(preds).double(), torch.cat(ys_raw).double()
 
+
+@torch.no_grad()
+def fit_deviation_calibration(model: AttentionModel, loader: SplitDatasetLoader) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mean predicted raw surface and, per column, the slope of the true on the predicted deviation.
+
+    Deviations are taken on deltas versus the default cell, the quantity the model
+    predicts; the per-image level of the raw labels is not its to explain.
+    """
+    pred, y_raw = predict_split(model, loader)
+    default_cell = loader.dataset.default_cell
+    raw = model.to_raw(pred)
+    mean_pred = raw.mean(dim=0)
+    dev_pred = pin_default(raw, default_cell) - pin_default(mean_pred, default_cell)
+    dev_true = pin_default(y_raw, default_cell) - pin_default(model.regressor.mean_surface.double(), default_cell)
+    slope = (dev_true * dev_pred).sum(dim=(0, 1)) / dev_pred.pow(2).sum(dim=(0, 1)).clamp(min=1e-12)
+    return mean_pred, slope
+
+
+@torch.no_grad()
+def eval(
+    model: AttentionModel,
+    loader: SplitDatasetLoader,
+    selector: SelectorModel,
+    calibrated: bool = SELECT_CALIBRATED,
+) -> dict[str, float]:
+    """Regression, deviation and selection metrics for one split, from a single forward pass."""
+
+    default_cell = loader.dataset.default_cell
     regressor = model.regressor
-    pred_sel = regressor.to_selector(regressor.to_raw(pred.double()))
-    true_sel = regressor.to_selector(y_raw.double())
-    weights = None if PHI_WEIGHTS is None else pred_sel.new_tensor(PHI_WEIGHTS)
-    true_phi = selector.calc_phi(true_sel, weights=weights)
-    pred_phi = selector.calc_phi(pred_sel, weights=weights)
+    pred, y_raw = predict_split(model, loader)
+    weights = None if PHI_WEIGHTS is None else pred.new_tensor(PHI_WEIGHTS)
+
+    # Regression space, where the loss lives.
+    true = regressor.to_training(y_raw)
+    pred_phi_reg, true_phi_reg = selector.calc_phi(pred, weights=weights), selector.calc_phi(true, weights=weights)
+
+    # Raw units, where the per-image deviation from the train-mean surface is measured.
+    raw = regressor.to_raw(pred)
+    if calibrated:
+        raw = regressor.calibrate_raw(raw)
+    mean_delta = pin_default(regressor.mean_surface.double(), default_cell)
+    dev_true, dev_pred = pin_default(y_raw, default_cell) - mean_delta, pin_default(raw, default_cell) - mean_delta
+
+    # Selection space: per-sample normalized deltas, phi, and the selected cells.
+    pred_sel, true_sel = regressor.to_selector(raw), regressor.to_selector(y_raw)
+    true_phi, pred_phi = selector.calc_phi(true_sel, weights=weights), selector.calc_phi(pred_sel, weights=weights)
     selected = selector.select_deltas(pred_sel)
 
-    # Restrict selector-facing stats to t_start > t_end cells, if requested.
+    # Restrict the per-cell stats to t_start > t_end cells, if requested.
     cell_mask = None if selector.cell_mask is None else selector.cell_mask.to(device=pred.device)
-    y_raw_eval = y_raw.double()
+    loss = calc_loss(pred, y_raw, selector, cell_mask=cell_mask)
     if cell_mask is not None:
-        n_cells = true_phi.shape[-1]
-        inv = selected.new_full((n_cells,), -1)
+        inv = selected.new_full((true_phi.shape[-1],), -1)
         inv[cell_mask] = torch.arange(int(cell_mask.sum()), device=selected.device, dtype=selected.dtype)
-        selected = inv[selected]
-        default_cell = int(inv[default_cell].item())
-        true_phi = true_phi[:, cell_mask]
-        pred_phi = pred_phi[:, cell_mask]
-        pred_sel = pred_sel[:, cell_mask]
-        true_sel = true_sel[:, cell_mask]
-        y_raw_eval = y_raw_eval[:, cell_mask]
+        selected, default_cell = inv[selected], int(inv[default_cell].item())
+        pred, true, pred_phi_reg, true_phi_reg, y_raw, dev_true, dev_pred, pred_sel, true_sel, true_phi, pred_phi = (
+            x[:, cell_mask] for x in (pred, true, pred_phi_reg, true_phi_reg, y_raw, dev_true, dev_pred, pred_sel, true_sel, true_phi, pred_phi)
+        )
 
     return {
-        # How well the predicted phi surface matches the true one.
+        # How well the predicted phi surface matches the true one, and the loss terms.
         **training_metrics(
             true_phi, pred_phi,
-            lambda: calc_loss(pred, y_raw, selector, cell_mask=cell_mask),
-            lambda: mse_loss(pred_phi, true_phi, top_k=MSE_LOSS_TOP_K),
-            lambda: ranking_loss(pred_phi, true_phi, top_k=RANKING_LOSS_TOP_K),
-            lambda: col_loss(pred_sel, true_sel, top_k=COL_LOSS_TOP_K),
+            lambda: loss,
+            lambda: mse_loss(pred_phi_reg, true_phi_reg),
+            lambda: ranking_loss(pred_phi_reg, true_phi_reg, top_k=RANKING_LOSS_TOP_K),
+            lambda: col_loss(pred, true),
         ),
+        # How well the per-image deviations from the shared surface are predicted.
+        **deviation_metrics(dev_true, dev_pred, TARGET_COLS),
         # How well the selected cell compares to the true best cell.
-        **selection_metrics(
-            true_phi, selected, default_cell
-        ),
+        **selection_metrics(true_phi, selected, default_cell),
         # Per-column training and selection metrics.
-        **per_col_metrics(
-            true_sel, y_raw_eval, pred_sel,
-            selected, default_cell, TARGET_COLS,
-        ),
+        **per_col_metrics(true_sel, y_raw, pred_sel, selected, default_cell, TARGET_COLS),
     }
 
 
@@ -248,12 +283,14 @@ def train(device: torch.device) -> None:
         device=device,
         default_cell=metadata.default_cell,
         feat_dim=train.feature_shape[-1],
+        mask_dim=train.mask_shape[-1],
     )
 
     cell_labels = metadata.cell_labels.detach().cpu().numpy()
     t_start_values = torch.as_tensor(np.sort(np.unique(cell_labels[:, 0])), dtype=torch.float64)
     t_end_values = torch.as_tensor(np.sort(np.unique(cell_labels[:, 1])), dtype=torch.float64)
     selector = SelectorModel(model, cell_labels)
+    cell_mask = None if selector.cell_mask is None else selector.cell_mask.to(device)
 
     run = init_run(run_dir, {
         "n_cells": int(train.n_cells),
@@ -264,15 +301,26 @@ def train(device: torch.device) -> None:
 
     model.regressor.set_metadata(metadata)
     print(
-        "Target columns (train, TRAINING_* space before z-score):\n"
-        f"  {'Target':<38} {'Mean':>8} {'Std':>8}\n"
-        + "\n".join(
-            f"  {c:<38} "
-            f"{model.regressor.zscore_mean[i]:8.3f} "
-            f"{model.regressor.zscore_std[i]:8.3f}"
-            for i, c in enumerate(TARGET_COLS)
-        )
+        "Regression scale (raw units per delta unit):\n"
+        + "\n".join(f"  {c:<38} {s:8.3f}" for c, s in zip(TARGET_COLS, metadata.loss_scale.tolist()))
     )
+
+    def checkpoint() -> dict:
+        """Weights plus the sizing contract selector.py rebuilds the model from."""
+        return {
+            "regressor_state_dict": model.regressor.state_dict(),
+            "target_cols": list(TARGET_COLS),
+            "image_shape": train.image_shape,
+            "source_shape": train.source_shape,
+            "feature_shape": train.feature_shape,
+            "mask_shape": train.mask_shape,
+            "img_emb_pool": bool(IMG_EMB_POOL),
+            "img_fusion": IMG_FUSION,
+            "mask_features": MASK_FEATURES,
+            "cell_t_pairs": metadata.cell_labels,
+            "t_start_values": t_start_values,
+            "t_end_values": t_end_values,
+        }
 
     # Initialize the optimizer and (optional) cosine LR schedule.
     optimizer = torch.optim.AdamW(model.regressor.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
@@ -300,18 +348,17 @@ def train(device: torch.device) -> None:
             # Iterate over the batches.
             for batch in train_loader:
 
-                # Forward pass. Targets are z-scored to match the head outputs.
+                # Forward pass, scored in the regression space against the raw labels.
                 out = model.regressor(
-                    batch.image_tokens, 
-                    batch.source_tokens, 
+                    batch.image_tokens,
+                    batch.source_tokens,
                     batch.target_tokens,
-                    batch.source_mask, 
+                    batch.source_mask,
                     batch.target_mask,
                     batch.mask_features,
+                    batch.mask_tokens,
                 )
-                loss = calc_loss(
-                    out, batch.y_raw, selector,
-                )
+                loss = calc_loss(out, batch.y_raw, selector, cell_mask=cell_mask)
 
                 # Backpropagate the loss.
                 optimizer.zero_grad()
@@ -347,7 +394,9 @@ def train(device: torch.device) -> None:
             )
 
             # Choose a checkpoint metric to gauge improvement.
-            if CKPT_METRIC == "val_phi_spearman":
+            if CKPT_METRIC == "val_dev_corr":
+                score = val_metrics.get("dev_corr", float("nan"))
+            elif CKPT_METRIC == "val_phi_spearman":
                 score = val_metrics.get("phi_spearman", float("nan"))
             elif CKPT_METRIC == "val_regret":
                 score = -val_metrics.get("regret_median", float("nan"))
@@ -368,19 +417,7 @@ def train(device: torch.device) -> None:
             if improved:
                 best_score, best_epoch, since_improved = score, epoch, 0
                 best_val_loss = val_metrics["loss"]
-                torch.save({
-                    "regressor_state_dict": model.regressor.state_dict(),
-                    "target_cols": list(TARGET_COLS),
-                    "regressor_pred_space": str(TRAINING_PRED_SPACE),
-                    "image_shape": train.image_shape,
-                    "source_shape": train.source_shape,
-                    "img_emb_pool": bool(IMG_EMB_POOL),
-                    "feature_shape": train.feature_shape,
-                    "use_zedit_mask": bool(USE_ZEDIT_MASK),
-                    "cell_t_pairs": metadata.cell_labels,
-                    "t_start_values": t_start_values,
-                    "t_end_values": t_end_values,
-                }, weights_out)
+                torch.save(checkpoint(), weights_out)
             else:
                 since_improved += 1
 
@@ -407,12 +444,16 @@ def train(device: torch.device) -> None:
                 print(f"No improvement in {since_improved} epochs. Early stopping at epoch {epoch}.")
                 break
 
-        # Load the best weights and evaluate on the test set.
-        checkpoint = torch.load(weights_out, map_location=device, weights_only=False)
-        model.regressor.load_state_dict(checkpoint["regressor_state_dict"])
+        # Load the best weights, calibrate the deviation amplitude on val (one slope per
+        # column, kept in the checkpoint), and evaluate on the test set both ways.
+        model.regressor.load_state_dict(torch.load(weights_out, map_location=device, weights_only=False)["regressor_state_dict"])
+        model.regressor.set_calibration(*fit_deviation_calibration(model, val_loader))
+        torch.save(checkpoint(), weights_out)
 
         test_metrics = eval(model, test_loader, selector)
-        print("\n" + format_metric_table([("test", test_metrics)]))
+        test_calibrated = eval(model, test_loader, selector, calibrated=True)
+        print("\n" + format_metric_table([("test", test_metrics), ("test (cal)", test_calibrated)]))
+        print("Deviation slopes (val): " + ", ".join(f"{c} {s:.3f}" for c, s in zip(TARGET_COLS, model.regressor.dev_scale.tolist())))
 
         # Summary rather than log, so the runs table ranks on final quality
         # instead of whatever the last epoch happened to produce.
@@ -426,7 +467,11 @@ def train(device: torch.device) -> None:
         (run_dir / "regression_metrics.json").write_text(json.dumps({
             "best_epoch": best_epoch,
             "epochs_ran": len(history),
+            "label_seeds": LABEL_SEEDS,
+            "eval_label_seeds": EVAL_LABEL_SEEDS,
+            "dev_scale": model.regressor.dev_scale.tolist(),
             "test": test_metrics,
+            "test_calibrated": test_calibrated,
             "val_best": history[best_epoch - 1]["val"] if history else {},
             "history": history,
         }, indent=2) + "\n")

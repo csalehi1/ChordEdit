@@ -15,7 +15,7 @@ import torch
 
 from _helpers import get_default_cell, prep_sample_id
 from embeddings import EmbeddingsTable, SampleEmbeddings, get_embeddings
-from model import apply_pipeline, pin_default
+from model import to_deltas
 from settings import *
 
 ID_TO_SPLIT_NAME = "id_to_split.csv"
@@ -29,27 +29,13 @@ Sample and split classes.
 
 @dataclass(frozen=True)
 class DatasetMetadata:
-    """Train-global grid identity and invert stats, shared by every split."""
+    """Train-global grid identity and regression stats, shared by every split."""
 
     n_cells: int                     # cells per grid
     cell_labels: torch.Tensor        # (n_cells, 2) being (t_start, t_end)
     default_cell: int                # shared default-cell index; raises if not unique
-    mean_surface: torch.Tensor       # (n_cells, C)
-    minmax_max: torch.Tensor         # (C,)
-    minmax_min: torch.Tensor         # (C,)
-    zscore_mean: torch.Tensor        # (C,)
-    zscore_std: torch.Tensor         # (C,)
-
-    def pipeline_stats(self) -> dict[str, int | torch.Tensor]:
-        """Kwargs for apply_pipeline / invert_pipeline."""
-        return dict(
-            default_cell=self.default_cell,
-            minmax_min=self.minmax_min,
-            minmax_max=self.minmax_max,
-            zscore_mean=self.zscore_mean,
-            zscore_std=self.zscore_std,
-            mean_surface=self.mean_surface,
-        )
+    mean_surface: torch.Tensor       # (n_cells, C) raw CLIP/PSNR
+    loss_scale: torch.Tensor         # (C,) raw units per regression-space unit
 
 
 def get_train_metadata(run_dir: Path, built: DatasetMetadata | None = None) -> DatasetMetadata:
@@ -69,10 +55,7 @@ def get_train_metadata(run_dir: Path, built: DatasetMetadata | None = None) -> D
         "cell_labels": built.cell_labels.detach().cpu().contiguous(),
         "default_cell": built.default_cell,
         "mean_surface": built.mean_surface.detach().cpu().contiguous(),
-        "minmax_max": built.minmax_max.detach().cpu().contiguous(),
-        "minmax_min": built.minmax_min.detach().cpu().contiguous(),
-        "zscore_mean": built.zscore_mean.detach().cpu().contiguous(),
-        "zscore_std": built.zscore_std.detach().cpu().contiguous(),
+        "loss_scale": built.loss_scale.detach().cpu().contiguous(),
     }, path)
     print(f"Saved {path.name}.")
     return built
@@ -84,7 +67,7 @@ class SampleData:
 
     sample_id: str
     x: SampleEmbeddings
-    y: torch.Tensor                  # (n_cells, C) TRAINING_* targets
+    y: torch.Tensor                  # (n_cells, C) regression-space deltas
     y_raw: torch.Tensor              # (n_cells, C) raw CLIP/PSNR
 
 
@@ -95,13 +78,14 @@ class DatasetSplit:
     split_name: str                  # "train" / "val" / "test"
     sample_ids: tuple[str, ...]      # (N,) one sample_id per grid
     x: EmbeddingsTable               # shared across splits; index via sample_ids
-    y: torch.Tensor                  # (N, n_cells, C) TRAINING_* targets
+    y: torch.Tensor                  # (N, n_cells, C) regression-space deltas
     y_raw: torch.Tensor              # (N, n_cells, C) raw CLIP/PSNR
     image_shape: tuple[int, ...]     # per-sample image_tokens shape
     source_shape: tuple[int, ...]    # per-sample source_tokens shape
     target_shape: tuple[int, ...]    # per-sample target_tokens shape
     feature_shape: tuple[int, ...]   # per-sample mask_features shape
-    metadata: DatasetMetadata        # train-global grid + invert stats
+    mask_shape: tuple[int, ...]      # per-sample mask_tokens shape
+    metadata: DatasetMetadata        # train-global grid + regression stats
 
     def __post_init__(self):
         # Translate sample ids to table rows once, so gather is pure tensor
@@ -147,6 +131,7 @@ class DatasetSplit:
             table.source_mask[idx],
             table.target_mask[idx],
             table.mask_features[idx],
+            table.mask_tokens[idx],
             self.y[sel],
             self.y_raw[sel],
         )
@@ -188,14 +173,15 @@ def get_df() -> pd.DataFrame:
             pie_df[SAMPLE_ID_COL] = PIE_SAMPLE_ID_PREFIX + pie_df[SAMPLE_ID_COL]
             return pie_df
 
-        def _select_label_seeds(metrics_df: pd.DataFrame) -> pd.DataFrame:
-            """Reduce list-valued metric cells to the entries at SPLIT_SEEDS.
+        def _reduce_label_seeds(metrics_df: pd.DataFrame) -> pd.DataFrame:
+            """Average list-valued metric cells over generation seeds.
 
             The seed column holds the generation seeds in the same order as the
             PSNR/CLIP lists, e.g. seed '[42, 43, 44, 45]' and psnr '[a, b, c, d]'.
-            Each value in SPLIT_SEEDS is looked up in that list; those indices are
-            taken and averaged. Scalar cells (no seed column, or a single value)
-            pass through unchanged.
+            `<col>` becomes the mean over LABEL_SEEDS (the training labels) and
+            `<col>__eval` the mean over EVAL_LABEL_SEEDS (the val/test labels). A NaN
+            anywhere in a list voids the cell, so the sample set does not depend on the
+            seeds chosen. Scalar cells (no seed column, or a single value) pass through.
             """
 
             def _parse_list_cell(value) -> np.ndarray:
@@ -206,38 +192,33 @@ def get_df() -> pd.DataFrame:
                     return np.array([], dtype=np.float64)
                 return np.array([float(value)], dtype=np.float64)
 
-            row_seeds = None
-            if SEED_COL in metrics_df.columns:
-                row_seeds = [_parse_list_cell(v) for v in metrics_df[SEED_COL]]
-            wanted = np.asarray(SPLIT_SEEDS, dtype=np.float64)
+            def _at_seeds(vals: np.ndarray, i: int, wanted: tuple[int, ...] | None) -> np.ndarray:
+                """The entries of vals at the wanted seeds of row i, or all of them."""
+                if wanted is None or row_seeds is None or vals.size == 1:
+                    return vals
+                cell_seeds = row_seeds[i]
+                if cell_seeds.size != vals.size:
+                    raise ValueError(f"{vals.size} values but {cell_seeds.size} seeds in row {i}")
+                hits = [np.flatnonzero(cell_seeds == seed) for seed in wanted]
+                if any(h.size == 0 for h in hits):
+                    raise ValueError(f"Row {i} has seeds {cell_seeds.tolist()}, expected {list(wanted)}")
+                return vals[[int(h[0]) for h in hits]]
 
+            row_seeds = [_parse_list_cell(v) for v in metrics_df[SEED_COL]] if SEED_COL in metrics_df.columns else None
             for col in TARGET_COLS:
                 values = [_parse_list_cell(v) for v in metrics_df[col]]
-                out = np.full(len(values), np.nan, dtype=np.float64)
+                out = np.full((len(values), 2), np.nan, dtype=np.float64)
                 for i, vals in enumerate(values):
-                    if vals.size == 0 or np.isnan(vals).any():
-                        continue
-                    if row_seeds is None or vals.size == 1:
-                        out[i] = float(vals.mean())
-                        continue
-                    cell_seeds = row_seeds[i]
-                    if cell_seeds.size != vals.size:
-                        raise ValueError(f"{col}: {vals.size} values but {cell_seeds.size} seeds in row {i}")
-                    idx = []
-                    for seed in wanted:
-                        hits = np.flatnonzero(cell_seeds == seed)
-                        if hits.size == 0:
-                            raise ValueError(f"{col}: row {i} has seeds {cell_seeds.tolist()}, expected {list(SPLIT_SEEDS)}")
-                        idx.append(int(hits[0]))
-                    out[i] = float(vals[np.asarray(idx)].mean())
-                metrics_df[col] = out
+                    if vals.size and not np.isnan(vals).any():
+                        out[i] = _at_seeds(vals, i, LABEL_SEEDS).mean(), _at_seeds(vals, i, EVAL_LABEL_SEEDS or LABEL_SEEDS).mean()
+                metrics_df[col], metrics_df[f"{col}__eval"] = out[:, 0], out[:, 1]
             return metrics_df
 
         is_primary = metrics_csv == METRICS_CSV
 
         # Clean metrics CSV: drop rows that do not have target metrics or t_delta.
         metrics_df = pd.read_csv(metrics_csv)
-        metrics_df = _select_label_seeds(metrics_df)
+        metrics_df = _reduce_label_seeds(metrics_df)
         n_before = len(metrics_df)
         metrics_df = metrics_df.dropna(subset=list(TARGET_COLS)).reset_index(drop=True)
         if len(metrics_df) < n_before:
@@ -282,7 +263,7 @@ def get_df() -> pd.DataFrame:
         for col in (IMAGE_PATH_COL, MASK_PATH_COL):
             inputs_df[col] = [str(p) if (p := Path(path)).is_absolute() else str(DATASET_DIR / path) for path in inputs_df[col]]
 
-        metrics_cols = [SAMPLE_ID_COL, T_START_COL, T_END_COL, T_DELTA_COL, *TARGET_COLS]
+        metrics_cols = [SAMPLE_ID_COL, T_START_COL, T_END_COL, T_DELTA_COL, *TARGET_COLS, *(f"{c}__eval" for c in TARGET_COLS)]
         df = pd.merge(metrics_df.loc[:, metrics_cols], inputs_df.loc[:, inputs_cols], on=SAMPLE_ID_COL, how="left").reset_index(drop=True)
 
         if is_primary and PIE_BENCH:
@@ -309,7 +290,7 @@ def get_splits_df(splits_df_path: Path) -> dict[str, tuple[pd.DataFrame, pd.Data
         is_pie = sids.str.startswith(PIE_SAMPLE_ID_PREFIX)
         ue_ids = np.sort(sids[~is_pie].unique())
         n_samples = len(ue_ids)
-        perm = np.random.default_rng(SPLIT_SEEDS).permutation(ue_ids)
+        perm = np.random.default_rng(SPLIT_SEED).permutation(ue_ids)
         n_train = max(1, round(TRAIN_FRAC * n_samples))
         n_val = max(0, min(round(VAL_FRAC * n_samples), n_samples - n_train - 1))
         train_ids = perm[:n_train]
@@ -376,9 +357,9 @@ def get_dataset(
         samples = pd.concat([X for X, _ in splits.values()], ignore_index=True)
         return get_embeddings(samples, device)
 
-    def _grid_arrange(X_df: pd.DataFrame, y_df: pd.DataFrame) -> tuple[list[str], torch.Tensor, torch.Tensor]:
-        """One split's cells as grids: (sample_ids, t (n_cells, 2), y_raw)."""
-        del y_df  # raw metrics live on X_df as *__raw columns
+    def _grid_arrange(X_df: pd.DataFrame, y_df: pd.DataFrame) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One split's cells as grids: (sample_ids, t (n_cells, 2), y_raw, y_raw at the eval seeds)."""
+        del y_df  # raw metrics live on X_df as *__raw and *__eval columns
         Xs = X_df.sort_values([SAMPLE_ID_COL, T_START_COL, T_END_COL], kind="stable")
         sample_ids = Xs[SAMPLE_ID_COL].to_numpy()
         unique_ids, counts = np.unique(sample_ids, return_counts=True)
@@ -393,24 +374,21 @@ def get_dataset(
         if not keep.all():
             print(f"Dropped {int((~keep).sum())} sample(s) whose grid does not match the split's canonical cells.")
 
-        raw_cols = [f"{c}__raw" for c in TARGET_COLS]
-        y_raw = torch.tensor(Xs[raw_cols].to_numpy(), dtype=torch.float).reshape(n, n_cells, -1)
+        def _grid(suffix: str) -> torch.Tensor:
+            cols = [f"{c}{suffix}" for c in TARGET_COLS]
+            return torch.tensor(Xs[cols].to_numpy(), dtype=torch.float).reshape(n, n_cells, -1)[torch.as_tensor(keep)]
+
         t_pairs = torch.tensor(t[keep][0], dtype=torch.float64)
-        return list(unique_ids[keep]), t_pairs, y_raw[torch.as_tensor(keep)]
+        return list(unique_ids[keep]), t_pairs, _grid("__raw"), _grid("__eval")
 
     def _metadata_to_device(meta: DatasetMetadata) -> DatasetMetadata:
         """Copy train metadata tensors onto the dataset device."""
-        def col(x: torch.Tensor) -> torch.Tensor:
-            return x.to(device=device, dtype=torch.float)
         return DatasetMetadata(
             n_cells=int(meta.n_cells),
             cell_labels=meta.cell_labels.to(device=device),
             default_cell=int(meta.default_cell),
-            mean_surface=col(meta.mean_surface),
-            minmax_max=col(meta.minmax_max),
-            minmax_min=col(meta.minmax_min),
-            zscore_mean=col(meta.zscore_mean),
-            zscore_std=col(meta.zscore_std),
+            mean_surface=meta.mean_surface.to(device=device, dtype=torch.float),
+            loss_scale=meta.loss_scale.to(device=device, dtype=torch.float),
         )
 
     def _get_metadata() -> DatasetMetadata:
@@ -418,76 +396,41 @@ def get_dataset(
         if (Path(run_dir) / TRAIN_METADATA_NAME).exists():
             return _metadata_to_device(get_train_metadata(run_dir))
         train_pairs, train_raw = arranged["train"][1], arranged["train"][2]
-        flat = train_raw.reshape(-1, train_raw.shape[-1])
-        n_targets = int(flat.shape[-1])
-        if MINMAX_SCALE == "median_range":
-            ranges = train_raw.nan_to_num(nan=float("-inf")).amax(dim=1) - train_raw.nan_to_num(nan=float("inf")).amin(dim=1)
-            minmax_min = torch.zeros(n_targets, dtype=train_raw.dtype)
-            minmax_max = ranges.double().median(dim=0).values.to(dtype=train_raw.dtype)
+        if LOSS_SCALE == "median_range":
+            # A typical sample's grid range per column, so deltas mostly lie in [-1, 1].
+            ranges = train_raw.amax(dim=1) - train_raw.amin(dim=1)
+            loss_scale = ranges.double().median(dim=0).values.to(dtype=train_raw.dtype)
         else:
-            minmax_max = flat.nan_to_num(nan=float("-inf")).amax(dim=0)
-            minmax_min = flat.nan_to_num(nan=float("inf")).amin(dim=0)
-        raw_stats = DatasetMetadata(
+            loss_scale = torch.tensor(LOSS_SCALE_VALUES, dtype=train_raw.dtype)
+        built = DatasetMetadata(
             n_cells=int(train_pairs.shape[0]),
             cell_labels=train_pairs,
             default_cell=get_default_cell(train_pairs),
             mean_surface=train_raw.double().mean(dim=0).to(dtype=train_raw.dtype),
-            minmax_max=minmax_max,
-            minmax_min=minmax_min,
-            zscore_mean=torch.zeros(n_targets, dtype=train_raw.dtype),
-            zscore_std=torch.ones(n_targets, dtype=train_raw.dtype),
-        )
-        pre_zscore = apply_pipeline(
-            train_raw.double(),
-            pred_space=TRAINING_PRED_SPACE,
-            use_minmax_norm=TRAINING_USE_MINMAX_NORM,
-            use_persample_norm=TRAINING_USE_PERSAMPLE_NORM,
-            use_zscore_stand=False,
-            default_cell=raw_stats.default_cell,
-            minmax_min=raw_stats.minmax_min,
-            minmax_max=raw_stats.minmax_max,
-            zscore_mean=raw_stats.zscore_mean,
-            zscore_std=raw_stats.zscore_std,
-            mean_surface=raw_stats.mean_surface,
-        ).reshape(-1, n_targets)
-        built = DatasetMetadata(
-            **{**raw_stats.__dict__,
-               "zscore_mean": pre_zscore.mean(dim=0).to(dtype=train_raw.dtype),
-               "zscore_std": pre_zscore.std(dim=0).clamp(min=1e-8).to(dtype=train_raw.dtype)},
+            loss_scale=loss_scale,
         )
         return _metadata_to_device(get_train_metadata(run_dir, built))
 
     def _get_splits(metadata: DatasetMetadata) -> dict[str, DatasetSplit]:
-        """Get the splits from the packed grids, transformed with train metadata."""
+        """Get the splits from the packed grids, with val/test labels at the eval seeds if set."""
         out: dict[str, DatasetSplit] = {}
-        for name, (sample_ids, t_pairs, y_raw) in arranged.items():
+        for name, (sample_ids, t_pairs, y_raw, y_eval) in arranged.items():
             if int(t_pairs.shape[0]) != metadata.n_cells:
                 raise ValueError(f"{name} grid has {t_pairs.shape[0]} cells, train has {metadata.n_cells}")
-            y = apply_pipeline(
-                y_raw,
-                pred_space=TRAINING_PRED_SPACE,
-                use_minmax_norm=TRAINING_USE_MINMAX_NORM,
-                use_persample_norm=TRAINING_USE_PERSAMPLE_NORM,
-                use_zscore_stand=TRAINING_USE_ZSCORE_STAND,
-                default_cell=metadata.default_cell,
-                minmax_min=metadata.minmax_min,
-                minmax_max=metadata.minmax_max,
-                zscore_mean=metadata.zscore_mean,
-                zscore_std=metadata.zscore_std,
-                mean_surface=metadata.mean_surface,
-            )
-            if PIN_DEFAULT_CELL:
-                y = pin_default(y, metadata.default_cell)
+            if name != "train" and EVAL_LABEL_SEEDS is not None:
+                y_raw = y_eval
+            y_raw = y_raw.to(device)
             out[name] = DatasetSplit(
                 split_name=name,
                 sample_ids=tuple(sample_ids),
                 x=table,
-                y=y.to(device),
-                y_raw=y_raw.to(device),
+                y=to_deltas(y_raw, metadata.default_cell, metadata.loss_scale),
+                y_raw=y_raw,
                 image_shape=table.image_shape,
                 source_shape=table.source_shape,
                 target_shape=table.target_shape,
                 feature_shape=table.feature_shape,
+                mask_shape=table.mask_shape,
                 metadata=metadata,
             )
         return out

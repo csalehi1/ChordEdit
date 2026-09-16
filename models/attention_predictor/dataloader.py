@@ -28,10 +28,11 @@ class SampleBatch:
     target_tokens: torch.Tensor         # (N, T, D), (N, 1, D)
     source_mask: torch.Tensor           # (N, N_t) bool; ones when pooled
     target_mask: torch.Tensor           # (N, N_t) bool; ones when pooled
-    mask_features: torch.Tensor         # (N, D_feat); ones when unused
+    mask_features: torch.Tensor         # (N, D_feat); empty when unused
+    mask_tokens: torch.Tensor           # (N, N_m, D_clip); N_m = 0 when unused
 
-    y: torch.Tensor                     # (N, n_cells, C)
-    y_raw: torch.Tensor                 # (N, n_cells, C)
+    y: torch.Tensor                     # (N, n_cells, C) regression-space deltas
+    y_raw: torch.Tensor                 # (N, n_cells, C) raw CLIP/PSNR
     default_cell: torch.Tensor          # (N,)
 
 
@@ -45,7 +46,7 @@ class SplitDatasetLoader:
 
     def _batch(self, sel: torch.Tensor) -> SampleBatch:
         """Gather one SampleBatch for the sample indices in sel."""
-        image_tokens, source_tokens, target_tokens, source_mask, target_mask, mask_features, y, y_raw = self.dataset.gather(sel)
+        image_tokens, source_tokens, target_tokens, source_mask, target_mask, mask_features, mask_tokens, y, y_raw = self.dataset.gather(sel)
         return SampleBatch(
             image_tokens=image_tokens,
             source_tokens=source_tokens,
@@ -53,6 +54,7 @@ class SplitDatasetLoader:
             source_mask=source_mask,
             target_mask=target_mask,
             mask_features=mask_features,
+            mask_tokens=mask_tokens,
             y=y,
             y_raw=y_raw,
             default_cell=torch.full((len(sel),), self.dataset.default_cell, dtype=torch.long, device=y.device),

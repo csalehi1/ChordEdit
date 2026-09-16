@@ -31,8 +31,11 @@ if TYPE_CHECKING:
 
 
 """
-Target-space transforms on (..., n_cells, C) grids: train-global min-max,
-per-sample min-max, pred-space, and z-score.
+Target-space transforms on (..., n_cells, C) grids.
+
+The regression space is deltas versus the default cell in shared units (raw / one scale
+per column), which inverts exactly to raw PSNR/CLIP. The selection space re-normalizes
+each raw grid per sample to [0, 1] per column before taking deltas, the paper's phi input.
 """
 
 _EPS = 1e-8
@@ -44,139 +47,18 @@ def pin_default(values: torch.Tensor, default_cell: int) -> torch.Tensor:
     return values - values[..., default_cell, :].unsqueeze(-2)
 
 
-def minmax_norm(values: torch.Tensor, vmin: torch.Tensor, vmax: torch.Tensor) -> torch.Tensor:
-    """Global minmax normalization."""
-    # (N, n_cells, C), (C,), (C,) -> (N, n_cells, C)
-    vmin, vmax = vmin.to(values), vmax.to(values)
-    return (values - vmin) / (vmax - vmin + _EPS)
+def to_deltas(raw: torch.Tensor, default_cell: int, scale: torch.Tensor) -> torch.Tensor:
+    """Regression space: (raw - raw at the default cell) / scale, one scale per column."""
+    # (N, n_cells, C), int, (C,) -> (N, n_cells, C)
+    return pin_default(raw, default_cell) / scale.to(raw)
 
 
-def minmax_denorm(values: torch.Tensor, vmin: torch.Tensor, vmax: torch.Tensor) -> torch.Tensor:
-    # (N, n_cells, C), (C,), (C,) -> (N, n_cells, C)
-    vmin, vmax = vmin.to(values), vmax.to(values)
-    return values * (vmax - vmin + _EPS) + vmin
-
-
-def persample_norm(values: torch.Tensor, vmin: torch.Tensor, vmax: torch.Tensor) -> torch.Tensor:
-    """Per-sample minmax normalization."""
-    # (N, n_cells, C), (N, 1, C), (N, 1, C) -> (N, n_cells, C)
-    vmin, vmax = vmin.to(values), vmax.to(values)
-    return (values - vmin) / (vmax - vmin + _EPS)
-
-
-def persample_denorm(values: torch.Tensor, vmin: torch.Tensor, vmax: torch.Tensor) -> torch.Tensor:
-    # (N, n_cells, C), (N, 1, C), (N, 1, C) -> (N, n_cells, C)
-    vmin, vmax = vmin.to(values), vmax.to(values)
-    return values * (vmax - vmin + _EPS) + vmin
-
-
-def zscore_norm(values: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-    # (N, n_cells, C), (C,), (C,) -> (N, n_cells, C)
-    mean, std = mean.to(values), std.to(values).clamp(min=_EPS)
-    return (values - mean) / std
-
-
-def zscore_denorm(values: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-    # (N, n_cells, C), (C,), (C,) -> (N, n_cells, C)
-    mean, std = mean.to(values), std.to(values).clamp(min=_EPS)
-    return values * std + mean
-
-
-def squash_deltas(values: torch.Tensor, bound: float) -> torch.Tensor:
-    """Bound selector-space deltas to (-bound, bound) with bound * tanh(x / bound).
-
-    Identity near zero, so ordinary cells are barely moved, but the far
-    negative tail saturates instead of feeding exp(-alpha * Delta) in phi.
-    """
-    # (N, n_cells, C), float -> (N, n_cells, C)
-    return bound * torch.tanh(values / bound)
-
-
-def apply_pipeline(
-    raw: torch.Tensor,
-    *,
-    pred_space: str,
-    use_minmax_norm: bool,
-    use_persample_norm: bool,
-    use_zscore_stand: bool,
-    default_cell: int,
-    minmax_min: torch.Tensor,
-    minmax_max: torch.Tensor,
-    zscore_mean: torch.Tensor,
-    zscore_std: torch.Tensor,
-    mean_surface: torch.Tensor,
-) -> torch.Tensor:
-    """Map raw CLIP/PSNR grids (N, n_cells, C) through a TRAINING_* or selection stack.
-
-    The z-score stats must describe the values after the earlier steps, not raw
-    CLIP/PSNR; see dataset._get_metadata.
-    """
-    if raw.ndim < 2:
-        raise ValueError(f"Expected {tuple(raw.shape)} == (..., n_cells, C)")
-
-    x = raw
-    if use_minmax_norm:
-        x = minmax_norm(x, minmax_min, minmax_max)
-    if use_persample_norm:
-        vmin = x.nan_to_num(nan=math.inf).amin(dim=-2, keepdim=True)
-        vmax = x.nan_to_num(nan=-math.inf).amax(dim=-2, keepdim=True)
-        x = persample_norm(x, vmin, vmax)
-    if pred_space == "deltas":
-        x = x - x[..., default_cell, :].unsqueeze(-2)
-    elif pred_space == "residuals":
-        surface = mean_surface.to(device=x.device, dtype=x.dtype)
-        if use_minmax_norm:
-            surface = minmax_norm(surface, minmax_min, minmax_max)
-        if use_persample_norm:
-            vmin = surface.nan_to_num(nan=math.inf).amin(dim=-2, keepdim=True)
-            vmax = surface.nan_to_num(nan=-math.inf).amax(dim=-2, keepdim=True)
-            surface = persample_norm(surface, vmin, vmax)
-        x = x - surface
-    elif pred_space == "fixed":
-        x = zscore_norm(x, zscore_mean, zscore_std)
-
-    if use_zscore_stand:
-        x = zscore_norm(x, zscore_mean, zscore_std)
-    return x
-
-
-def invert_pipeline(
-    values: torch.Tensor,
-    *,
-    pred_space: str,
-    use_minmax_norm: bool,
-    use_persample_norm: bool,
-    use_zscore_stand: bool,
-    default_cell: int,
-    minmax_min: torch.Tensor,
-    minmax_max: torch.Tensor,
-    zscore_mean: torch.Tensor,
-    zscore_std: torch.Tensor,
-    mean_surface: torch.Tensor,
-) -> torch.Tensor:
-    """Undo apply_pipeline with train stats. Persample is not inverted."""
-
-    x = values
-    if use_zscore_stand:
-        x = zscore_denorm(x, zscore_mean, zscore_std)
-    if pred_space == "fixed":
-        x = zscore_denorm(x, zscore_mean, zscore_std)
-    elif pred_space in ("deltas", "residuals"):
-        surface = mean_surface.to(device=x.device, dtype=x.dtype)
-        if use_minmax_norm:
-            surface = minmax_norm(surface, minmax_min, minmax_max)
-        if use_persample_norm:
-            vmin = surface.nan_to_num(nan=math.inf).amin(dim=-2, keepdim=True)
-            vmax = surface.nan_to_num(nan=-math.inf).amax(dim=-2, keepdim=True)
-            surface = persample_norm(surface, vmin, vmax)
-        if pred_space == "deltas":
-            # Heads see a zero default, so add the train-mean default in the same prep space.
-            surface = surface[..., default_cell, :].unsqueeze(-2)
-        x = x + surface
-
-    if use_minmax_norm:
-        x = minmax_denorm(x, minmax_min, minmax_max)
-    return x
+def persample_deltas(raw: torch.Tensor, default_cell: int) -> torch.Tensor:
+    """Selection space: per-sample min-max of each column, then deltas versus the default cell."""
+    # (N, n_cells, C), int -> (N, n_cells, C)
+    vmin = raw.nan_to_num(nan=math.inf).amin(dim=-2, keepdim=True)
+    vmax = raw.nan_to_num(nan=-math.inf).amax(dim=-2, keepdim=True)
+    return pin_default((raw - vmin) / (vmax - vmin + _EPS), default_cell)
 
 
 def combine_edit_features(f_src: torch.Tensor, f_tar: torch.Tensor) -> torch.Tensor:
@@ -266,6 +148,28 @@ class TextFeaturizer(nn.Module):
         """Return the prompt queries F_t, source first then target."""
         # Stack and project from (N, N_t, D_txt)^2 to (N, 2, N_t, d).
         return self.projector(torch.stack([src, tar], dim=1))
+
+
+class TextTokenMLP(nn.Module):
+    """Per-token residual MLP on the projected prompt tokens.
+
+    Without it a linear projection followed by the masked mean is the pooled prompt
+    embedding, so token-level prompts would add nothing to pooling.
+    """
+
+    def __init__(self, attn_dim: int = ATTN_DIM, dropout_rate: float = COMBINER_DROPOUT):
+        super().__init__()
+        self.norm = nn.LayerNorm(attn_dim)
+        self.body = nn.Sequential(
+            nn.Linear(attn_dim, attn_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(attn_dim, attn_dim),
+        )
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        # (N, 2, N_t, d) -> (N, 2, N_t, d)
+        return tokens + self.body(self.norm(tokens))
 
 
 class MaskedVisionDescriptorizer(nn.Module):
@@ -388,17 +292,20 @@ class TextGrounder(nn.Module):
         ])
         self.out_norm = nn.LayerNorm(attn_dim)
         self.null_token = nn.Parameter(torch.zeros(1, 1, attn_dim))
+        # Tells the image keys from the masked-image keys.
+        self.key_type = nn.Parameter(torch.zeros(2, 1, attn_dim))
 
     def forward(
         self,
-        queries: torch.Tensor,  # (N, 2, N_t, d)
-        tokens: torch.Tensor,   # (N, N_v, d)
-    ) -> torch.Tensor:          # (N, 2, N_t, d)
+        queries: torch.Tensor,      # (N, 2, N_t, d)
+        tokens: torch.Tensor,       # (N, N_v, d)
+        mask_tokens: torch.Tensor,  # (N, N_m, d), N_m may be 0
+    ) -> torch.Tensor:              # (N, 2, N_t, d)
         n, _, n_t, d = queries.shape
 
-        # Append the null token to the visual tokens.
-        tokens = torch.cat([tokens, self.null_token.expand(n, -1, -1)], dim=-2)
-        
+        # Append the masked-image tokens and the null token to the visual tokens.
+        tokens = torch.cat([tokens + self.key_type[0], mask_tokens + self.key_type[1], self.null_token.expand(n, -1, -1)], dim=-2)
+
         # Repeat the visual tokens for each prompt.
         kv = self.kv_norm(tokens).repeat_interleave(2, dim=0)
 
@@ -508,6 +415,7 @@ class AttentionRegressor(nn.Module):
         n_targets: int = len(TARGET_COLS),
         attn_dim: int = ATTN_DIM,
         feat_dim: int = 0,
+        mask_dim: int = 0,
     ):
         super().__init__()
 
@@ -517,24 +425,35 @@ class AttentionRegressor(nn.Module):
 
         # Focus on the difference-aware saliencies between prompt tokens.
         self.use_saliency = bool(USE_DIFF_SALIENCY)
-        
+
         if USE_DIFF_SALIENCY and TEXT_EMB_POOL:
             raise ValueError("USE_DIFF_SALIENCY needs TEXT_EMB_POOL=false")
 
+        # The masked-image tokens are keys only under attention; otherwise their mean is a segment.
+        self.use_mask_tokens = MASK_FEATURES in ("tokens", "both") and IMG_FUSION != "none"
+
         self.vision_featurizer = VisionFeaturizer(img_shape, attn_dim=attn_dim)
         self.text_featurizer = TextFeaturizer(text_dim, attn_dim=attn_dim)
-        self.text_grounder = TextGrounder(attn_dim=attn_dim)
+        if TEXT_TOKEN_MLP:
+            self.text_token_mlp = TextTokenMLP(attn_dim=attn_dim)
+        if IMG_FUSION == "attn":
+            self.text_grounder = TextGrounder(attn_dim=attn_dim)
+        else:
+            # No grounding: normalize the projected prompt tokens as the grounder would.
+            self.text_out_norm = nn.LayerNorm(attn_dim)
         self.text_pooler = TextPooler()
+        if self.use_mask_tokens:
+            self.mask_featurizer = VisionProjector(mask_dim, attn_dim)
 
         # Routed here, the block is one more z_edit segment, so it reaches the
         # heads without passing through the attention values.
-        if USE_ZEDIT_MASK:
+        if MASK_FEATURES != "none":
             self.masked_vision_descriptorizer = MaskedVisionDescriptorizer(feat_dim, attn_dim=attn_dim)
 
         # Number of segments in the edit descriptor z_edit.
         n_seg = 6 if self.use_saliency else 4
-        if USE_ZEDIT_MASK:
-            n_seg += 1
+        n_seg += int(IMG_FUSION == "concat") + int(self.use_mask_tokens and IMG_FUSION == "concat")
+        n_seg += int(MASK_FEATURES != "none")
 
         # Each metric may have its own combiner C_theta to describe it differently.
         if SPLIT_COMBINER:
@@ -546,74 +465,46 @@ class AttentionRegressor(nn.Module):
         self.psnr_head = make_metric_head(attn_dim, n_cells)
         self.clip_head = make_metric_head(attn_dim, n_cells)
 
-        self.register_buffer("minmax_min", torch.zeros(n_targets))
-        self.register_buffer("minmax_max", torch.ones(n_targets))
-        self.register_buffer("zscore_mean", torch.zeros(n_targets))
-        self.register_buffer("zscore_std", torch.ones(n_targets))
+        # Train stats: raw mean surface and the per-column regression scale.
         self.register_buffer("mean_surface", torch.zeros(n_cells, n_targets))
+        self.register_buffer("loss_scale", torch.ones(n_targets))
+        # Deviation calibration fitted on val after training; identity until then.
+        self.register_buffer("mean_pred_surface", torch.zeros(n_cells, n_targets))
+        self.register_buffer("dev_scale", torch.ones(n_targets))
 
     def set_metadata(self, metadata: DatasetMetadata) -> None:
-        """Copy train invert stats onto the module buffers."""
+        """Copy train stats onto the module buffers."""
         if metadata.n_cells != self.n_cells:
             raise ValueError(f"Expected {self.n_cells} cells, got {metadata.n_cells}")
         if metadata.default_cell != self.default_cell:
             raise ValueError(f"Expected default_cell {self.default_cell}, got {metadata.default_cell}")
-
-        def copy_col(stat: torch.Tensor, buf: torch.Tensor) -> None:
-            t = torch.as_tensor(stat, dtype=buf.dtype, device=buf.device).reshape(-1)
-            if t.numel() != self.n_targets:
-                raise ValueError(f"Expected {self.n_targets} stats, got {t.numel()}")
+        for stat, buf in ((metadata.mean_surface, self.mean_surface), (metadata.loss_scale, self.loss_scale)):
+            t = torch.as_tensor(stat, dtype=buf.dtype, device=buf.device)
+            if tuple(t.shape) != tuple(buf.shape):
+                raise ValueError(f"Expected stats of shape {tuple(buf.shape)}, got {tuple(t.shape)}")
             buf.copy_(t)
 
-        copy_col(metadata.minmax_min, self.minmax_min)
-        copy_col(metadata.minmax_max, self.minmax_max)
-        copy_col(metadata.zscore_mean, self.zscore_mean)
-        copy_col(metadata.zscore_std, self.zscore_std)
-        self.zscore_std.clamp_(min=1e-8)
-        surface = torch.as_tensor(
-            metadata.mean_surface, dtype=self.mean_surface.dtype, device=self.mean_surface.device,
-        )
-        if tuple(surface.shape) != (self.n_cells, self.n_targets):
-            raise ValueError(f"Expected mean_surface {(self.n_cells, self.n_targets)}, got {tuple(surface.shape)}")
-        self.mean_surface.copy_(surface)
+    def set_calibration(self, mean_pred_surface: torch.Tensor, dev_scale: torch.Tensor) -> None:
+        """Store the mean predicted raw surface and the per-column deviation slopes."""
+        self.mean_pred_surface.copy_(mean_pred_surface.to(self.mean_pred_surface))
+        self.dev_scale.copy_(dev_scale.to(self.dev_scale))
 
-    def _pipeline_stats(self) -> dict:
-        return dict(
-            default_cell=self.default_cell,
-            minmax_min=self.minmax_min,
-            minmax_max=self.minmax_max,
-            zscore_mean=self.zscore_mean,
-            zscore_std=self.zscore_std,
-            mean_surface=self.mean_surface,
-        )
+    def to_training(self, raw: torch.Tensor) -> torch.Tensor:
+        """Raw CLIP/PSNR grid to regression-space deltas."""
+        return to_deltas(raw, self.default_cell, self.loss_scale)
 
     def to_raw(self, values: torch.Tensor) -> torch.Tensor:
-        """Undo TRAINING_* on head outputs using this module's train stats.
-
-        Persample min-max is not inverted. Deltas add the train-mean default cell.
-        """
-        return invert_pipeline(
-            values,
-            pred_space=TRAINING_PRED_SPACE,
-            use_minmax_norm=TRAINING_USE_MINMAX_NORM,
-            use_persample_norm=TRAINING_USE_PERSAMPLE_NORM,
-            use_zscore_stand=TRAINING_USE_ZSCORE_STAND,
-            **self._pipeline_stats(),
-        )
+        """Regression-space deltas to raw CLIP/PSNR, adding the train-mean default cell."""
+        return values * self.loss_scale.to(values) + self.mean_surface[self.default_cell].to(values)
 
     def to_selector(self, raw: torch.Tensor) -> torch.Tensor:
-        """Apply PRED_SPACE / USE_*_NORM (and DELTA_SQUASH) to a raw CLIP/PSNR grid using this module's train stats."""
-        x = apply_pipeline(
-            raw,
-            pred_space=PRED_SPACE,
-            use_minmax_norm=USE_MINMAX_NORM,
-            use_persample_norm=USE_PERSAMPLE_NORM,
-            use_zscore_stand=USE_ZSCORE_STAND,
-            **self._pipeline_stats(),
-        )
-        if DELTA_SQUASH is not None:
-            x = squash_deltas(x, DELTA_SQUASH)
-        return x
+        """Raw CLIP/PSNR grid to the per-sample normalized deltas phi is scored on."""
+        return persample_deltas(raw, self.default_cell)
+
+    def calibrate_raw(self, raw: torch.Tensor) -> torch.Tensor:
+        """Rescale the deviation from the mean predicted surface by the fitted slopes."""
+        mean = self.mean_pred_surface.to(raw)
+        return mean + self.dev_scale.to(raw) * (raw - mean)
 
     def forward(
         self,
@@ -623,20 +514,27 @@ class AttentionRegressor(nn.Module):
         source_mask: torch.Tensor,      # (N, N_t)
         target_mask: torch.Tensor,      # (N, N_t)
         mask_features: torch.Tensor,    # (N, D_feat)
+        mask_tokens: torch.Tensor,      # (N, N_m, D_clip), N_m may be 0
     ) -> torch.Tensor:                  # (N, n_cells, 2)
-        """Return per-cell (psnr, clip) predictions in TRAINING_* units."""
-        
+        """Return per-cell (psnr, clip) deltas in the regression space."""
+
         # Featurize the image and text tokens.
         fv_tokens = self.vision_featurizer(image_tokens)
         ft_tokens = self.text_featurizer(source_tokens, target_tokens)
         ft_masks = torch.stack([source_mask, target_mask], dim=1)
+        if TEXT_TOKEN_MLP:
+            ft_tokens = self.text_token_mlp(ft_tokens)
+        fm_tokens = self.mask_featurizer(mask_tokens) if self.use_mask_tokens else fv_tokens[:, :0]
 
         # Compute the text token saliency, if enabled.
         # Measures the novelty of each text token against the other.
         ft_saliencies = text_token_diff_saliency(ft_tokens, ft_masks) if self.use_saliency else None
-        
-        # Ground the text tokens in the image tokens.
-        groundeds = self.text_grounder(ft_tokens, fv_tokens)
+
+        # Ground the text tokens in the image and masked-image tokens.
+        if IMG_FUSION == "attn":
+            groundeds = self.text_grounder(ft_tokens, fv_tokens, fm_tokens)
+        else:
+            groundeds = self.text_out_norm(ft_tokens)
 
         # Pool the grounded text tokens with masks and saliencies seperately.
         f_means, f_diffs = self.text_pooler(groundeds, ft_masks, ft_saliencies)
@@ -649,10 +547,16 @@ class AttentionRegressor(nn.Module):
         if f_diffs is not None:
             z_edit = torch.cat([z_edit, f_diffs[:, 0], f_diffs[:, 1]], dim=-1)    # (N, 6d)
 
+        # Without attention, the mean projected image (and masked-image) tokens are segments.
+        if IMG_FUSION == "concat":
+            z_edit = torch.cat([z_edit, fv_tokens.mean(dim=-2)], dim=-1)
+            if self.use_mask_tokens:
+                z_edit = torch.cat([z_edit, fm_tokens.mean(dim=-2)], dim=-1)
+
         # If the masked-image block is enabled, add it as a final segment.
-        if USE_ZEDIT_MASK:
+        if MASK_FEATURES != "none":
             f_m = self.masked_vision_descriptorizer(mask_features)
-            z_edit = torch.cat([z_edit, f_m], dim=-1)    # (N, 5d)
+            z_edit = torch.cat([z_edit, f_m], dim=-1)
 
         if SPLIT_COMBINER:
             # Map the difference-aware edit representation with two separate combiners for the heads.
@@ -668,8 +572,11 @@ class AttentionRegressor(nn.Module):
 
         # Stack the PSNR and CLIP predictions into a single tensor.
         z = torch.stack([z_psnr, z_clip], dim=-1)    # (N, n_cells, 2)
-        if (TRAINING_USE_MINMAX_NORM or TRAINING_USE_PERSAMPLE_NORM) and not TRAINING_USE_ZSCORE_STAND:
+        if LOSS_SCALE == "median_range":
+            # Deltas in units of a typical grid range lie in [-1, 1] for almost every cell.
             z = torch.tanh(z / 2.0)
+        if HEAD_PARAM == "deviation":
+            z = z + self.to_training(self.mean_surface)
         if PIN_DEFAULT_CELL:
             z = pin_default(z, self.default_cell)
         return z
@@ -686,9 +593,10 @@ class AttentionModel(nn.Module):
         default_cell: int,
         device: torch.device | str | None = None,
         feat_dim: int = 0,
+        mask_dim: int = 0,
     ):
         super().__init__()
-        self.regressor = AttentionRegressor(image_shape, text_dim, n_cells, default_cell, feat_dim=feat_dim)
+        self.regressor = AttentionRegressor(image_shape, text_dim, n_cells, default_cell, feat_dim=feat_dim, mask_dim=mask_dim)
         if device is not None:
             self.regressor.to(device)
 
@@ -700,9 +608,10 @@ class AttentionModel(nn.Module):
         source_mask: torch.Tensor,      # (N, N_t)
         target_mask: torch.Tensor,      # (N, N_t)
         mask_features: torch.Tensor,    # (N, D_feat)
+        mask_tokens: torch.Tensor,      # (N, N_m, D_clip)
     ) -> torch.Tensor:
-        """Predict per-cell (psnr, clip) in TRAINING_* units."""
-        return self.regressor(image_tokens, source_tokens, target_tokens, source_mask, target_mask, mask_features)
+        """Predict per-cell (psnr, clip) deltas in the regression space."""
+        return self.regressor(image_tokens, source_tokens, target_tokens, source_mask, target_mask, mask_features, mask_tokens)
 
     def to_raw(self, values: torch.Tensor) -> torch.Tensor:
         return self.regressor.to_raw(values)
@@ -710,16 +619,7 @@ class AttentionModel(nn.Module):
     def to_selector(self, raw: torch.Tensor) -> torch.Tensor:
         return self.regressor.to_selector(raw)
 
-    def pred_raw(
-        self,
-        image_tokens: torch.Tensor,
-        source_tokens: torch.Tensor,
-        target_tokens: torch.Tensor,
-        source_mask: torch.Tensor,
-        target_mask: torch.Tensor,
-        mask_features: torch.Tensor,
-    ) -> torch.Tensor:
-        """Predict per-cell (psnr, clip) in raw CLIP/PSNR."""
-        pred = self.pred_cells(image_tokens, source_tokens, target_tokens, source_mask, target_mask, mask_features)
-        raw = self.to_raw(pred)
-        return raw
+    def pred_raw(self, *inputs: torch.Tensor) -> torch.Tensor:
+        """Predict per-cell (psnr, clip) in raw CLIP/PSNR; calibrated when SELECT_CALIBRATED."""
+        raw = self.to_raw(self.pred_cells(*inputs))
+        return self.regressor.calibrate_raw(raw) if SELECT_CALIBRATED else raw

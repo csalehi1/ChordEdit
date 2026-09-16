@@ -64,11 +64,14 @@ TRAIN_FRAC = float(CONFIG["TRAIN_FRAC"]) if CONFIG["TRAIN_FRAC"] is not None els
 VAL_FRAC = float(CONFIG["VAL_FRAC"])
 
 # Separate seeds so that the model can be reseeded without moving samples between splits.
-# SPLIT_SEEDS also picks which generation-seed values to take from list-valued metric cells.
 SEED = int(CONFIG["SEED"])
-SPLIT_SEEDS = tuple(int(v) for v in list(CONFIG["SPLIT_SEEDS"]))
-if not SPLIT_SEEDS:
-    raise ValueError("Expected a non-empty SPLIT_SEEDS list")
+SPLIT_SEED = int(CONFIG.get("SPLIT_SEED", 42))
+
+# Generation seeds averaged into the training labels (null: every seed in the cell), and
+# the seeds the val/test labels are averaged from (null: the same as LABEL_SEEDS), so a
+# held-out generation seed can score the model. Older snapshots named the former SPLIT_SEEDS.
+LABEL_SEEDS = tuple(int(v) for v in CONFIG.get("LABEL_SEEDS", CONFIG.get("SPLIT_SEEDS")) or []) or None
+EVAL_LABEL_SEEDS = tuple(int(v) for v in CONFIG.get("EVAL_LABEL_SEEDS") or []) or None
 
 # The maximum number of samples to train on, or null to use all samples.
 MAX_SAMPLES = int(CONFIG["MAX_SAMPLES"]) if CONFIG["MAX_SAMPLES"] is not None else None
@@ -126,12 +129,29 @@ IMG_EMB_TYPE = str(CONFIG["IMG_EMB_TYPE"])
 # Pool the visual embedding to a single key/value token.
 IMG_EMB_POOL = bool(CONFIG["IMG_EMB_POOL"])
 
-# Load the masked-image CLIP feature block used by CLIP-Edited at the un-edited state.
-USE_IMG_MASK = bool(CONFIG["USE_IMG_MASK"])
-USE_ZEDIT_MASK = bool(CONFIG["USE_ZEDIT_MASK"])
+# How the image reaches the edit descriptor: "attn" grounds the prompt tokens in the visual
+# tokens by cross-attention, "concat" appends the mean projected visual token as a z_edit
+# segment instead, and "none" drops the image path. With one pooled visual token the
+# attention has two keys (image, null) and reduces to a gate, so pooled runs use "concat".
+IMG_FUSION = str(CONFIG.get("IMG_FUSION", "attn"))
+if IMG_FUSION not in ("attn", "concat", "none"):
+    raise ValueError(f"Expected IMG_FUSION in ('attn', 'concat', 'none'), got {IMG_FUSION!r}")
+
+# Masked-image CLIP features, the only inputs that express what CLIP-Edited measures:
+# "block" is the 768-d masked projection plus five cosine/area scalars as a z_edit segment,
+# "tokens" adds the masked-image CLIP tokens as cross-attention keys and keeps only the
+# scalars as a segment, "both" does both, "none" drops them. Older snapshots set
+# USE_IMG_MASK / USE_ZEDIT_MASK.
+MASK_FEATURES = str(CONFIG.get("MASK_FEATURES", "block" if CONFIG.get("USE_IMG_MASK") and CONFIG.get("USE_ZEDIT_MASK") else "none"))
+if MASK_FEATURES not in ("none", "block", "tokens", "both"):
+    raise ValueError(f"Expected MASK_FEATURES in ('none', 'block', 'tokens', 'both'), got {MASK_FEATURES!r}")
 
 # Pool each prompt to a single masked-mean query; false keeps the full token sequences.
 TEXT_EMB_POOL = bool(CONFIG["TEXT_EMB_POOL"])
+
+# Apply a per-token MLP to the projected prompt tokens before pooling. Without it, a linear
+# projection followed by the masked mean is the pooled prompt embedding.
+TEXT_TOKEN_MLP = bool(CONFIG.get("TEXT_TOKEN_MLP", False))
 
 # Add a second pooled vector per prompt, weighted by novelty against the other prompt.
 USE_DIFF_SALIENCY = bool(CONFIG["USE_DIFF_SALIENCY"])
@@ -141,40 +161,37 @@ LAYERSCALE_INIT = float(CONFIG["LAYERSCALE_INIT"]) if CONFIG["LAYERSCALE_INIT"] 
 
 
 """
-Data pipeline settings.
+Regression settings.
+
+The heads regress deltas versus the default cell in shared units, raw PSNR/CLIP divided by
+one scale per column, so predictions invert exactly to dB and CLIP points. Selection
+re-normalizes the predicted raw grid per sample (the paper's phi input), so nothing here
+changes the scoreboard.
 """
 
-# Choose PRED_SPACE from "raws", "deltas", "residuals", or "fixed".
-PRED_SPACES = ("raws", "deltas", "residuals", "fixed")
-PRED_SPACE = str(CONFIG["PRED_SPACE"])
-if PRED_SPACE not in PRED_SPACES:
-    raise ValueError(f"Expected PRED_SPACE in {PRED_SPACES}, got {PRED_SPACE!r}")
-USE_MINMAX_NORM = bool(CONFIG["USE_MINMAX_NORM"])
-USE_PERSAMPLE_NORM = bool(CONFIG["USE_PERSAMPLE_NORM"])
-USE_ZSCORE_STAND = bool(CONFIG["USE_ZSCORE_STAND"])
+# "median_range" scales each column by the train-median per-sample grid range;
+# "custom" uses LOSS_SCALE_VALUES in raw units (e.g. the seed-noise sd per column).
+LOSS_SCALE = str(CONFIG.get("LOSS_SCALE", "median_range"))
+if LOSS_SCALE not in ("median_range", "custom"):
+    raise ValueError(f"Expected LOSS_SCALE in ('median_range', 'custom'), got {LOSS_SCALE!r}")
+LOSS_SCALE_VALUES = tuple(float(v) for v in CONFIG.get("LOSS_SCALE_VALUES") or []) or None
+if LOSS_SCALE == "custom" and (LOSS_SCALE_VALUES is None or len(LOSS_SCALE_VALUES) != 2):
+    raise ValueError(f"LOSS_SCALE custom needs two LOSS_SCALE_VALUES, got {LOSS_SCALE_VALUES}")
 
-# Choose from "global" (per-col minmax) or "median_range" (per-col median range).
-MINMAX_SCALE = str(CONFIG["MINMAX_SCALE"])
+# The heads predict the per-image deviation from the train-mean surface ("deviation", the
+# mean is added back inside the model) or the full delta surface ("deltas").
+HEAD_PARAM = str(CONFIG.get("HEAD_PARAM", "deltas"))
+if HEAD_PARAM not in ("deltas", "deviation"):
+    raise ValueError(f"Expected HEAD_PARAM in ('deltas', 'deviation'), got {HEAD_PARAM!r}")
 
-# Clamp selector-space deltas to [-CLAMP_DELTAS, CLAMP_DELTAS] before phi.
+# Clamp deltas to [-CLAMP_DELTAS, CLAMP_DELTAS] before phi, in the loss and at selection.
 CLAMP_DELTAS = float(CONFIG["CLAMP_DELTAS"]) if CONFIG.get("CLAMP_DELTAS") is not None else None
-
-# Bound the selector-space deltas to (-DELTA_SQUASH, DELTA_SQUASH) with a tanh
-DELTA_SQUASH = float(CONFIG["DELTA_SQUASH"]) if CONFIG["DELTA_SQUASH"] is not None else None
 
 # These levers reweight, floor, and gate ranking at selection time.
 DELTA_WEIGHTS = tuple(float(w) for w in list(CONFIG["DELTA_WEIGHTS"] or [])) or None
 DELTA_FLOORS = tuple(float(v) if v is not None else None for v in list(CONFIG["DELTA_FLOORS"] or [])) or None
 PHI_FLOOR = float(CONFIG["PHI_FLOOR"]) if CONFIG["PHI_FLOOR"] is not None else None
 TEMPERATURE = float(CONFIG["TEMPERATURE"]) if CONFIG["TEMPERATURE"] is not None else None
-
-# TRAINING_* null falls back to the selection setting of the same name.
-TRAINING_PRED_SPACE = str(CONFIG["TRAINING_PRED_SPACE"]) if CONFIG["TRAINING_PRED_SPACE"] is not None else PRED_SPACE
-if TRAINING_PRED_SPACE not in PRED_SPACES:
-    raise ValueError(f"Expected TRAINING_PRED_SPACE in {PRED_SPACES}, got {TRAINING_PRED_SPACE!r}")
-TRAINING_USE_MINMAX_NORM = bool(CONFIG["TRAINING_USE_MINMAX_NORM"]) if CONFIG["TRAINING_USE_MINMAX_NORM"] is not None else USE_MINMAX_NORM
-TRAINING_USE_PERSAMPLE_NORM = bool(CONFIG["TRAINING_USE_PERSAMPLE_NORM"]) if CONFIG["TRAINING_USE_PERSAMPLE_NORM"] is not None else USE_PERSAMPLE_NORM
-TRAINING_USE_ZSCORE_STAND = bool(CONFIG["TRAINING_USE_ZSCORE_STAND"]) if CONFIG["TRAINING_USE_ZSCORE_STAND"] is not None else USE_ZSCORE_STAND
 
 
 """
@@ -225,17 +242,18 @@ WEIGHT_DECAY = float(CONFIG["WEIGHT_DECAY"])
 LR_SCHEDULER = str(CONFIG["LR_SCHEDULER"])
 EARLY_STOP_PATIENCE = int(CONFIG["EARLY_STOP_PATIENCE"])
 EMA_DECAY = float(CONFIG["EMA_DECAY"])
-# Choose from "val_phi_spearman", "val_regret", "val_gain_mean", "val_loss", "val_top1_accuracy", "val_top5_accuracy", "val_rho_phi_image".
+# Choose from "val_dev_corr", "val_phi_spearman", "val_regret", "val_gain_mean", "val_loss", "val_top1_accuracy", "val_top5_accuracy", "val_rho_phi_image".
 CKPT_METRIC = str(CONFIG["CKPT_METRIC"])
 SAMPLES_PER_BATCH = int(CONFIG["SAMPLES_PER_BATCH"])
 
-# Configurations for the training loss.
+# Configurations for the training loss, all in the regression space.
 MSE_LOSS_WEIGHT = float(CONFIG["MSE_LOSS_WEIGHT"])
-MSE_LOSS_TOP_K = int(CONFIG["MSE_LOSS_TOP_K"]) if CONFIG["MSE_LOSS_TOP_K"] is not None else None
 RANKING_LOSS_WEIGHT = float(CONFIG["RANKING_LOSS_WEIGHT"])
 RANKING_LOSS_TOP_K = int(CONFIG["RANKING_LOSS_TOP_K"]) if CONFIG["RANKING_LOSS_TOP_K"] is not None else None
 COL_LOSS_WEIGHTS = tuple(float(w) for w in list(CONFIG["COL_LOSS_WEIGHTS"]))
-COL_LOSS_TOP_K = int(CONFIG["COL_LOSS_TOP_K"]) if CONFIG["COL_LOSS_TOP_K"] is not None else None
+# Weight of 1 - corr(predicted deviation, true deviation), the deviation of each cell across
+# the samples of a batch; scale-free, so it scores the direction of the per-image structure.
+DEV_LOSS_WEIGHT = float(CONFIG.get("DEV_LOSS_WEIGHT", 0.0))
 
 """
 Selector settings.
@@ -259,8 +277,12 @@ SCORE_PHI = partial(_SCORE_FN, **_SCORE_KW)  # Torch phi(Delta)
 DEFAULT_T_START = float(CONFIG["DEFAULT_T_START"])
 DEFAULT_T_END = float(CONFIG["DEFAULT_T_END"])
 
-# If true, the selector and eval stats only consider cells with t_start > t_end.
+# If true, the loss, the selector and eval stats only consider cells with t_start > t_end.
 USE_DIAGONAL_MASK = bool(CONFIG.get("USE_DIAGONAL_MASK", False))
+
+# Select on the calibrated raw predictions (deviation amplitudes rescaled per column by the
+# slopes fitted on val after training) rather than the raw head outputs.
+SELECT_CALIBRATED = bool(CONFIG.get("SELECT_CALIBRATED", False))
 
 # The run directory name under RUNS_DIR, and an empty string uses a timestamp.
 RUN_NAME = str(CONFIG["RUN_NAME"])
