@@ -64,8 +64,11 @@ TRAIN_FRAC = float(CONFIG["TRAIN_FRAC"]) if CONFIG["TRAIN_FRAC"] is not None els
 VAL_FRAC = float(CONFIG["VAL_FRAC"])
 
 # Separate seeds so that the model can be reseeded without moving samples between splits.
+# SPLIT_SEEDS also picks which generation-seed values to take from list-valued metric cells.
 SEED = int(CONFIG["SEED"])
-SPLIT_SEED = int(CONFIG["SPLIT_SEED"])
+SPLIT_SEEDS = tuple(int(v) for v in list(CONFIG["SPLIT_SEEDS"]))
+if not SPLIT_SEEDS:
+    raise ValueError("Expected a non-empty SPLIT_SEEDS list")
 
 # The maximum number of samples to train on, or null to use all samples.
 MAX_SAMPLES = int(CONFIG["MAX_SAMPLES"]) if CONFIG["MAX_SAMPLES"] is not None else None
@@ -105,6 +108,7 @@ METRICS_CSV = GENERATED_DIR / f"id_to_metrics_{DIR_NAME.replace("_", "").lower()
 T_START_COL = "t_start"
 T_END_COL = "t_end"
 T_DELTA_COL = "t_delta"
+SEED_COL = "seed"
 PSNR_COL = "psnr_unedit_part"
 CLIP_COL = "clip_similarity_target_image_edit_part"
 

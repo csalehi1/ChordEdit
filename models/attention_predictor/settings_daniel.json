@@ -5,7 +5,7 @@
   "TRAIN_FRAC": 0.8,
   "VAL_FRAC": 0.1,
   "SEED": 42,
-  "SPLIT_SEED": 42,
+  "SPLIT_SEEDS": [42, 43, 44, 45],
   "MAX_SAMPLES": null,
   "PIE_BENCH": false,
 

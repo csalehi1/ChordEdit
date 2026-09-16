@@ -188,8 +188,15 @@ def get_df() -> pd.DataFrame:
             pie_df[SAMPLE_ID_COL] = PIE_SAMPLE_ID_PREFIX + pie_df[SAMPLE_ID_COL]
             return pie_df
 
-        def _average_label_cells(metrics_df: pd.DataFrame) -> pd.DataFrame:
-            """Average list cells ('[a, b]') to one value; a NaN in the list makes the cell NaN."""
+        def _select_label_seeds(metrics_df: pd.DataFrame) -> pd.DataFrame:
+            """Reduce list-valued metric cells to the entries at SPLIT_SEEDS.
+
+            The seed column holds the generation seeds in the same order as the
+            PSNR/CLIP lists, e.g. seed '[42, 43, 44, 45]' and psnr '[a, b, c, d]'.
+            Each value in SPLIT_SEEDS is looked up in that list; those indices are
+            taken and averaged. Scalar cells (no seed column, or a single value)
+            pass through unchanged.
+            """
 
             def _parse_list_cell(value) -> np.ndarray:
                 if isinstance(value, str) and value.strip().startswith("["):
@@ -199,13 +206,30 @@ def get_df() -> pd.DataFrame:
                     return np.array([], dtype=np.float64)
                 return np.array([float(value)], dtype=np.float64)
 
+            row_seeds = None
+            if SEED_COL in metrics_df.columns:
+                row_seeds = [_parse_list_cell(v) for v in metrics_df[SEED_COL]]
+            wanted = np.asarray(SPLIT_SEEDS, dtype=np.float64)
+
             for col in TARGET_COLS:
                 values = [_parse_list_cell(v) for v in metrics_df[col]]
                 out = np.full(len(values), np.nan, dtype=np.float64)
                 for i, vals in enumerate(values):
                     if vals.size == 0 or np.isnan(vals).any():
                         continue
-                    out[i] = float(vals.mean())
+                    if row_seeds is None or vals.size == 1:
+                        out[i] = float(vals.mean())
+                        continue
+                    cell_seeds = row_seeds[i]
+                    if cell_seeds.size != vals.size:
+                        raise ValueError(f"{col}: {vals.size} values but {cell_seeds.size} seeds in row {i}")
+                    idx = []
+                    for seed in wanted:
+                        hits = np.flatnonzero(cell_seeds == seed)
+                        if hits.size == 0:
+                            raise ValueError(f"{col}: row {i} has seeds {cell_seeds.tolist()}, expected {list(SPLIT_SEEDS)}")
+                        idx.append(int(hits[0]))
+                    out[i] = float(vals[np.asarray(idx)].mean())
                 metrics_df[col] = out
             return metrics_df
 
@@ -213,7 +237,7 @@ def get_df() -> pd.DataFrame:
 
         # Clean metrics CSV: drop rows that do not have target metrics or t_delta.
         metrics_df = pd.read_csv(metrics_csv)
-        metrics_df = _average_label_cells(metrics_df)
+        metrics_df = _select_label_seeds(metrics_df)
         n_before = len(metrics_df)
         metrics_df = metrics_df.dropna(subset=list(TARGET_COLS)).reset_index(drop=True)
         if len(metrics_df) < n_before:
@@ -285,7 +309,7 @@ def get_splits_df(splits_df_path: Path) -> dict[str, tuple[pd.DataFrame, pd.Data
         is_pie = sids.str.startswith(PIE_SAMPLE_ID_PREFIX)
         ue_ids = np.sort(sids[~is_pie].unique())
         n_samples = len(ue_ids)
-        perm = np.random.default_rng(SPLIT_SEED).permutation(ue_ids)
+        perm = np.random.default_rng(SPLIT_SEEDS).permutation(ue_ids)
         n_train = max(1, round(TRAIN_FRAC * n_samples))
         n_val = max(0, min(round(VAL_FRAC * n_samples), n_samples - n_train - 1))
         train_ids = perm[:n_train]
