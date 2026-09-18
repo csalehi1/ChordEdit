@@ -11,10 +11,10 @@
   "MAX_SAMPLES": null,
   "PIE_BENCH": false,
 
-  "IMG_EMB_TYPE": "clip",
+  "IMG_EMB_TYPE": "vae",
   "IMG_EMB_POOL": false,
   "IMG_FUSION": "attn",
-  "MASK_FEATURES": "both",
+  "MASK_FEATURES": "none",
   "TEXT_EMB_POOL": false,
   "TEXT_TOKEN_MLP": false,
   "USE_DIFF_SALIENCY": false,
@@ -47,7 +47,7 @@
   "LR_SCHEDULER": "cosine",
   "EARLY_STOP_PATIENCE": 0,
   "EMA_DECAY": 0.0,
-  "CKPT_METRIC": "val_dev_corr",
+  "CKPT_METRIC": "val_top5_accuracy",
   "SAMPLES_PER_BATCH": 32,
 
   "MSE_LOSS_WEIGHT": 3.0,

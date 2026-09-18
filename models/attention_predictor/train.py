@@ -467,8 +467,8 @@ def train(device: torch.device) -> None:
         (run_dir / "regression_metrics.json").write_text(json.dumps({
             "best_epoch": best_epoch,
             "epochs_ran": len(history),
-            "label_seeds": LABEL_SEEDS,
-            "eval_label_seeds": EVAL_LABEL_SEEDS,
+            "train_metrics_seeds": TRAIN_METRICS_SEEDS,
+            "eval_metrics_seeds": EVAL_METRICS_SEEDS,
             "dev_scale": model.regressor.dev_scale.tolist(),
             "test": test_metrics,
             "test_calibrated": test_calibrated,

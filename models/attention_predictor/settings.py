@@ -67,11 +67,16 @@ VAL_FRAC = float(CONFIG["VAL_FRAC"])
 SEED = int(CONFIG["SEED"])
 SPLIT_SEED = int(CONFIG.get("SPLIT_SEED", 42))
 
-# Generation seeds averaged into the training labels (null: every seed in the cell), and
-# the seeds the val/test labels are averaged from (null: the same as LABEL_SEEDS), so a
-# held-out generation seed can score the model. Older snapshots named the former SPLIT_SEEDS.
-LABEL_SEEDS = tuple(int(v) for v in CONFIG.get("LABEL_SEEDS", CONFIG.get("SPLIT_SEEDS")) or []) or None
-EVAL_LABEL_SEEDS = tuple(int(v) for v in CONFIG.get("EVAL_LABEL_SEEDS") or []) or None
+# Generation seeds averaged into the training metrics, and the seeds the val/test
+# metrics are averaged from, so a held-out generation seed can score the model.
+def _metrics_seeds(key: str) -> tuple[int, ...]:
+    raw = CONFIG[key]
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(f"Expected a non-empty list for {key}, got {raw!r}")
+    return tuple(int(v) for v in raw)
+
+TRAIN_METRICS_SEEDS = _metrics_seeds("TRAIN_METRICS_SEEDS")
+EVAL_METRICS_SEEDS = _metrics_seeds("EVAL_METRICS_SEEDS")
 
 # The maximum number of samples to train on, or null to use all samples.
 MAX_SAMPLES = int(CONFIG["MAX_SAMPLES"]) if CONFIG["MAX_SAMPLES"] is not None else None

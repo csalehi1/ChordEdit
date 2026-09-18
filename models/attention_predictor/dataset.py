@@ -173,15 +173,15 @@ def get_df() -> pd.DataFrame:
             pie_df[SAMPLE_ID_COL] = PIE_SAMPLE_ID_PREFIX + pie_df[SAMPLE_ID_COL]
             return pie_df
 
-        def _reduce_label_seeds(metrics_df: pd.DataFrame) -> pd.DataFrame:
+        def _reduce_metrics_seeds(metrics_df: pd.DataFrame) -> pd.DataFrame:
             """Average list-valued metric cells over generation seeds.
 
             The seed column holds the generation seeds in the same order as the
             PSNR/CLIP lists, e.g. seed '[42, 43, 44, 45]' and psnr '[a, b, c, d]'.
-            `<col>` becomes the mean over LABEL_SEEDS (the training labels) and
-            `<col>__eval` the mean over EVAL_LABEL_SEEDS (the val/test labels). A NaN
-            anywhere in a list voids the cell, so the sample set does not depend on the
-            seeds chosen. Scalar cells (no seed column, or a single value) pass through.
+            `<col>` becomes the mean over TRAIN_METRICS_SEEDS and `<col>__eval` the
+            mean over EVAL_METRICS_SEEDS. A NaN anywhere in a list voids the cell, so
+            the sample set does not depend on the seeds chosen. Scalar cells (no seed
+            column, or a single value) pass through.
             """
 
             def _parse_list_cell(value) -> np.ndarray:
@@ -192,9 +192,9 @@ def get_df() -> pd.DataFrame:
                     return np.array([], dtype=np.float64)
                 return np.array([float(value)], dtype=np.float64)
 
-            def _at_seeds(vals: np.ndarray, i: int, wanted: tuple[int, ...] | None) -> np.ndarray:
-                """The entries of vals at the wanted seeds of row i, or all of them."""
-                if wanted is None or row_seeds is None or vals.size == 1:
+            def _at_seeds(vals: np.ndarray, i: int, wanted: tuple[int, ...]) -> np.ndarray:
+                """The entries of vals at the wanted seeds of row i."""
+                if row_seeds is None or vals.size == 1:
                     return vals
                 cell_seeds = row_seeds[i]
                 if cell_seeds.size != vals.size:
@@ -210,7 +210,7 @@ def get_df() -> pd.DataFrame:
                 out = np.full((len(values), 2), np.nan, dtype=np.float64)
                 for i, vals in enumerate(values):
                     if vals.size and not np.isnan(vals).any():
-                        out[i] = _at_seeds(vals, i, LABEL_SEEDS).mean(), _at_seeds(vals, i, EVAL_LABEL_SEEDS or LABEL_SEEDS).mean()
+                        out[i] = _at_seeds(vals, i, TRAIN_METRICS_SEEDS).mean(), _at_seeds(vals, i, EVAL_METRICS_SEEDS).mean()
                 metrics_df[col], metrics_df[f"{col}__eval"] = out[:, 0], out[:, 1]
             return metrics_df
 
@@ -218,7 +218,7 @@ def get_df() -> pd.DataFrame:
 
         # Clean metrics CSV: drop rows that do not have target metrics or t_delta.
         metrics_df = pd.read_csv(metrics_csv)
-        metrics_df = _reduce_label_seeds(metrics_df)
+        metrics_df = _reduce_metrics_seeds(metrics_df)
         n_before = len(metrics_df)
         metrics_df = metrics_df.dropna(subset=list(TARGET_COLS)).reset_index(drop=True)
         if len(metrics_df) < n_before:
@@ -412,12 +412,12 @@ def get_dataset(
         return _metadata_to_device(get_train_metadata(run_dir, built))
 
     def _get_splits(metadata: DatasetMetadata) -> dict[str, DatasetSplit]:
-        """Get the splits from the packed grids, with val/test labels at the eval seeds if set."""
+        """Get the splits from the packed grids, with val/test labels at the eval seeds."""
         out: dict[str, DatasetSplit] = {}
         for name, (sample_ids, t_pairs, y_raw, y_eval) in arranged.items():
             if int(t_pairs.shape[0]) != metadata.n_cells:
                 raise ValueError(f"{name} grid has {t_pairs.shape[0]} cells, train has {metadata.n_cells}")
-            if name != "train" and EVAL_LABEL_SEEDS is not None:
+            if name != "train":
                 y_raw = y_eval
             y_raw = y_raw.to(device)
             out[name] = DatasetSplit(

@@ -34,10 +34,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# When run as a script, pin the run's settings before dataset/model import.
-# When imported from train.py those modules are already loaded, so this must
-# not run: load_run_settings would refuse, and parse_args would reject
-# train.py's flags.
+# Load the run's settings.
 if __name__ == "__main__":
     _ARGS = parse_args()
     RUN_DIR = resolve_run_dir(load_live_settings().RUNS_DIR if _ARGS.run_dir is None else None, _ARGS.run_dir)
