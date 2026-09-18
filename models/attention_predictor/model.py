@@ -133,8 +133,8 @@ class VisionFeaturizer(nn.Module):
             # grid, so its tokens only exist once spatial_flatten has made them.
             if IMG_EMB_POOL:
                 image_tokens = image_tokens.mean(dim=-2, keepdim=True)
-        # Project from (N, N_tok, img_dim) to (N, N_tok, attn_dim).
-        return self.projector(image_tokens)
+        # Project from (N, N_tok, img_dim) to (N, N_tok, attn_dim); token tables arrive in fp16.
+        return self.projector(image_tokens.float())
 
 
 class TextFeaturizer(nn.Module):
@@ -146,8 +146,8 @@ class TextFeaturizer(nn.Module):
 
     def forward(self, src: torch.Tensor, tar: torch.Tensor) -> torch.Tensor:
         """Return the prompt queries F_t, source first then target."""
-        # Stack and project from (N, N_t, D_txt)^2 to (N, 2, N_t, d).
-        return self.projector(torch.stack([src, tar], dim=1))
+        # Stack and project from (N, N_t, D_txt)^2 to (N, 2, N_t, d); token tables arrive in fp16.
+        return self.projector(torch.stack([src, tar], dim=1).float())
 
 
 class TextTokenMLP(nn.Module):
@@ -524,7 +524,7 @@ class AttentionRegressor(nn.Module):
         ft_masks = torch.stack([source_mask, target_mask], dim=1)
         if TEXT_TOKEN_MLP:
             ft_tokens = self.text_token_mlp(ft_tokens)
-        fm_tokens = self.mask_featurizer(mask_tokens) if self.use_mask_tokens else fv_tokens[:, :0]
+        fm_tokens = self.mask_featurizer(mask_tokens.float()) if self.use_mask_tokens else fv_tokens[:, :0]
 
         # Compute the text token saliency, if enabled.
         # Measures the novelty of each text token against the other.

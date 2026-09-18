@@ -160,7 +160,11 @@ def get_clip_tokens(
     tokens_file: str = _CLIP_TOKENS_FILE,
     pool: bool | None = None,
 ) -> torch.Tensor:
-    """(n, N_v, D_clip) CLIP-L/14 vision tokens, pooled to one token per sample when pooling."""
+    """(n, N_v, D_clip) CLIP-L/14 vision tokens, pooled to one token per sample when pooling.
+
+    Unpooled tables stay in the cache's fp16 (about 5 GB per 10k samples); the model casts
+    per batch, so the device holds half the memory for the same values.
+    """
     root = (scattered_dir if scattered_dir is not None else SCATTERED_DIR) / "annotation_embeddings"
     sample_ids = samples[SAMPLE_ID_COL].astype(str).tolist()
     pool = IMG_EMB_POOL if pool is None else pool
@@ -168,7 +172,7 @@ def get_clip_tokens(
     def _load_clip_tokens(sample_id: str) -> torch.Tensor:
         """Load one sample's tokens, pooling them here so the table stays small."""
         tokens = torch.load(root / sample_id / tokens_file, map_location="cpu", weights_only=True)
-        return tokens.mean(dim=0, keepdim=True) if pool else tokens
+        return tokens.float().mean(dim=0, keepdim=True) if pool else tokens.half()
 
     # Named `executor`, not `pool`: the bool above is read inside the closure at
     # call time, and a `with ... as pool:` here used to rebind it to the
@@ -178,7 +182,7 @@ def get_clip_tokens(
             executor.map(_load_clip_tokens, sample_ids),
             total=len(sample_ids), desc=f"Loading {tokens_file}", unit="sample",
         ))
-    return torch.stack(rows).float().contiguous()
+    return torch.stack(rows).contiguous()
 
 
 def get_img_mask_features(tables: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -404,8 +408,9 @@ def get_embeddings(
         tables = get_packed_embeddings(samples)
         sample_ids = samples[SAMPLE_ID_COL].tolist()
 
-    source_tokens = tables["src_tokens"].float() if not TEXT_EMB_POOL else tables["src"]
-    target_tokens = tables["tar_tokens"].float() if not TEXT_EMB_POOL else tables["tar"]
+    # Prompt token tables stay fp16 (the cache's dtype); the model casts per batch.
+    source_tokens = tables["src_tokens"] if not TEXT_EMB_POOL else tables["src"]
+    target_tokens = tables["tar_tokens"] if not TEXT_EMB_POOL else tables["tar"]
 
     # Get the image tokens.
     if IMG_EMB_TYPE == "vae":
@@ -427,7 +432,7 @@ def get_embeddings(
     # The masked-image block and tokens, empty when the features are off.
     n = len(sample_ids)
     mask_features = get_img_mask_features(tables) if MASK_FEATURES != "none" else torch.zeros(n, 0)
-    mask_tokens = get_clip_tokens(samples, tokens_file=_MASK_TOKENS_FILE, pool=False) if MASK_FEATURES in ("tokens", "both") else torch.zeros(n, 0, CLIP_TOKEN_DIM)
+    mask_tokens = get_clip_tokens(samples, tokens_file=_MASK_TOKENS_FILE, pool=False) if MASK_FEATURES in ("tokens", "both") else torch.zeros(n, 0, CLIP_TOKEN_DIM, dtype=torch.float16)
 
     return EmbeddingsTable(
         _sample_ids=tuple(sample_ids),
